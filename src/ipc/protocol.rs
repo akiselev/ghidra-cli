@@ -137,6 +137,28 @@ pub enum Command {
     /// Shutdown the daemon
     Shutdown,
 
+    // === Analysis Queue ===
+    /// Add file paths to the analysis queue
+    QueueAdd {
+        /// Absolute file paths to add (already glob-expanded by the client)
+        paths: Vec<String>,
+        /// Project name for imported binaries
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+    },
+
+    /// List all items in the analysis queue
+    QueueList,
+
+    /// Remove file paths from the analysis queue
+    QueueRemove {
+        /// Absolute file paths to remove (already glob-expanded by the client)
+        paths: Vec<String>,
+    },
+
+    /// Wait until all queued analyses are complete (returns current status)
+    QueueStatus,
+
     // === Generic CLI Command Forwarding ===
     /// Execute a CLI command through the daemon's queue
     ExecuteCli {

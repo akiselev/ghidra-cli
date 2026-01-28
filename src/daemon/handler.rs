@@ -2,22 +2,25 @@
 //!
 //! Translates IPC commands into Ghidra bridge operations.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::json;
 use tokio::sync::Mutex;
 use tracing::debug;
 
+use crate::daemon::analysis_queue::AnalysisQueue;
 use crate::ghidra::bridge::GhidraBridge;
 use crate::ipc::protocol::{Command, Response};
 
 /// Handle an IPC command.
 pub async fn handle_command(
     bridge: &Arc<Mutex<Option<GhidraBridge>>>,
+    analysis_queue: &AnalysisQueue,
     id: u64,
     command: Command,
 ) -> Response {
-    match handle_command_inner(bridge, command).await {
+    match handle_command_inner(bridge, analysis_queue, command).await {
         Ok(result) => Response::success(id, result),
         Err(e) => Response::error(id, e.to_string()),
     }
@@ -25,6 +28,7 @@ pub async fn handle_command(
 
 async fn handle_command_inner(
     bridge: &Arc<Mutex<Option<GhidraBridge>>>,
+    analysis_queue: &AnalysisQueue,
     command: Command,
 ) -> anyhow::Result<serde_json::Value> {
     match command {
@@ -142,6 +146,35 @@ async fn handle_command_inner(
                 })),
             )
             .await
+        }
+
+        Command::QueueAdd { paths, project } => {
+            let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+            let project = project.unwrap_or_else(|| "queue-project".to_string());
+            let added = analysis_queue.add(paths, project).await;
+            Ok(json!({
+                "added": added,
+            }))
+        }
+
+        Command::QueueList => {
+            let entries = analysis_queue.list().await;
+            Ok(json!({
+                "entries": entries,
+            }))
+        }
+
+        Command::QueueRemove { paths } => {
+            let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+            let removed = analysis_queue.remove(&paths).await;
+            Ok(json!({
+                "removed": removed,
+            }))
+        }
+
+        Command::QueueStatus => {
+            let status = analysis_queue.status().await;
+            Ok(serde_json::to_value(status)?)
         }
 
         Command::ExecuteCli { command_json } => {

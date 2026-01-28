@@ -12,9 +12,11 @@ use anyhow::{Context, Result};
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 
+use crate::daemon::analysis_queue::AnalysisQueue;
 use crate::daemon::process::{get_data_dir, remove_lock_file, write_daemon_info, DaemonInfo};
 use crate::ghidra::bridge::GhidraBridge;
 
+pub mod analysis_queue;
 pub mod cache;
 pub mod handler;
 pub mod handlers;
@@ -88,13 +90,23 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     write_daemon_info(&data_dir, &config.project_path, &daemon_info)
         .context("Failed to write lock file")?;
 
+    // Create and start the analysis queue
+    let analysis_queue = AnalysisQueue::new(bridge.clone());
+    analysis_queue.start_processor().await;
+
     // Start IPC server task
     let ipc_bridge = bridge.clone();
     let ipc_shutdown_tx = shutdown_tx.clone();
     let ipc_project_path = config.project_path.clone();
+    let ipc_analysis_queue = analysis_queue.clone();
     let ipc_handle = tokio::spawn(async move {
-        if let Err(e) =
-            ipc_server::run_ipc_server(ipc_bridge, ipc_shutdown_tx, &ipc_project_path).await
+        if let Err(e) = ipc_server::run_ipc_server(
+            ipc_bridge,
+            ipc_shutdown_tx,
+            &ipc_project_path,
+            ipc_analysis_queue,
+        )
+        .await
         {
             error!("IPC server error: {}", e);
         }

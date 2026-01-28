@@ -133,6 +133,10 @@ pub enum Commands {
     #[command(subcommand)]
     Daemon(DaemonCommands),
 
+    /// Analysis queue for batch binary processing
+    #[command(subcommand)]
+    Queue(QueueCommands),
+
     /// Download and setup Ghidra automatically
     Setup(SetupArgs),
 }
@@ -813,6 +817,47 @@ pub enum DaemonCommands {
         #[arg(long)]
         project: Option<String>,
     },
+}
+
+/// Analysis queue commands for batch binary processing
+#[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
+pub enum QueueCommands {
+    /// Add binaries matching a glob pattern to the analysis queue
+    Add(QueueAddArgs),
+
+    /// List all items in the analysis queue
+    List,
+
+    /// Remove items matching a glob pattern from the queue
+    Remove(QueueRemoveArgs),
+
+    /// Block until all queued analyses are complete
+    Wait(QueueWaitArgs),
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct QueueAddArgs {
+    /// Glob pattern(s) matching binaries to analyze (e.g. "./bins/*" or "/usr/bin/ls")
+    #[arg(required = true)]
+    pub patterns: Vec<String>,
+
+    /// Project name for imported binaries
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct QueueRemoveArgs {
+    /// Glob pattern(s) matching queued paths to remove
+    #[arg(required = true)]
+    pub patterns: Vec<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct QueueWaitArgs {
+    /// Poll interval in seconds (default: 2)
+    #[arg(long, default_value = "2")]
+    pub interval: u64,
 }
 
 /// Arguments for the setup command

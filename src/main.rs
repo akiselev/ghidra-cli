@@ -110,6 +110,7 @@ fn requires_daemon(command: &Commands) -> bool {
             | Commands::Disasm(_)
             | Commands::Batch(_)
             | Commands::Stats(_)
+            | Commands::Queue(_)
     )
 }
 
@@ -321,6 +322,164 @@ async fn execute_via_daemon(
                 XRefCommands::To(args) => client.xrefs_to(args.address.clone()).await?,
                 XRefCommands::From(args) => client.xrefs_from(args.address.clone()).await?,
                 XRefCommands::List(_) => anyhow::bail!("XRef list not yet supported via daemon"),
+            }
+        }
+        // Queue commands - use dedicated IPC
+        Commands::Queue(queue_cmd) => {
+            use cli::QueueCommands;
+            match queue_cmd {
+                QueueCommands::Add(args) => {
+                    // Expand globs on the client side
+                    let mut paths = Vec::new();
+                    for pattern in &args.patterns {
+                        match glob::glob(pattern) {
+                            Ok(entries) => {
+                                let mut matched = false;
+                                for entry in entries {
+                                    match entry {
+                                        Ok(path) => {
+                                            if path.is_file() {
+                                                let abs = if path.is_absolute() {
+                                                    path
+                                                } else {
+                                                    std::env::current_dir()?.join(&path)
+                                                };
+                                                paths.push(
+                                                    abs.to_string_lossy().to_string(),
+                                                );
+                                                matched = true;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "Warning: error reading glob entry: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                                if !matched {
+                                    eprintln!(
+                                        "Warning: no files matched pattern '{}'",
+                                        pattern
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: invalid glob pattern '{}': {}",
+                                    pattern, e
+                                );
+                            }
+                        }
+                    }
+
+                    if paths.is_empty() {
+                        anyhow::bail!("No files matched the given pattern(s)");
+                    }
+
+                    let result = client
+                        .queue_add(paths.clone(), args.project.clone())
+                        .await?;
+                    let added = result
+                        .get("added")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    println!("Added {} file(s) to the analysis queue", added);
+                    if added < paths.len() as u64 {
+                        println!(
+                            "  ({} skipped as duplicates)",
+                            paths.len() as u64 - added
+                        );
+                    }
+                    return Ok(String::new());
+                }
+                QueueCommands::List => {
+                    client.queue_list().await?
+                }
+                QueueCommands::Remove(args) => {
+                    // Expand globs on the client side
+                    let mut paths = Vec::new();
+                    for pattern in &args.patterns {
+                        match glob::glob(pattern) {
+                            Ok(entries) => {
+                                for entry in entries.flatten() {
+                                    let abs = if entry.is_absolute() {
+                                        entry
+                                    } else {
+                                        std::env::current_dir()?.join(&entry)
+                                    };
+                                    paths.push(abs.to_string_lossy().to_string());
+                                }
+                            }
+                            Err(_) => {
+                                // Treat as literal path if not a valid glob
+                                paths.push(pattern.clone());
+                            }
+                        }
+                    }
+
+                    let result = client.queue_remove(paths).await?;
+                    let removed = result
+                        .get("removed")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    println!("Removed {} item(s) from the analysis queue", removed);
+                    return Ok(String::new());
+                }
+                QueueCommands::Wait(args) => {
+                    println!("Waiting for analysis queue to complete...");
+                    let interval =
+                        tokio::time::Duration::from_secs(args.interval);
+                    loop {
+                        let status = client.queue_status().await?;
+                        let all_done = status
+                            .get("all_done")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        let total = status
+                            .get("total")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let completed = status
+                            .get("completed")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let failed = status
+                            .get("failed")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let pending = status
+                            .get("pending")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let analyzing = status
+                            .get("analyzing")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+
+                        if total == 0 {
+                            println!("Queue is empty.");
+                            return Ok(String::new());
+                        }
+
+                        eprint!(
+                            "\r  Progress: {}/{} completed, {} failed, {} pending, {} analyzing",
+                            completed, total, failed, pending, analyzing
+                        );
+
+                        if all_done {
+                            eprintln!();
+                            println!(
+                                "All done! {} completed, {} failed out of {} total.",
+                                completed, failed, total
+                            );
+                            return Ok(String::new());
+                        }
+
+                        tokio::time::sleep(interval).await;
+                    }
+                }
             }
         }
         // New commands - forward through ExecuteCli

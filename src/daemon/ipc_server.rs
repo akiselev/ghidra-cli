@@ -16,6 +16,7 @@ use tokio::io::BufReader;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, error, info};
 
+use crate::daemon::analysis_queue::AnalysisQueue;
 use crate::ghidra::bridge::GhidraBridge;
 use crate::ipc::protocol::{Command, Request, Response};
 use crate::ipc::transport;
@@ -26,6 +27,8 @@ use super::handler;
 pub struct IpcServer {
     /// The Ghidra bridge instance
     bridge: Arc<Mutex<Option<GhidraBridge>>>,
+    /// Analysis queue
+    analysis_queue: AnalysisQueue,
     /// Shutdown signal sender
     shutdown_tx: broadcast::Sender<()>,
     /// Server start time
@@ -37,9 +40,11 @@ impl IpcServer {
     pub fn new(
         bridge: Arc<Mutex<Option<GhidraBridge>>>,
         shutdown_tx: broadcast::Sender<()>,
+        analysis_queue: AnalysisQueue,
     ) -> Self {
         Self {
             bridge,
+            analysis_queue,
             shutdown_tx,
             started_at: Instant::now(),
         }
@@ -95,7 +100,8 @@ impl IpcServer {
             }
 
             // Handle command
-            let response = handler::handle_command(&self.bridge, request.id, request.command).await;
+            let response =
+                handler::handle_command(&self.bridge, &self.analysis_queue, request.id, request.command).await;
 
             // Send response
             let json = serde_json::to_vec(&response)?;
@@ -109,6 +115,7 @@ pub async fn run_ipc_server(
     bridge: Arc<Mutex<Option<GhidraBridge>>>,
     shutdown_tx: broadcast::Sender<()>,
     project_path: &Path,
+    analysis_queue: AnalysisQueue,
 ) -> anyhow::Result<()> {
     // Create the IPC listener for this project
     let listener = transport::create_listener_for_project(project_path)
@@ -120,7 +127,7 @@ pub async fn run_ipc_server(
         transport::socket_name_for_project(project_path)
     );
 
-    let server = Arc::new(IpcServer::new(bridge, shutdown_tx.clone()));
+    let server = Arc::new(IpcServer::new(bridge, shutdown_tx.clone(), analysis_queue));
     let mut shutdown_rx = shutdown_tx.subscribe();
 
     loop {

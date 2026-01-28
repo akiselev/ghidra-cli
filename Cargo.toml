@@ -60,6 +60,9 @@ walkdir = "2.4"
 # Process management
 which = "6.0"
 
+# Glob pattern matching
+glob = "0.3"
+
 # Regex
 regex = "1.10"
 lazy_static = "1.4"

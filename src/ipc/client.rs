@@ -150,6 +150,31 @@ impl DaemonClient {
         self.send_command(Command::XRefsFrom { address }).await
     }
 
+    /// Add file paths to the analysis queue.
+    pub async fn queue_add(
+        &mut self,
+        paths: Vec<String>,
+        project: Option<String>,
+    ) -> Result<serde_json::Value> {
+        self.send_command(Command::QueueAdd { paths, project })
+            .await
+    }
+
+    /// List all items in the analysis queue.
+    pub async fn queue_list(&mut self) -> Result<serde_json::Value> {
+        self.send_command(Command::QueueList).await
+    }
+
+    /// Remove file paths from the analysis queue.
+    pub async fn queue_remove(&mut self, paths: Vec<String>) -> Result<serde_json::Value> {
+        self.send_command(Command::QueueRemove { paths }).await
+    }
+
+    /// Get analysis queue status (for polling in wait).
+    pub async fn queue_status(&mut self) -> Result<serde_json::Value> {
+        self.send_command(Command::QueueStatus).await
+    }
+
     /// Execute a CLI command through the daemon (takes pre-serialized JSON).
     pub async fn execute_cli_json(&mut self, command_json: String) -> Result<serde_json::Value> {
         self.send_command(Command::ExecuteCli { command_json })
