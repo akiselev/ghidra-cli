@@ -3,6 +3,7 @@
 use predicates::prelude::*;
 use serial_test::serial;
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[macro_use]
 mod common;
@@ -20,6 +21,13 @@ fn harness() -> &'static DaemonTestHarness {
         ensure_test_project(TEST_PROJECT, TEST_PROGRAM);
         DaemonTestHarness::new(TEST_PROJECT, TEST_PROGRAM).expect("Failed to start daemon")
     })
+}
+
+fn unique_suffix() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time went backwards")
+        .as_nanos()
 }
 
 #[test]
@@ -121,6 +129,67 @@ fn test_symbol_rename() {
         .success();
 
     // Verify new symbol exists
+    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        .arg("symbol")
+        .arg("get")
+        .arg(&new_name)
+        .arg("--project")
+        .arg(TEST_PROJECT)
+        .arg("--program")
+        .arg(TEST_PROGRAM)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&*new_name));
+}
+
+#[test]
+#[serial]
+fn test_symbol_rename_non_primary_label_by_name() {
+    require_ghidra!();
+    let harness = harness();
+
+    let addr = get_function_address(harness, TEST_PROJECT, TEST_PROGRAM, "main");
+    let suffix = unique_suffix();
+    let old_name = format!("rename_label_old_{}", suffix);
+    let new_name = format!("rename_label_new_{}", suffix);
+
+    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        .arg("symbol")
+        .arg("create")
+        .arg(&addr)
+        .arg(&old_name)
+        .arg("--project")
+        .arg(TEST_PROJECT)
+        .arg("--program")
+        .arg(TEST_PROGRAM)
+        .assert()
+        .success();
+
+    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        .arg("symbol")
+        .arg("rename")
+        .arg(&old_name)
+        .arg(&new_name)
+        .arg("--project")
+        .arg(TEST_PROJECT)
+        .arg("--program")
+        .arg(TEST_PROGRAM)
+        .assert()
+        .success();
+
+    // The label should have been renamed, not left in place while
+    // the primary symbol at the same address was renamed.
+    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        .arg("symbol")
+        .arg("get")
+        .arg(&old_name)
+        .arg("--project")
+        .arg(TEST_PROJECT)
+        .arg("--program")
+        .arg(TEST_PROGRAM)
+        .assert()
+        .failure();
+
     assert_cmd::cargo::cargo_bin_cmd!("ghidra")
         .arg("symbol")
         .arg("get")

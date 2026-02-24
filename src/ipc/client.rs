@@ -110,7 +110,7 @@ impl BridgeClient {
         filter: Option<String>,
     ) -> Result<serde_json::Value> {
         self.send_command(
-            "list_functions",
+            "function_list",
             Some(json!({"limit": limit, "filter": filter})),
         )
     }
@@ -199,14 +199,19 @@ impl BridgeClient {
         )
     }
 
-    pub fn symbol_delete(&self, name: &str) -> Result<serde_json::Value> {
-        self.send_command("symbol_delete", Some(json!({"name": name})))
+    pub fn symbol_delete(&self, target: &str) -> Result<serde_json::Value> {
+        self.send_command("symbol_delete", Some(json!({"target": target})))
     }
 
-    pub fn symbol_rename(&self, old_name: &str, new_name: &str) -> Result<serde_json::Value> {
+    pub fn symbol_rename(
+        &self,
+        target: &str,
+        new_name: &str,
+        namespace: Option<&str>,
+    ) -> Result<serde_json::Value> {
         self.send_command(
             "symbol_rename",
-            Some(json!({"old_name": old_name, "new_name": new_name})),
+            Some(json!({"target": target, "new_name": new_name, "namespace": namespace})),
         )
     }
 
@@ -226,6 +231,24 @@ impl BridgeClient {
         self.send_command(
             "type_apply",
             Some(json!({"address": address, "type_name": type_name})),
+        )
+    }
+
+    pub fn type_import_c(&self, code: &str, category: Option<&str>) -> Result<serde_json::Value> {
+        self.send_command(
+            "type_import_c",
+            Some(json!({"code": code, "category": category})),
+        )
+    }
+
+    pub fn function_set_signature(
+        &self,
+        target: &str,
+        signature: &str,
+    ) -> Result<serde_json::Value> {
+        self.send_command(
+            "function_set_signature",
+            Some(json!({"address": target, "signature": signature})),
         )
     }
 

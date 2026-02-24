@@ -100,9 +100,17 @@ ghidra function decompile TARGET [QUERY_OPTS]
 ghidra function disasm TARGET [QUERY_OPTS]
 ghidra function calls TARGET [QUERY_OPTS]   # outgoing calls
 ghidra function xrefs TARGET [QUERY_OPTS]   # incoming references
-ghidra function rename OLD NEW [--project P] [--program PROG]
-ghidra function create ADDRESS [NAME] [--project P] [--program PROG]
+ghidra function set-signature TARGET 'SIGNATURE'  # aliases: set-sig, signature
+ghidra function create ADDRESS [NAME]
 ghidra function delete TARGET [QUERY_OPTS]
+```
+
+`set-signature` parses a C-style function prototype and applies it. Supports `__thiscall`,
+`__cdecl`, `__stdcall`, `__fastcall` calling conventions. The function is also renamed to match
+the signature. Does NOT handle namespaces — use `symbol rename` for that.
+
+```bash
+ghidra function set-signature 0x401000 'void __thiscall Update(float dt, int flags)'
 ```
 
 ### Top-level Shortcuts
@@ -124,9 +132,20 @@ ghidra strings refs STRING [QUERY_OPTS]     # xrefs to string
 ```bash
 ghidra symbol list [QUERY_OPTS]             # aliases: sym, symbols
 ghidra symbol get NAME [QUERY_OPTS]
-ghidra symbol create ADDRESS NAME [--project P] [--program PROG]
+ghidra symbol create ADDRESS NAME
 ghidra symbol delete NAME [QUERY_OPTS]
-ghidra symbol rename OLD NEW [--project P] [--program PROG]
+ghidra symbol rename TARGET NEW_NAME [--namespace NS]
+```
+
+`symbol rename` accepts an address or name as TARGET. NEW_NAME supports `Namespace::Name`
+syntax to set the namespace. Use `--namespace NS` as an alternative, or `--namespace ''` to
+move to the global namespace.
+
+```bash
+ghidra symbol rename 0x401000 MyClass::MyMethod    # rename + set namespace
+ghidra symbol rename 0x401000 MyMethod --namespace MyClass  # same result
+ghidra symbol rename 0x401000 MyMethod --namespace ''  # move to global
+ghidra symbol rename 0x401000 NewName              # rename only, keep namespace
 ```
 
 ### Memory Operations
@@ -155,6 +174,25 @@ ghidra type list [QUERY_OPTS]               # alias: types
 ghidra type get NAME [QUERY_OPTS]
 ghidra type create DEFINITION [--project P] [--program PROG]
 ghidra type apply ADDRESS TYPE_NAME [--project P] [--program PROG]
+ghidra type import-c 'C_CODE' [--category PATH] [--project P] [--program PROG]  # aliases: import, parse-c
+```
+
+`import-c` parses C type definitions (structs, unions, enums, typedefs including function
+pointers) and imports them into the program's data type manager. Supports bitfields and struct
+inheritance (`: Parent`). Existing types with the same name are overwritten.
+
+Use `--category` to organize types into Ghidra data type categories instead of the root `/`.
+
+```bash
+# Import types to root
+ghidra type import-c 'struct Vec3 { float x; float y; float z; };'
+
+# Import into a category (ideal for vtables, class definitions)
+ghidra type import-c --category /CTimer \
+  'struct CTimer;
+   typedef void (*CTimer_dtor)(CTimer *this, short flags);
+   struct CTimer_vtable { void *rtti0; void *rtti1; CTimer_dtor dtor; };
+   struct CTimer { CTimer_vtable *vtable; int state; float timer; };'
 ```
 
 ### Comment Operations
@@ -382,7 +420,13 @@ ghidra graph callers suspicious_func --depth 3 --project analysis
 ghidra x-ref to 0x401000 --project analysis
 ghidra function disasm 0x401000 --project analysis
 
-# 5. Patch
+# 5. Type recovery
+ghidra type import-c --category /MyClass 'struct MyClass { void* vtable; int state; float timer; };'
+ghidra symbol rename 0x401000 MyClass::Update  # apply namespace
+ghidra function set-signature 0x401000 'void __thiscall Update(float dt, int flags)'
+ghidra decompile 0x401000  # verify improved output
+
+# 6. Patch
 ghidra patch nop 0x401234 --count 3 --project analysis
 ghidra patch export -o patched.exe --project analysis
 ```

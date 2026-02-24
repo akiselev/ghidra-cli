@@ -25,6 +25,10 @@ import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
+import ghidra.app.util.cparser.C.CParser;
+import ghidra.app.util.cparser.C.ParseException;
+import ghidra.app.cmd.function.ApplyFunctionSignatureCmd;
+import ghidra.app.cmd.function.FunctionRenameOption;
 import ghidra.util.task.ConsoleTaskMonitor;
 import ghidra.util.task.TaskMonitor;
 
@@ -188,11 +192,6 @@ public class GhidraCliBridge extends GhidraScript {
         switch (command) {
             case "ping":            return handlePing();
             case "program_info":    return handleProgramInfo();
-            case "list_functions":  return handleListFunctions(args);
-            case "get_function":    return handleGetFunction(args);
-            case "rename_function": return handleRenameFunction(args);
-            case "create_function": return handleCreateFunction(args);
-            case "delete_function": return handleDeleteFunction(args);
             case "decompile":       return handleDecompile(args);
             case "list_strings":    return handleListStrings(args);
             case "list_imports":    return handleListImports();
@@ -220,11 +219,18 @@ public class GhidraCliBridge extends GhidraScript {
             case "symbol_create":   return handleSymbolCreate(args);
             case "symbol_delete":   return handleSymbolDelete(args);
             case "symbol_rename":   return handleSymbolRename(args);
+            // Function commands
+            case "function_list":   return handleFunctionList(args);
+            case "function_get":    return handleFunctionGet(args);
+            case "function_create": return handleFunctionCreate(args);
+            case "function_delete": return handleFunctionDelete(args);
+            case "function_set_signature": return handleFunctionSetSignature(args);
             // Type commands
             case "type_list":       return handleTypeList(args);
             case "type_get":        return handleTypeGet(args);
             case "type_create":     return handleTypeCreate(args);
             case "type_apply":      return handleTypeApply(args);
+            case "type_import_c":   return handleTypeImportC(args);
             // Comment commands
             case "comment_list":    return handleCommentList(args);
             case "comment_get":     return handleCommentGet(args);
@@ -424,7 +430,7 @@ public class GhidraCliBridge extends GhidraScript {
         return result;
     }
 
-    private JsonObject handleListFunctions(JsonObject args) {
+    private JsonObject handleFunctionList(JsonObject args) {
         if (currentProgram == null) {
             return errorResult("No program loaded");
         }
@@ -581,7 +587,7 @@ public class GhidraCliBridge extends GhidraScript {
         return dp[n][m];
     }
 
-    private JsonObject handleGetFunction(JsonObject args) {
+    private JsonObject handleFunctionGet(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
 
         String target = getArgString(args, "address");
@@ -601,43 +607,7 @@ public class GhidraCliBridge extends GhidraScript {
         return functionToJson(func);
     }
 
-    private JsonObject handleRenameFunction(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
-
-        String oldTarget = getArgString(args, "old_name");
-        String newName = getArgString(args, "new_name");
-        if (oldTarget == null || newName == null || oldTarget.isEmpty() || newName.isEmpty()) {
-            return errorResult("old_name and new_name required");
-        }
-
-        try {
-            Function func = findFunctionByNameOrAddress(oldTarget);
-            if (func == null) {
-                return errorResult(buildFunctionTargetHint(oldTarget));
-            }
-
-            int txId = currentProgram.startTransaction("Rename function");
-            try {
-                String oldName = func.getName();
-                func.setName(newName, SourceType.USER_DEFINED);
-                currentProgram.endTransaction(txId, true);
-
-                JsonObject result = new JsonObject();
-                result.addProperty("status", "renamed");
-                result.addProperty("old_name", oldName);
-                result.addProperty("new_name", newName);
-                result.addProperty("address", func.getEntryPoint().toString());
-                return result;
-            } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
-                throw e;
-            }
-        } catch (Exception e) {
-            return errorResult("Failed to rename function: " + e.getMessage());
-        }
-    }
-
-    private JsonObject handleCreateFunction(JsonObject args) {
+    private JsonObject handleFunctionCreate(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
 
         String target = getArgString(args, "address");
@@ -684,7 +654,7 @@ public class GhidraCliBridge extends GhidraScript {
         }
     }
 
-    private JsonObject handleDeleteFunction(JsonObject args) {
+    private JsonObject handleFunctionDelete(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
 
         String target = getArgString(args, "address");
@@ -1825,26 +1795,17 @@ public class GhidraCliBridge extends GhidraScript {
     private JsonObject handleSymbolDelete(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
 
-        String name = getArgString(args, "name");
-        if (name == null) return errorResult("Symbol name required");
+        String target = getArgString(args, "target");
+        if (target == null) return errorResult("Symbol target required");
 
         try {
-            SymbolTable symbolTable = currentProgram.getSymbolTable();
-            SymbolIterator syms = symbolTable.getSymbols(name);
-            List<Symbol> toDelete = new ArrayList<>();
-            while (syms.hasNext()) {
-                toDelete.add(syms.next());
-            }
-
-            if (toDelete.isEmpty()) {
-                return errorResult("Symbol not found: " + name);
-            }
+            Symbol symbol = findUniqueSymbolByNameOrAddress(target);
+            Address symbolAddr = symbol.getAddress();
+            String deletedName = symbol.getName(true);
 
             int txId = currentProgram.startTransaction("Delete symbol");
             try {
-                for (Symbol s : toDelete) {
-                    s.delete();
-                }
+                symbol.delete();
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
                 currentProgram.endTransaction(txId, false);
@@ -1853,8 +1814,15 @@ public class GhidraCliBridge extends GhidraScript {
 
             JsonObject result = new JsonObject();
             result.addProperty("status", "deleted");
-            result.addProperty("name", name);
+            result.addProperty("name", deletedName);
+            if (symbolAddr != null) {
+                result.addProperty("address", symbolAddr.toString());
+            } else {
+                result.add("address", JsonNull.INSTANCE);
+            }
             return result;
+        } catch (IllegalArgumentException e) {
+            return errorResult(e.getMessage());
         } catch (Exception e) {
             return errorResult("Failed to delete symbol: " + e.getMessage());
         }
@@ -1863,28 +1831,53 @@ public class GhidraCliBridge extends GhidraScript {
     private JsonObject handleSymbolRename(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
 
-        String oldName = getArgString(args, "old_name");
+        String target = getArgString(args, "target");
         String newName = getArgString(args, "new_name");
-        if (oldName == null || newName == null) {
-            return errorResult("old_name and new_name required");
+        if (target == null) return errorResult("Symbol target required");
+        if (newName == null || newName.trim().isEmpty()) {
+            return errorResult("New name required");
         }
 
+        // Check for explicit --namespace arg (may be null = not provided, or "" = global)
+        String namespaceArg = getArgString(args, "namespace");
+
         try {
-            SymbolTable symbolTable = currentProgram.getSymbolTable();
-            SymbolIterator syms = symbolTable.getSymbols(oldName);
-            List<Symbol> toRename = new ArrayList<>();
-            while (syms.hasNext()) {
-                toRename.add(syms.next());
+            Symbol symbol = findUniqueSymbolByNameOrAddress(target);
+            Address symbolAddr = symbol.getAddress();
+            if (symbolAddr == null) {
+                return errorResult("Symbol has no address: " + target);
             }
 
-            if (toRename.isEmpty()) {
-                return errorResult("Symbol not found: " + oldName);
+            String oldName = symbol.getName(true); // include namespace
+            String simpleName = newName;
+            String namespacePath = null;
+
+            // Determine namespace: --namespace flag takes precedence over :: parsing
+            if (namespaceArg != null) {
+                // Explicit namespace provided (empty string = global namespace)
+                namespacePath = namespaceArg;
+                // If new_name also has ::, extract just the simple name
+                int lastColon = newName.lastIndexOf("::");
+                if (lastColon >= 0) {
+                    simpleName = newName.substring(lastColon + 2);
+                }
+            } else {
+                // Parse :: from new_name
+                int lastColon = newName.lastIndexOf("::");
+                if (lastColon >= 0) {
+                    namespacePath = newName.substring(0, lastColon);
+                    simpleName = newName.substring(lastColon + 2);
+                }
             }
 
             int txId = currentProgram.startTransaction("Rename symbol");
             try {
-                for (Symbol s : toRename) {
-                    s.setName(newName, SourceType.USER_DEFINED);
+                if (namespacePath != null) {
+                    Namespace ns = createNamespaceHierarchy(namespacePath);
+                    symbol.setNameAndNamespace(
+                        simpleName, ns, SourceType.USER_DEFINED);
+                } else {
+                    symbol.setName(simpleName, SourceType.USER_DEFINED);
                 }
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
@@ -1894,12 +1887,44 @@ public class GhidraCliBridge extends GhidraScript {
 
             JsonObject result = new JsonObject();
             result.addProperty("status", "renamed");
+            result.addProperty("address", symbolAddr.toString());
             result.addProperty("old_name", oldName);
-            result.addProperty("new_name", newName);
+            result.addProperty("new_name", symbol.getName(true));
+            result.addProperty("namespace", symbol.getParentNamespace().getName(true));
+            result.addProperty("type", symbol.getSymbolType().toString());
             return result;
+        } catch (IllegalArgumentException e) {
+            return errorResult(e.getMessage());
         } catch (Exception e) {
-            return errorResult("Failed to rename symbol: " + e.getMessage());
+            return errorResult("Failed to rename: " + e.getMessage());
         }
+    }
+
+    /**
+     * Create a namespace hierarchy from a "::" separated path.
+     * E.g., "A" creates a single namespace,
+     * "A::B::C" creates A -> B -> C hierarchy.
+     * Empty/null path returns the global namespace.
+     */
+    private Namespace createNamespaceHierarchy(String path) throws Exception {
+        if (path == null || path.isEmpty()) {
+            return currentProgram.getGlobalNamespace();
+        }
+        SymbolTable symbolTable = currentProgram.getSymbolTable();
+        String[] parts = path.split("::");
+        Namespace parent = currentProgram.getGlobalNamespace();
+
+        for (String part : parts) {
+            part = part.trim();
+            if (part.isEmpty()) continue;
+            Namespace existing = symbolTable.getNamespace(part, parent);
+            if (existing != null) {
+                parent = existing;
+            } else {
+                parent = symbolTable.createNameSpace(parent, part, SourceType.USER_DEFINED);
+            }
+        }
+        return parent;
     }
 
     // --- Type Handlers ---
@@ -2073,6 +2098,263 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to apply type: " + e.getMessage());
         }
+    }
+
+    // --- Import C Types Handler ---
+
+    private JsonObject handleTypeImportC(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+
+        String code = getArgString(args, "code");
+        if (code == null || code.trim().isEmpty()) {
+            return errorResult("C code required");
+        }
+
+        String categoryPath = getArgString(args, "category");
+
+        try {
+            DataTypeManager dtm = currentProgram.getDataTypeManager();
+
+            // Ensure trailing semicolon for CParser
+            String processedCode = code.trim();
+            if (!processedCode.endsWith(";")) {
+                processedCode += ";";
+            }
+
+            int txId = currentProgram.startTransaction("Import C types");
+            try {
+                // Parse into program DTM
+                CParser parser = new CParser(dtm, true,
+                    new DataTypeManager[] { dtm });
+                parser.parse(processedCode);
+                String parseMessages = parser.getParseMessages();
+
+                // Collect all explicitly defined type names from the parser
+                Set<String> definedNames = new HashSet<>();
+                definedNames.addAll(parser.getComposites().keySet());
+                definedNames.addAll(parser.getEnums().keySet());
+                definedNames.addAll(parser.getTypes().keySet());
+                definedNames.addAll(parser.getFunctions().keySet());
+                Set<DataType> parsedTypes = new HashSet<>();
+                parsedTypes.addAll(parser.getComposites().values());
+                parsedTypes.addAll(parser.getEnums().values());
+                parsedTypes.addAll(parser.getTypes().values());
+                parsedTypes.addAll(parser.getFunctions().values());
+
+                // If --category specified, move defined types to target category
+                CategoryPath lookupPath = CategoryPath.ROOT;
+                if (categoryPath != null) {
+                    String normalizedPath = categoryPath.startsWith("/")
+                        ? categoryPath : "/" + categoryPath;
+                    CategoryPath targetPath = new CategoryPath(normalizedPath);
+                    Category targetCat = dtm.createCategory(targetPath);
+
+                    // Move only datatypes touched by this parse operation.
+                    for (DataType dt : parsedTypes) {
+                        if (!isUserFacingDataType(dt)) continue;
+                        if (dt.getCategoryPath().equals(targetPath)) continue;
+                        targetCat.moveDataType(dt, DataTypeConflictHandler.REPLACE_HANDLER);
+                    }
+                    lookupPath = targetPath;
+                }
+
+                currentProgram.endTransaction(txId, true);
+
+                // Build response with all imported types
+                JsonArray typesArray = new JsonArray();
+                for (String name : definedNames) {
+                    DataType best = findBestParsedDataType(name, parsedTypes, lookupPath);
+                    if (best == null) {
+                        best = findBestDataType(dtm, name, lookupPath);
+                    }
+                    if (best != null) {
+                        JsonObject typeInfo = new JsonObject();
+                        typeInfo.addProperty("name", best.getName());
+                        typeInfo.addProperty("path", best.getPathName());
+                        typeInfo.addProperty("size", best.getLength());
+                        typeInfo.addProperty("category",
+                            best.getCategoryPath().toString());
+                        typesArray.add(typeInfo);
+                    }
+                }
+
+                JsonObject response = new JsonObject();
+                response.addProperty("status", "imported");
+                response.add("types", typesArray);
+                if (parseMessages != null && !parseMessages.trim().isEmpty()) {
+                    response.addProperty("messages", parseMessages.trim());
+                }
+                return response;
+
+            } catch (Exception e) {
+                currentProgram.endTransaction(txId, false);
+                throw e;
+            }
+
+        } catch (ParseException pe) {
+            return errorResult("C parse error: " + pe.getMessage());
+        } catch (Exception e) {
+            return errorResult("Failed to import C types: " + e.getMessage());
+        }
+    }
+
+    // --- Function Set Signature Handler ---
+
+    private JsonObject handleFunctionSetSignature(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+
+        String addrStr = getArgString(args, "address");
+        String signature = getArgString(args, "signature");
+        if (addrStr == null) return errorResult("Function address required");
+        if (signature == null || signature.trim().isEmpty()) {
+            return errorResult("Signature string required");
+        }
+
+        try {
+            // Step 1: Resolve the function
+            Address addr = resolveAddress(addrStr);
+            if (addr == null) return errorResult("Cannot resolve address: " + addrStr);
+
+            FunctionManager fm = currentProgram.getFunctionManager();
+            Function func = fm.getFunctionAt(addr);
+            if (func == null) {
+                func = fm.getFunctionContaining(addr);
+            }
+            if (func == null) return errorResult("No function at address: " + addrStr);
+
+            // Step 2: Pre-process the signature
+            // CParser (C.jj:1194-1204) defines tokens for __cdecl, __stdcall, __fastcall,
+            // __vectorcall, __rustcall, __pascal — but NOT __thiscall.
+            // We mirror applyFunctionQualifiers() (C.jj:654-696): strip __thiscall from
+            // the string and apply it separately via setCallingConvention().
+            String processedSig = signature.trim();
+            boolean isThiscall = false;
+            if (processedSig.contains("__thiscall")) {
+                isThiscall = true;
+                processedSig = processedSig.replaceAll("\\b__thiscall\\b", "").replaceAll("\\s+", " ").trim();
+            }
+
+            // Ensure trailing semicolon for CParser
+            if (!processedSig.endsWith(";")) {
+                processedSig += ";";
+            }
+
+            // Step 3: Parse with CParser
+            DataTypeManager dtm = currentProgram.getDataTypeManager();
+            CParser parser = new CParser(dtm, false, new DataTypeManager[] { dtm });
+            DataType parsed = parser.parse(processedSig);
+
+            if (!(parsed instanceof FunctionDefinition)) {
+                return errorResult("Could not parse as function signature: " + signature);
+            }
+            FunctionDefinition funcDef = (FunctionDefinition) parsed;
+
+            // Step 4: Apply within a transaction
+            int txId = currentProgram.startTransaction("Set function signature");
+            try {
+                ApplyFunctionSignatureCmd cmd = new ApplyFunctionSignatureCmd(
+                    func.getEntryPoint(),
+                    funcDef,
+                    SourceType.USER_DEFINED,
+                    false,  // don't preserve calling convention
+                    false,  // applyEmptyComposites
+                    DataTypeConflictHandler.REPLACE_HANDLER,
+                    FunctionRenameOption.RENAME
+                );
+                boolean applied = cmd.applyTo(currentProgram);
+                if (!applied) {
+                    currentProgram.endTransaction(txId, false);
+                    return errorResult("Failed to apply signature: " + cmd.getStatusMsg());
+                }
+
+                // Re-fetch function after signature change
+                func = fm.getFunctionAt(func.getEntryPoint());
+
+                // Set __thiscall calling convention (mirrors C.jj applyFunctionQualifiers())
+                if (isThiscall && func != null) {
+                    func.setCallingConvention("__thiscall");
+                }
+
+                currentProgram.endTransaction(txId, true);
+            } catch (Exception e) {
+                currentProgram.endTransaction(txId, false);
+                throw e;
+            }
+
+            // Build response
+            func = fm.getFunctionAt(addr);
+            JsonObject result = new JsonObject();
+            result.addProperty("status", "updated");
+            result.addProperty("address", addr.toString());
+            if (func != null) {
+                result.addProperty("name", func.getName());
+                result.addProperty("namespace", func.getParentNamespace().getName(true));
+                result.addProperty("calling_convention", func.getCallingConventionName());
+                result.addProperty("signature", func.getPrototypeString(false, false));
+                result.addProperty("parameter_count", func.getParameterCount());
+            }
+            return result;
+
+        } catch (ParseException pe) {
+            return errorResult("Signature parse error: " + pe.getMessage());
+        } catch (Exception e) {
+            return errorResult("Failed to set signature: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Find all user-facing data types matching a name, excluding internal
+     * /functions/ category types (FunctionDefinition internals).
+     */
+    private List<DataType> findUserDataTypes(DataTypeManager dtm, String name) {
+        List<DataType> all = new ArrayList<>();
+        dtm.findDataTypes(name, all);
+        List<DataType> result = new ArrayList<>();
+        for (DataType dt : all) {
+            if (!dt.getName().equals(name)) continue;
+            if (!isUserFacingDataType(dt)) continue;
+            result.add(dt);
+        }
+        return result;
+    }
+
+    private boolean isUserFacingDataType(DataType dt) {
+        if (dt == null) return false;
+        return !dt.getCategoryPath().toString().equals("/functions");
+    }
+
+    private DataType findBestParsedDataType(String name, Set<DataType> parsed,
+            CategoryPath preferred) {
+        DataType best = null;
+        for (DataType dt : parsed) {
+            if (!isUserFacingDataType(dt)) continue;
+            if (!dt.getName().equals(name)) continue;
+            if (dt.getCategoryPath().equals(preferred)) {
+                return dt;
+            }
+            if (best == null) {
+                best = dt;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * Find the best user-facing data type for a name, preferring the given
+     * category path.
+     */
+    private DataType findBestDataType(DataTypeManager dtm, String name,
+            CategoryPath preferred) {
+        DataType best = null;
+        for (DataType dt : findUserDataTypes(dtm, name)) {
+            if (dt.getCategoryPath().equals(preferred)) {
+                return dt; // exact match
+            }
+            if (best == null) {
+                best = dt;
+            }
+        }
+        return best;
     }
 
     // --- Comment Handlers ---
@@ -2306,6 +2588,45 @@ public class GhidraCliBridge extends GhidraScript {
         result.addProperty("node_count", nodes.size());
         result.addProperty("edge_count", edges.size());
         return result;
+    }
+
+    private Symbol findUniqueSymbolByNameOrAddress(String target) {
+        if (currentProgram == null || target == null || target.isEmpty()) {
+            throw new IllegalArgumentException("Symbol target required");
+        }
+
+        SymbolTable symbolTable = currentProgram.getSymbolTable();
+
+        // Prefer exact name matches so non-primary labels are renamed correctly.
+        List<Symbol> namedMatches = new ArrayList<>();
+        SymbolIterator syms = symbolTable.getSymbols(target);
+        while (syms.hasNext()) {
+            Symbol s = syms.next();
+            Address symAddr = s.getAddress();
+            if (symAddr != null && !symAddr.isExternalAddress()) {
+                namedMatches.add(s);
+            }
+        }
+
+        if (namedMatches.size() == 1) {
+            return namedMatches.get(0);
+        }
+        if (namedMatches.size() > 1) {
+            throw new IllegalArgumentException(
+                "Ambiguous symbol target '" + target + "' (" + namedMatches.size() +
+                " matches). Use an address."
+            );
+        }
+
+        Address addr = resolveAddress(target);
+        if (addr == null) {
+            throw new IllegalArgumentException("Symbol not found: " + target);
+        }
+        Symbol symbol = symbolTable.getPrimarySymbol(addr);
+        if (symbol == null) {
+            throw new IllegalArgumentException("No symbol at address: " + target);
+        }
+        return symbol;
     }
 
     private Function findFunctionByNameOrAddress(String nameOrAddr) {
