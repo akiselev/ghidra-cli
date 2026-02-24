@@ -145,6 +145,7 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
             cli::FunctionCommands::Calls(args) => args.options.project.clone(),
             cli::FunctionCommands::XRefs(args) => args.options.project.clone(),
             cli::FunctionCommands::Rename(args) => args.project.clone(),
+            cli::FunctionCommands::SetSignature(args) => args.project.clone(),
             cli::FunctionCommands::Create(args) => args.project.clone(),
             cli::FunctionCommands::Delete(args) => args.options.project.clone(),
         },
@@ -203,6 +204,7 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
             cli::TypeCommands::Get(args) => args.options.project.clone(),
             cli::TypeCommands::Create(args) => args.project.clone(),
             cli::TypeCommands::Apply(args) => args.project.clone(),
+            cli::TypeCommands::ImportC(args) => args.project.clone(),
         },
         Commands::Patch(cmd) => match cmd {
             cli::PatchCommands::Bytes(args) => args.project.clone(),
@@ -249,6 +251,7 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
             cli::FunctionCommands::Calls(args) => args.options.program.clone(),
             cli::FunctionCommands::XRefs(args) => args.options.program.clone(),
             cli::FunctionCommands::Rename(args) => args.program.clone(),
+            cli::FunctionCommands::SetSignature(args) => args.program.clone(),
             cli::FunctionCommands::Create(args) => args.program.clone(),
             cli::FunctionCommands::Delete(args) => args.options.program.clone(),
         },
@@ -307,6 +310,7 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
             cli::TypeCommands::Get(args) => args.options.program.clone(),
             cli::TypeCommands::Create(args) => args.program.clone(),
             cli::TypeCommands::Apply(args) => args.program.clone(),
+            cli::TypeCommands::ImportC(args) => args.program.clone(),
         },
         Commands::Patch(cmd) => match cmd {
             cli::PatchCommands::Bytes(args) => args.program.clone(),
@@ -640,29 +644,30 @@ fn execute_via_bridge(
                 }
                 FunctionCommands::Get(args) => {
                     client.send_command(
-                        "get_function",
+                        "function_get",
                         Some(json!({"address": args.resolved_target()})),
                     )
                 }
                 FunctionCommands::Disasm(args) => client.disasm(args.resolved_target(), None),
                 FunctionCommands::Calls(args) => client.find_calls(args.resolved_target()),
                 FunctionCommands::XRefs(args) => client.xrefs_to(args.resolved_target().to_string()),
-                FunctionCommands::Rename(args) => client.send_command(
-                    "rename_function",
-                    Some(json!({
-                        "old_name": args.old_name,
-                        "new_name": args.new_name,
-                    })),
+                FunctionCommands::Rename(args) => client.symbol_rename(
+                    &args.target,
+                    &args.new_name,
+                    args.namespace.as_deref(),
                 ),
+                FunctionCommands::SetSignature(args) => {
+                    client.function_set_signature(&args.target, &args.signature)
+                }
                 FunctionCommands::Create(args) => client.send_command(
-                    "create_function",
+                    "function_create",
                     Some(json!({
                         "address": args.address,
                         "name": args.name,
                     })),
                 ),
                 FunctionCommands::Delete(args) => client.send_command(
-                    "delete_function",
+                    "function_delete",
                     Some(json!({
                         "address": args.resolved_target(),
                     })),
@@ -754,7 +759,11 @@ fn execute_via_bridge(
                 SymbolCommands::Create(args) => client.symbol_create(&args.address, &args.name),
                 SymbolCommands::Delete(args) => client.symbol_delete(&args.name),
                 SymbolCommands::Rename(args) => {
-                    client.symbol_rename(&args.old_name, &args.new_name)
+                    client.symbol_rename(
+                        &args.target,
+                        &args.new_name,
+                        args.namespace.as_deref(),
+                    )
                 }
             }
         }
@@ -765,6 +774,9 @@ fn execute_via_bridge(
                 TypeCommands::Get(args) => client.type_get(&args.name),
                 TypeCommands::Create(args) => client.type_create(&args.definition),
                 TypeCommands::Apply(args) => client.type_apply(&args.address, &args.type_name),
+                TypeCommands::ImportC(args) => {
+                    client.type_import_c(&args.code, args.category.as_deref())
+                }
             }
         }
         Commands::Comment(cmd) => {

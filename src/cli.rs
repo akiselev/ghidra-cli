@@ -304,6 +304,9 @@ pub enum FunctionCommands {
     XRefs(FunctionGetArgs),
     /// Rename function
     Rename(RenameArgs),
+    /// Update function signature
+    #[command(alias = "set-sig", alias = "signature")]
+    SetSignature(SetSignatureArgs),
     /// Create function
     Create(CreateFunctionArgs),
     /// Delete function
@@ -333,8 +336,25 @@ impl FunctionGetArgs {
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct RenameArgs {
-    pub old_name: String,
+    /// Symbol address or name
+    pub target: String,
+    /// New name ('Name' or 'Namespace::Name')
     pub new_name: String,
+    /// Explicit namespace (overrides '::' parsing; empty string = global)
+    #[arg(long)]
+    pub namespace: Option<String>,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct SetSignatureArgs {
+    /// Function address or name
+    pub target: String,
+    /// C-style function signature (e.g. 'void foo(int a, float b)')
+    pub signature: String,
     #[arg(long)]
     pub program: Option<String>,
     #[arg(long)]
@@ -479,6 +499,9 @@ pub enum TypeCommands {
     Create(CreateTypeArgs),
     /// Apply type to address
     Apply(ApplyTypeArgs),
+    /// Import C type definitions
+    #[command(alias = "import", alias = "parse-c")]
+    ImportC(ImportCArgs),
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -501,6 +524,19 @@ pub struct CreateTypeArgs {
 pub struct ApplyTypeArgs {
     pub address: String,
     pub type_name: String,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct ImportCArgs {
+    /// C code containing type definitions
+    pub code: String,
+    /// Category path to store types in
+    #[arg(long)]
+    pub category: Option<String>,
     #[arg(long)]
     pub program: Option<String>,
     #[arg(long)]

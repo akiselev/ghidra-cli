@@ -8,6 +8,9 @@ A high-performance Rust CLI for automating Ghidra reverse engineering tasks, des
 - **Auto-start bridge** - Import/analyze commands automatically start the bridge
 - **Fast queries** - Sub-second response times with Ghidra kept in memory
 - **Comprehensive analysis** - Functions, symbols, types, strings, cross-references
+- **Type recovery** - Create data types with C syntax (structs, enums, typedefs)
+- **Function prototypes** - Adjust function signatures and calling conventions
+- **Symbol management** - Rename symbols and organize namespaces
 - **Binary patching** - Modify bytes, NOP instructions, export patches
 - **Call graphs** - Generate caller/callee graphs, export to DOT format
 - **Search capabilities** - Find strings, bytes, functions, crypto patterns
@@ -99,15 +102,20 @@ ghidra function list                   # List all functions
 ghidra function list --filter "size > 100"  # Filter by size
 ghidra decompile <name-or-addr>        # Decompile function
 ghidra disasm <address> --instructions 20  # Disassemble instructions
+ghidra function set-signature <addr> 'void __thiscall Update(float dt, int flags)'  # Set function prototype
 ```
 
 ### Symbols & Types
 ```bash
 ghidra symbol list                     # List symbols
 ghidra symbol create <addr> <name>     # Create symbol
-ghidra symbol rename <old> <new>       # Rename symbol
+ghidra symbol rename <target> <new>    # Rename symbol (address or name)
+ghidra symbol rename <target> Ns::Name # Rename + set namespace
+ghidra symbol rename <target> Name --namespace ''  # Move to global namespace
 ghidra type list                       # List data types
 ghidra type get <name>                 # Get type details
+ghidra type import-c 'struct Vec3 { float x; float y; float z; };'
+ghidra type import-c --category /Player 'struct Player { Vec3 pos; int hp; };'
 ```
 
 ### Cross-References
@@ -251,8 +259,12 @@ Example workflow with an AI agent:
 2. `ghidra find interesting` - AI analyzes suspicious patterns
 3. `ghidra decompile <func>` - AI examines specific functions
 4. `ghidra x-ref to <addr>` - AI traces data flow
-5. `ghidra patch nop <addr>` - AI patches anti-debug code
-6. `ghidra patch export -o patched.bin` - Export patched binary
+5. `ghidra type import-c --category /MyClass 'struct MyClass { ... };'` - AI defines recovered types
+6. `ghidra symbol rename <addr> MyClass::Method` - AI assigns names and namespaces
+7. `ghidra function set-signature <addr> 'void __thiscall Method(int arg)'` - AI applies function prototypes
+8. `ghidra decompile <addr>` - AI iterates on decompilation output
+9. `ghidra patch nop <addr>` - AI patches anti-debug code
+10. `ghidra patch export -o patched.bin` - Export patched binary
 
 ## Troubleshooting
 
