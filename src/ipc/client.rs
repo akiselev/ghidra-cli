@@ -199,8 +199,8 @@ impl BridgeClient {
         )
     }
 
-    pub fn symbol_delete(&self, name: &str) -> Result<serde_json::Value> {
-        self.send_command("symbol_delete", Some(json!({"name": name})))
+    pub fn symbol_delete(&self, target: &str) -> Result<serde_json::Value> {
+        self.send_command("symbol_delete", Some(json!({"target": target})))
     }
 
     pub fn symbol_rename(
@@ -211,7 +211,7 @@ impl BridgeClient {
     ) -> Result<serde_json::Value> {
         self.send_command(
             "symbol_rename",
-            Some(json!({"address": target, "new_name": new_name, "namespace": namespace})),
+            Some(json!({"target": target, "new_name": new_name, "namespace": namespace})),
         )
     }
 

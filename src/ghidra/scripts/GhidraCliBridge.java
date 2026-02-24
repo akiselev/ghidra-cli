@@ -1795,7 +1795,7 @@ public class GhidraCliBridge extends GhidraScript {
     private JsonObject handleSymbolDelete(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
 
-        String target = getArgString(args, "name");
+        String target = getArgString(args, "target");
         if (target == null) return errorResult("Symbol target required");
 
         try {
@@ -1831,7 +1831,7 @@ public class GhidraCliBridge extends GhidraScript {
     private JsonObject handleSymbolRename(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
 
-        String target = getArgString(args, "address");
+        String target = getArgString(args, "target");
         String newName = getArgString(args, "new_name");
         if (target == null) return errorResult("Symbol target required");
         if (newName == null || newName.trim().isEmpty()) {
@@ -2231,7 +2231,7 @@ public class GhidraCliBridge extends GhidraScript {
             boolean isThiscall = false;
             if (processedSig.contains("__thiscall")) {
                 isThiscall = true;
-                processedSig = processedSig.replace("__thiscall", "").replaceAll("\\s+", " ").trim();
+                processedSig = processedSig.replaceAll("\\b__thiscall\\b", "").replaceAll("\\s+", " ").trim();
             }
 
             // Ensure trailing semicolon for CParser
