@@ -293,10 +293,14 @@ pub fn start_bridge(
 
     cmd.arg(ghidra_project_dir).arg(&ghidra_project_name);
 
-    // Add mode-specific args
+    // Add mode-specific args.
+    //
+    // `-noanalysis` everywhere: the bridge must bind its socket and signal ready
+    // BEFORE any auto-analysis runs, so launch stays bounded. Analysis is driven
+    // separately as an unbounded TCP `analyze` operation (which also saves).
     match &mode {
         BridgeStartMode::Import { binary_path } => {
-            cmd.arg("-import").arg(binary_path);
+            cmd.arg("-import").arg(binary_path).arg("-noanalysis");
         }
         BridgeStartMode::Process { program_name } => {
             cmd.arg("-process").arg(program_name).arg("-noanalysis");
@@ -306,10 +310,16 @@ pub fn start_bridge(
         }
     }
 
-    // Add Java bridge script args
+    // Add Java bridge script args.
+    //
+    // `-preScript` (not `-postScript`): a preScript runs after the binary is
+    // imported/loaded (so `currentProgram` is set) but before auto-analysis.
+    // The bridge binds its ServerSocket inside run(), so as a preScript it comes
+    // up as early as possible — decoupling a bounded launch from unbounded
+    // analysis. (`-noanalysis` skips the analysis phase anyway.)
     cmd.arg("-scriptPath")
         .arg(scripts_dir.to_str().unwrap())
-        .arg("-postScript")
+        .arg("-preScript")
         .arg("GhidraCliBridge.java")
         .arg(port_file.to_str().unwrap());
 
@@ -337,6 +347,23 @@ pub fn start_bridge(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // Spawn the JVM tree in its own process group so the whole tree (the
+    // analyzeHeadless wrapper AND the java grandchild) is killable as a unit.
+    // Without this, killing only the direct child leaves an orphaned JVM that
+    // holds the stdout/stderr pipes open — which previously hung the CLI.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // New group whose id equals the child (wrapper) pid — the group leader.
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
 
     info!("Ghidra command: {:?}", cmd);
 
@@ -402,90 +429,174 @@ pub fn start_bridge(
         (false, last_error, stdout_lines)
     });
 
-    // Poll for readiness: check stdout channel and port file + TCP connect
-    let ready_timeout = Duration::from_secs(120);
-    let start_time = std::time::Instant::now();
-    let mut ready = false;
-    let mut ready_via_port_file = false;
+    // Wait for the bridge to become ready.
+    //
+    // The wait is liveness-aware: we keep waiting as long as the child process
+    // is alive (loading a large binary is part of this bounded launch) and only
+    // give up if the process exits before becoming ready, or a generous absolute
+    // safety cap (`launch_timeout_secs`) is exceeded. The cap is a safety net,
+    // NOT the normal exit path — analysis runs afterwards as an unbounded TCP op.
+    //
+    // Primary readiness signal: port file present + TCP ping succeeds (robust on
+    // Windows, where stdout piped through analyzeHeadless.bat → cmd.exe → java.exe
+    // is unreliable). The stdout JSON ready signal is kept only as a fast path.
+    let launch_timeout = crate::config::Config::load()
+        .map(|c| c.get_launch_timeout())
+        .unwrap_or_else(|_| Duration::from_secs(180));
 
-    while start_time.elapsed() < ready_timeout {
-        // Check if stdout thread got the ready signal
-        if let Ok(true) = stdout_rx.try_recv() {
-            ready = true;
-            break;
-        }
-
-        // Check if the process has exited (error case)
-        if let Ok(Some(_)) = child.try_wait() {
-            break;
-        }
-
-        // Fallback: check if port file exists and bridge responds to TCP
+    let mut ready_port: Option<u16> = None;
+    let check_ready = || {
+        let signaled = matches!(stdout_rx.try_recv(), Ok(true));
         if let Ok(Some(port)) = read_port_file(project_path) {
-            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-            if TcpStream::connect_timeout(&addr, Duration::from_secs(5)).is_ok() {
-                info!("Bridge is ready (port file fallback on port {})", port);
-                ready = true;
-                ready_via_port_file = true;
+            if signaled || BridgeClient::new(port).ping().unwrap_or(false) {
+                ready_port = Some(port);
+                return true;
+            }
+        }
+        false
+    };
+    let check_alive = || matches!(child.try_wait(), Ok(None));
+
+    let outcome = poll_until_ready(
+        Duration::from_millis(250),
+        launch_timeout,
+        check_ready,
+        check_alive,
+    );
+
+    match outcome {
+        ReadyOutcome::Ready => {
+            let port = ready_port
+                .or_else(|| read_port_file(project_path).ok().flatten())
+                .ok_or_else(|| anyhow::anyhow!("Port file not created by bridge"))?;
+            // Success path: DETACH the reader threads — do NOT join. The JVM
+            // keeps the pipes open for its whole lifetime, so joining here would
+            // block forever. They terminate on their own when the bridge exits.
+            drop(stdout_handle);
+            drop(stderr_handle);
+            info!("Ghidra bridge started on port {}", port);
+            Ok(port)
+        }
+        ReadyOutcome::Exited | ReadyOutcome::TimedOut => {
+            // Kill the ENTIRE process tree FIRST so the pipes close; only then is
+            // it safe to join the reader threads. Joining before killing was the
+            // original hang: a surviving JVM held the pipes open forever.
+            kill_process_tree(&mut child);
+            cleanup_stale_files(project_path).ok();
+
+            let (_, last_error, stdout_lines) = stdout_handle.join().unwrap_or_default();
+            let stderr_output = stderr_handle.join().unwrap_or_default();
+            let detail = if !last_error.is_empty() {
+                format!(": {}", last_error)
+            } else if !stderr_output.is_empty() {
+                let last_stderr: Vec<_> =
+                    stderr_output.iter().rev().take(5).rev().cloned().collect();
+                format!(": stderr: {}", last_stderr.join("\n"))
+            } else {
+                let last_stdout: Vec<_> =
+                    stdout_lines.iter().rev().take(10).rev().cloned().collect();
+                format!("\nLast stdout:\n{}", last_stdout.join("\n"))
+            };
+            // Surface an actionable hint when the failure is the (otherwise
+            // opaque) OSGi script compile/load failure.
+            let combined = format!("{}\n{}", stdout_lines.join("\n"), stderr_output.join("\n"));
+            let hint = bridge_failure_hint(&combined);
+
+            match outcome {
+                ReadyOutcome::Exited => anyhow::bail!(
+                    "Ghidra process exited before the bridge became ready{}{}",
+                    detail,
+                    hint
+                ),
+                ReadyOutcome::TimedOut => anyhow::bail!(
+                    "Ghidra bridge did not become ready within {}s{}{}",
+                    launch_timeout.as_secs(),
+                    detail,
+                    hint
+                ),
+                ReadyOutcome::Ready => unreachable!(),
+            }
+        }
+    }
+}
+
+/// Outcome of the bridge readiness wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadyOutcome {
+    /// The bridge bound its socket and responded.
+    Ready,
+    /// The child process exited before the bridge became ready.
+    Exited,
+    /// The absolute launch safety cap was exceeded while the child was alive.
+    TimedOut,
+}
+
+/// Liveness-aware readiness state machine. Factored out (closures injected) so
+/// the three outcomes can be unit-tested without a real Ghidra process.
+///
+/// - `check_ready`: returns true once the bridge is listening (port + ping).
+/// - `check_alive`: returns true while the launched process is still running.
+fn poll_until_ready(
+    poll_interval: Duration,
+    launch_timeout: Duration,
+    mut check_ready: impl FnMut() -> bool,
+    mut check_alive: impl FnMut() -> bool,
+) -> ReadyOutcome {
+    let start = std::time::Instant::now();
+    loop {
+        if check_ready() {
+            return ReadyOutcome::Ready;
+        }
+        if !check_alive() {
+            // Re-check readiness once: the socket may have bound in the same
+            // instant the process record flipped to exited (it shouldn't, but
+            // this avoids a benign race reporting a false failure).
+            if check_ready() {
+                return ReadyOutcome::Ready;
+            }
+            return ReadyOutcome::Exited;
+        }
+        if start.elapsed() >= launch_timeout {
+            return ReadyOutcome::TimedOut;
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
+/// Kill an entire spawned process tree (group), then reap the direct child.
+///
+/// Safe to call whether or not the process is still alive. On unix this relies
+/// on the child having been spawned with `process_group(0)` (the child is the
+/// group leader, so its pid is the group id). On windows `taskkill /T` walks
+/// the tree. After this returns, the child's stdio pipes are closed, so any
+/// reader threads can be joined without blocking.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as i32;
+        unsafe {
+            libc::killpg(pgid, libc::SIGTERM);
+        }
+        // Brief grace window for the group to exit on SIGTERM.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if !is_pid_alive(child.id()) {
                 break;
             }
+            std::thread::sleep(Duration::from_millis(50));
         }
-
-        std::thread::sleep(Duration::from_millis(500));
-    }
-
-    if !ready {
-        // Prevent orphaned JVM process: if child is still running but didn't
-        // become ready, kill it and clean up stale files
-        if let Ok(None) = child.try_wait() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        cleanup_stale_files(project_path).ok();
-
-        let (_, last_error, stdout_lines) = stdout_handle.join().unwrap_or_default();
-        let stderr_output = stderr_handle.join().unwrap_or_default();
-        let detail = if !last_error.is_empty() {
-            format!(": {}", last_error)
-        } else if !stderr_output.is_empty() {
-            let last_stderr: Vec<_> = stderr_output.iter().rev().take(5).rev().cloned().collect();
-            format!(": stderr: {}", last_stderr.join("\n"))
-        } else {
-            let last_stdout: Vec<_> = stdout_lines.iter().rev().take(10).rev().cloned().collect();
-            format!("\nLast stdout:\n{}", last_stdout.join("\n"))
-        };
-        // Surface an actionable hint when the failure is the (otherwise opaque)
-        // OSGi script compile/load failure, instead of just passing it through.
-        let combined = format!("{}\n{}", stdout_lines.join("\n"), stderr_output.join("\n"));
-        let hint = bridge_failure_hint(&combined);
-
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                anyhow::bail!("Ghidra process exited with status: {}{}{}", status, detail, hint);
-            }
-            Ok(None) => {
-                anyhow::bail!("Ghidra bridge did not send ready signal{}{}", detail, hint);
-            }
-            Err(e) => {
-                anyhow::bail!("Error checking process status: {}", e);
-            }
+        // Force-kill the whole group. ESRCH on an already-dead group is harmless.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
         }
     }
-
-    // If we discovered readiness via port file, the stdout thread may still be
-    // blocking. That's fine - it will terminate when the bridge eventually exits
-    // and closes stdout. We intentionally don't join it here.
-    if !ready_via_port_file {
-        // Stdout thread delivered the signal, safe to join
-        drop(stdout_handle);
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .output();
     }
-
-    // Read port from port file
-    let port = read_port_file(project_path)?
-        .ok_or_else(|| anyhow::anyhow!("Port file not created by bridge"))?;
-
-    info!("Ghidra bridge started on port {}", port);
-    Ok(port)
+    let _ = child.wait();
 }
 
 /// Stop the bridge for a project.
@@ -516,7 +627,15 @@ pub fn stop_bridge(project_path: &Path) -> Result<()> {
             warn!("Killing bridge process {} as fallback", pid);
             #[cfg(unix)]
             unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
+                // Kill the whole process group (the JVM was spawned into the
+                // analyzeHeadless wrapper's group). Fall back to a single-pid
+                // kill if the group id can't be resolved.
+                let pgid = libc::getpgid(pid as i32);
+                if pgid > 0 {
+                    libc::killpg(pgid, libc::SIGTERM);
+                } else {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
             }
             #[cfg(windows)]
             {
@@ -540,7 +659,12 @@ pub fn stop_bridge(project_path: &Path) -> Result<()> {
             if is_pid_alive(pid) {
                 warn!("SIGKILL bridge process {} (SIGTERM didn't work)", pid);
                 unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
+                    let pgid = libc::getpgid(pid as i32);
+                    if pgid > 0 {
+                        libc::killpg(pgid, libc::SIGKILL);
+                    } else {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
                 }
                 // Brief wait for SIGKILL to take effect
                 for _ in 0..20 {
@@ -689,5 +813,93 @@ pub fn find_headless_script(ghidra_install_dir: &Path) -> Result<PathBuf> {
         Ok(script_path)
     } else {
         anyhow::bail!("analyzeHeadless not found at: {}", support_dir.display())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn ready_when_socket_binds_while_alive() {
+        // Becomes ready on the 3rd poll; process stays alive throughout.
+        let polls = Cell::new(0);
+        let outcome = poll_until_ready(
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+            || {
+                polls.set(polls.get() + 1);
+                polls.get() >= 3
+            },
+            || true,
+        );
+        assert_eq!(outcome, ReadyOutcome::Ready);
+    }
+
+    #[test]
+    fn exited_when_process_dies_before_ready() {
+        let alive = Cell::new(true);
+        let outcome = poll_until_ready(
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+            || false, // never ready
+            || {
+                let was = alive.get();
+                alive.set(false); // dies after the first liveness check
+                was
+            },
+        );
+        assert_eq!(outcome, ReadyOutcome::Exited);
+    }
+
+    #[test]
+    fn timed_out_when_never_ready_but_alive() {
+        let outcome = poll_until_ready(
+            Duration::from_millis(5),
+            Duration::from_millis(30), // tiny cap
+            || false,                  // never ready
+            || true,                   // always alive
+        );
+        assert_eq!(outcome, ReadyOutcome::TimedOut);
+    }
+
+    /// Spawn a shell that itself spawns a long-lived child, then prove
+    /// `kill_process_tree` takes out the whole group (not just the wrapper).
+    #[cfg(unix)]
+    #[test]
+    fn kill_process_tree_kills_whole_group() {
+        use std::os::unix::process::CommandExt;
+
+        let mut cmd = std::process::Command::new("sh");
+        // Print the grandchild's pid, then sleep both shell and grandchild.
+        cmd.arg("-c").arg("sleep 300 & echo $! ; wait");
+        cmd.stdout(Stdio::piped());
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn sh");
+
+        // Read the grandchild (sleep) pid that the shell printed.
+        let mut line = String::new();
+        {
+            let stdout = child.stdout.take().unwrap();
+            let mut reader = BufReader::new(stdout);
+            reader.read_line(&mut line).expect("read grandchild pid");
+        }
+        let grandchild: u32 = line.trim().parse().expect("parse grandchild pid");
+
+        assert!(is_pid_alive(grandchild), "grandchild should be alive");
+        kill_process_tree(&mut child);
+
+        // The group-kill should have reaped the grandchild too. Allow a brief
+        // moment for the kernel to deliver SIGKILL.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && is_pid_alive(grandchild) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !is_pid_alive(grandchild),
+            "grandchild {} should be dead after kill_process_tree",
+            grandchild
+        );
     }
 }

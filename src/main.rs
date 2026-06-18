@@ -17,7 +17,7 @@ use ghidra::GhidraClient;
 use ipc::client::BridgeClient;
 use query::Query;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
@@ -462,48 +462,54 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                 anyhow::bail!("Binary not found: {}", args.binary);
             }
 
-            // First, robustly check if a bridge is already running using ensure_bridge_running
-            // with Project mode. This will reuse an existing bridge or start a minimal one.
-            let existing_bridge_port = bridge::read_port_file(&project_path)
-                .ok()
-                .flatten()
-                .and_then(|port| {
-                    // Verify this port is actually reachable
-                    let client = BridgeClient::new(port);
-                    if client.ping().unwrap_or(false) {
-                        Some(port)
-                    } else {
-                        None
-                    }
-                });
-
-            if let Some(port) = existing_bridge_port {
-                // Bridge is running - import via TCP command
+            // Acquire a bridge connection and the imported program's name. Three
+            // hang-proof cases (see docs/plans/prescript-fix.md §3.3):
+            //   1. Bridge already running    -> TCP import into the live project.
+            //   2. Project exists, no bridge -> fast launch (Project mode), TCP import.
+            //   3. Brand-new project         -> bootstrap via `-import -noanalysis`
+            //      (only `-import` can create a project; analysis is skipped at
+            //      launch and driven over TCP below).
+            // The launch is bounded (the bridge binds its socket before analysis);
+            // analysis afterwards runs as an unbounded TCP operation.
+            let (client, program_name) = if let Some(port) =
+                bridge::is_bridge_running(&project_path)
+            {
                 let client = BridgeClient::new(port);
                 verify_bridge(&client)?;
+                if !cli.quiet {
+                    eprintln!("Importing into running bridge...");
+                }
                 let result = client.import_binary(&args.binary, args.program.as_deref())?;
-
-                let program_name = args.program.clone().unwrap_or_else(|| {
+                let name = args.program.clone().unwrap_or_else(|| {
                     result
                         .get("program")
                         .and_then(|p| p.as_str())
                         .unwrap_or("unknown")
                         .to_string()
                 });
-
-                // Switch to the newly imported program
-                client.open_program(&program_name)?;
+                client.open_program(&name)?;
+                (client, name)
+            } else if project_exists(&project_path) {
                 if !cli.quiet {
-                    eprintln!("Successfully imported as: {}", program_name);
+                    eprintln!("Starting Ghidra bridge...");
                 }
-                json!({
-                    "command": "import",
-                    "program": program_name,
-                    "status": "success",
-                    "data": result
-                })
+                let port = bridge::ensure_bridge_running(
+                    &project_path,
+                    &ghidra_install_dir,
+                    BridgeStartMode::Project,
+                )?;
+                let client = BridgeClient::new(port);
+                let result = client.import_binary(&args.binary, args.program.as_deref())?;
+                let name = args.program.clone().unwrap_or_else(|| {
+                    result
+                        .get("program")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("unknown")
+                        .to_string()
+                });
+                client.open_program(&name)?;
+                (client, name)
             } else {
-                // No bridge running - start one in import mode
                 if !cli.quiet {
                     eprintln!("Starting Ghidra bridge...");
                 }
@@ -514,24 +520,50 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                         binary_path: args.binary.clone(),
                     },
                 )?;
+                // `-import` already loaded the binary; the bridge's currentProgram
+                // is it. Prefer its real (domain) name for reporting.
                 let client = BridgeClient::new(port);
-                let info = client.program_info()?;
-                let program_name = args.program.clone().unwrap_or_else(|| {
-                    info.get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("unknown")
-                        .to_string()
-                });
+                let name = client
+                    .program_info()
+                    .ok()
+                    .and_then(|i| {
+                        i.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .or_else(|| args.program.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                (client, name)
+            };
+
+            // Run analysis as an UNBOUNDED operation unless the user opted out.
+            // handleAnalyze runs analyzeAll + program.save(), so the program
+            // persists without relying on a clean bridge shutdown.
+            let analyze_data = if args.no_analyze {
                 if !cli.quiet {
-                    eprintln!("Successfully imported as: {}", program_name);
+                    eprintln!("Skipping analysis (--no-analyze).");
                 }
-                json!({
-                    "command": "import",
-                    "program": program_name,
-                    "status": "success",
-                    "data": info
-                })
+                json!(null)
+            } else {
+                if !cli.quiet {
+                    eprintln!("Analyzing {}...", program_name);
+                }
+                let d = client.analyze()?;
+                if !cli.quiet {
+                    eprintln!("Analysis complete!");
+                }
+                d
+            };
+
+            if !cli.quiet {
+                eprintln!("Successfully imported as: {}", program_name);
             }
+            json!({
+                "command": "import",
+                "program": program_name,
+                "status": "success",
+                "data": { "analyze": analyze_data }
+            })
         }
 
         _ => {
@@ -1636,6 +1668,22 @@ fn verify_bridge(client: &BridgeClient) -> anyhow::Result<()> {
         anyhow::bail!("Bridge not responding to ping");
     }
     Ok(())
+}
+
+/// Whether a Ghidra project already exists on disk for the given project path.
+///
+/// `project_path` is `<parent>/<name>`; analyzeHeadless materializes the project
+/// as sibling `<parent>/<name>.gpr` (project file) and `<parent>/<name>.rep`
+/// (project directory). Either marks an existing project we can `-process`.
+fn project_exists(project_path: &Path) -> bool {
+    match (project_path.file_name(), project_path.parent()) {
+        (Some(name), Some(parent)) => {
+            let name = name.to_string_lossy();
+            parent.join(format!("{}.gpr", name)).exists()
+                || parent.join(format!("{}.rep", name)).exists()
+        }
+        _ => false,
+    }
 }
 
 /// Resolve a project name to its full path on disk.

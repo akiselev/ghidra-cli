@@ -16,6 +16,12 @@ pub struct Config {
     pub default_output_format: Option<String>,
     pub default_limit: Option<usize>,
     pub timeout: Option<u64>,
+    /// Bounded cap (seconds) for bridge launch readiness: JVM start + OSGi
+    /// compile + project open + binary load. Does NOT cover analysis, which runs
+    /// as an unbounded TCP operation. Overridable via `GHIDRA_CLI_LAUNCH_TIMEOUT`.
+    /// Defaults to 180s when unset (must accommodate the first-run OSGi compile).
+    #[serde(default)]
+    pub launch_timeout_secs: Option<u64>,
     pub aliases: std::collections::HashMap<String, String>,
 }
 
@@ -30,6 +36,7 @@ impl Default for Config {
             default_output_format: Some("auto".to_string()),
             default_limit: Some(1000),
             timeout: Some(300),
+            launch_timeout_secs: None,
             aliases: std::collections::HashMap::new(),
         }
     }
@@ -175,6 +182,17 @@ impl Config {
         std::env::var("GHIDRA_DEFAULT_PROGRAM")
             .ok()
             .or_else(|| self.default_program.clone())
+    }
+
+    /// Bounded cap for bridge launch readiness. `GHIDRA_CLI_LAUNCH_TIMEOUT`
+    /// (seconds) overrides the config value, which overrides the 180s default.
+    pub fn get_launch_timeout(&self) -> std::time::Duration {
+        let secs = std::env::var("GHIDRA_CLI_LAUNCH_TIMEOUT")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .or(self.launch_timeout_secs)
+            .unwrap_or(180);
+        std::time::Duration::from_secs(secs)
     }
 }
 

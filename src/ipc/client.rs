@@ -13,6 +13,24 @@ use tracing::debug;
 
 use super::protocol::{BridgeRequest, BridgeResponse};
 
+/// Default socket read timeout for short, interactive commands.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Read timeout for long-running operations (analyze/import of large binaries).
+///
+/// `None` means block until the bridge responds or the connection drops — these
+/// ops can legitimately exceed any fixed cap. Power users can impose a ceiling
+/// via `GHIDRA_CLI_OP_TIMEOUT` (seconds); `0` or unset means unbounded.
+fn long_op_timeout() -> Option<Duration> {
+    match std::env::var("GHIDRA_CLI_OP_TIMEOUT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        Some(0) | None => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+    }
+}
+
 /// Client for communicating with the Ghidra Java bridge.
 pub struct BridgeClient {
     port: u16,
@@ -31,10 +49,28 @@ impl BridgeClient {
     }
 
     /// Send a command to the bridge and return the result.
+    ///
+    /// Uses [`DEFAULT_READ_TIMEOUT`] for the response wait — suitable for short,
+    /// interactive commands. Long-running ops should use
+    /// [`Self::send_command_with_timeout`] with an unbounded read timeout.
     pub fn send_command(
         &self,
         command: &str,
         args: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        self.send_command_with_timeout(command, args, Some(DEFAULT_READ_TIMEOUT))
+    }
+
+    /// Send a command with an explicit socket read timeout.
+    ///
+    /// `read_timeout = None` blocks until the bridge responds or the connection
+    /// drops — required for operations whose duration is unbounded (e.g. analysis
+    /// of a large binary), which would otherwise spuriously time out.
+    pub fn send_command_with_timeout(
+        &self,
+        command: &str,
+        args: Option<serde_json::Value>,
+        read_timeout: Option<Duration>,
     ) -> Result<serde_json::Value> {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", self.port)
             .parse()
@@ -43,7 +79,9 @@ impl BridgeClient {
             TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(|e| {
                 anyhow::anyhow!("Failed to connect to bridge on port {}: {}", self.port, e)
             })?;
-        stream.set_read_timeout(Some(Duration::from_secs(300))).ok();
+        // `None` => blocking reads (no timeout). A long analysis can exceed any
+        // fixed cap, so callers route those ops through here with `None`.
+        stream.set_read_timeout(read_timeout).ok();
         stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
 
         let request = BridgeRequest {
@@ -79,8 +117,11 @@ impl BridgeClient {
     }
 
     /// Check if bridge is responding.
+    ///
+    /// Uses a short read timeout so readiness polling stays snappy (a missing
+    /// or unbound socket fails fast rather than blocking).
     pub fn ping(&self) -> Result<bool> {
-        match self.send_command("ping", None) {
+        match self.send_command_with_timeout("ping", None, Some(Duration::from_secs(5))) {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
         }
@@ -167,21 +208,24 @@ impl BridgeClient {
         self.send_command("xrefs_from", Some(json!({"address": address})))
     }
 
-    /// Import a binary.
+    /// Import a binary. Unbounded read timeout: importing a large binary can
+    /// take a long time.
     pub fn import_binary(
         &self,
         binary_path: &str,
         program: Option<&str>,
     ) -> Result<serde_json::Value> {
-        self.send_command(
+        self.send_command_with_timeout(
             "import",
             Some(json!({"binary_path": binary_path, "program": program})),
+            long_op_timeout(),
         )
     }
 
-    /// Analyze the current program.
+    /// Analyze the current program. Unbounded read timeout: full auto-analysis
+    /// can exceed any fixed cap on large/complex binaries.
     pub fn analyze(&self) -> Result<serde_json::Value> {
-        self.send_command("analyze", None)
+        self.send_command_with_timeout("analyze", None, long_op_timeout())
     }
 
     /// List programs in the project.
