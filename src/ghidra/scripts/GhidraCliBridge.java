@@ -2923,8 +2923,11 @@ public class GhidraCliBridge extends GhidraScript {
             node.addProperty("address", funcAddr);
             nodes.add(node);
 
-            Reference[] refs = refMgr.getReferencesFrom(func.getEntryPoint());
-            for (Reference ref : refs) {
+            ghidra.program.model.address.AddressIterator refSrcIter =
+                refMgr.getReferenceSourceIterator(func.getBody(), true);
+            while (refSrcIter.hasNext()) {
+                Address fromAddr = refSrcIter.next();
+                for (Reference ref : refMgr.getReferencesFrom(fromAddr)) {
                 if (ref.getReferenceType().isCall()) {
                     Address targetAddr = ref.getToAddress();
                     Function targetFunc = fm.getFunctionAt(targetAddr);
@@ -2935,6 +2938,7 @@ public class GhidraCliBridge extends GhidraScript {
                         edge.addProperty("type", "call");
                         edges.add(edge);
                     }
+                }
                 }
             }
             count++;
@@ -3055,21 +3059,25 @@ public class GhidraCliBridge extends GhidraScript {
         if (visited.contains(funcAddrStr)) return;
         visited.add(funcAddrStr);
 
-        Reference[] refs = refMgr.getReferencesFrom(func.getEntryPoint());
-        for (Reference ref : refs) {
-            if (ref.getReferenceType().isCall()) {
-                Address toAddr = ref.getToAddress();
-                Function calleeFunc = fm.getFunctionAt(toAddr);
-                if (calleeFunc != null) {
-                    JsonObject calleeInfo = new JsonObject();
-                    calleeInfo.addProperty("name", calleeFunc.getName());
-                    calleeInfo.addProperty("address", calleeFunc.getEntryPoint().toString());
-                    calleeInfo.addProperty("call_site", ref.getFromAddress().toString());
-                    calleeInfo.addProperty("depth", currentDepth);
-                    callees.add(calleeInfo);
+        ghidra.program.model.address.AddressIterator refSrcIter =
+            refMgr.getReferenceSourceIterator(func.getBody(), true);
+        while (refSrcIter.hasNext()) {
+            Address fromAddr = refSrcIter.next();
+            for (Reference ref : refMgr.getReferencesFrom(fromAddr)) {
+                if (ref.getReferenceType().isCall()) {
+                    Address toAddr = ref.getToAddress();
+                    Function calleeFunc = fm.getFunctionAt(toAddr);
+                    if (calleeFunc != null) {
+                        JsonObject calleeInfo = new JsonObject();
+                        calleeInfo.addProperty("name", calleeFunc.getName());
+                        calleeInfo.addProperty("address", calleeFunc.getEntryPoint().toString());
+                        calleeInfo.addProperty("call_site", ref.getFromAddress().toString());
+                        calleeInfo.addProperty("depth", currentDepth);
+                        callees.add(calleeInfo);
 
-                    if (maxDepth == 0 || currentDepth + 1 < maxDepth) {
-                        findCalleesRecursive(calleeFunc, currentDepth + 1, maxDepth, callees, visited, refMgr, fm);
+                        if (maxDepth == 0 || currentDepth + 1 < maxDepth) {
+                            findCalleesRecursive(calleeFunc, currentDepth + 1, maxDepth, callees, visited, refMgr, fm);
+                        }
                     }
                 }
             }

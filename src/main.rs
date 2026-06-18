@@ -364,6 +364,18 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
 /// Extract QueryOptions from a command, if it has them.
 fn extract_query_options(command: &Commands) -> Option<QueryOptions> {
     match command {
+        Commands::Query(args) => Some(QueryOptions {
+            program: args.program.clone(),
+            project: args.project.clone(),
+            filter: args.filter.clone(),
+            fields: args.fields.clone(),
+            format: args.format.clone(),
+            limit: args.limit,
+            offset: args.offset,
+            sort: args.sort.clone(),
+            count: args.count,
+            json: args.json,
+        }),
         Commands::Summary(args) => Some(args.options.clone()),
         Commands::Decompile(args) => Some(args.options.clone()),
         Commands::Disasm(args) => Some(args.options.clone()),
@@ -711,6 +723,26 @@ fn is_unknown_command_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("Unknown command:")
 }
 
+/// The bridge's list handlers only support a literal substring match on the
+/// primary name field, not the full filter DSL implemented client-side in
+/// `query::Filter`. When a full filter expression, sort, or count is requested,
+/// fetch the complete dataset (no server-side limit/filter) so Rust-side query
+/// processing can filter, sort, and paginate correctly.
+fn bridge_list_params(
+    limit: Option<usize>,
+    filter: Option<String>,
+    sort: Option<&str>,
+    count: bool,
+    offset: Option<usize>,
+    default_limit: Option<usize>,
+) -> (Option<usize>, Option<String>) {
+    if filter.is_some() || sort.is_some() || count || offset.is_some() {
+        (None, None)
+    } else {
+        (limit.or(default_limit), filter)
+    }
+}
+
 /// Execute a command via the bridge client.
 fn execute_via_bridge(
     client: &BridgeClient,
@@ -737,8 +769,28 @@ fn execute_via_bridge(
             }))
         }
         Commands::Query(args) => match args.data_type.as_str() {
-            "functions" => client.list_functions(args.limit.or(default_limit), args.filter.clone()),
-            "strings" => client.list_strings(args.limit.or(default_limit), args.filter.clone()),
+            "functions" => {
+                let (lim, filt) = bridge_list_params(
+                    args.limit,
+                    args.filter.clone(),
+                    args.sort.as_deref(),
+                    args.count,
+                    args.offset,
+                    default_limit,
+                );
+                client.list_functions(lim, filt)
+            }
+            "strings" => {
+                let (lim, filt) = bridge_list_params(
+                    args.limit,
+                    args.filter.clone(),
+                    args.sort.as_deref(),
+                    args.count,
+                    args.offset,
+                    default_limit,
+                );
+                client.list_strings(lim, filt)
+            }
             "imports" => client.list_imports(),
             "exports" => client.list_exports(),
             "memory" => client.memory_map(),
@@ -753,7 +805,15 @@ fn execute_via_bridge(
             use cli::FunctionCommands;
             match cmd {
                 FunctionCommands::List(opts) => {
-                    client.list_functions(opts.limit.or(default_limit), opts.filter.clone())
+                    let (lim, filt) = bridge_list_params(
+                        opts.limit,
+                        opts.filter.clone(),
+                        opts.sort.as_deref(),
+                        opts.count,
+                        opts.offset,
+                        default_limit,
+                    );
+                    client.list_functions(lim, filt)
                 }
                 FunctionCommands::Decompile(args) => client.decompile(
                     args.resolved_target().to_string(),
@@ -824,7 +884,15 @@ fn execute_via_bridge(
             use cli::StringsCommands;
             match cmd {
                 StringsCommands::List(opts) => {
-                    client.list_strings(opts.limit.or(default_limit), opts.filter.clone())
+                    let (lim, filt) = bridge_list_params(
+                        opts.limit,
+                        opts.filter.clone(),
+                        opts.sort.as_deref(),
+                        opts.count,
+                        opts.offset,
+                        default_limit,
+                    );
+                    client.list_strings(lim, filt)
                 }
                 StringsCommands::Refs(args) => client.xrefs_to(args.string.clone()),
             }
@@ -861,10 +929,26 @@ fn execute_via_bridge(
                 DumpCommands::Imports(_) => client.list_imports(),
                 DumpCommands::Exports(_) => client.list_exports(),
                 DumpCommands::Functions(opts) => {
-                    client.list_functions(opts.limit.or(default_limit), opts.filter.clone())
+                    let (lim, filt) = bridge_list_params(
+                        opts.limit,
+                        opts.filter.clone(),
+                        opts.sort.as_deref(),
+                        opts.count,
+                        opts.offset,
+                        default_limit,
+                    );
+                    client.list_functions(lim, filt)
                 }
                 DumpCommands::Strings(opts) => {
-                    client.list_strings(opts.limit.or(default_limit), opts.filter.clone())
+                    let (lim, filt) = bridge_list_params(
+                        opts.limit,
+                        opts.filter.clone(),
+                        opts.sort.as_deref(),
+                        opts.count,
+                        opts.offset,
+                        default_limit,
+                    );
+                    client.list_strings(lim, filt)
                 }
             }
         }
@@ -907,7 +991,15 @@ fn execute_via_bridge(
             use cli::SymbolCommands;
             match cmd {
                 SymbolCommands::List(opts) => {
-                    client.symbol_list(opts.limit.or(default_limit), opts.filter.as_deref())
+                    let (lim, filt) = bridge_list_params(
+                        opts.limit,
+                        opts.filter.clone(),
+                        opts.sort.as_deref(),
+                        opts.count,
+                        opts.offset,
+                        default_limit,
+                    );
+                    client.symbol_list(lim, filt.as_deref())
                 }
                 SymbolCommands::Get(args) => client.symbol_get(&args.name),
                 SymbolCommands::Create(args) => client.symbol_create(&args.address, &args.name),
@@ -921,7 +1013,15 @@ fn execute_via_bridge(
             use cli::TypeCommands;
             match cmd {
                 TypeCommands::List(opts) => {
-                    client.type_list(opts.limit.or(default_limit), opts.filter.as_deref())
+                    let (lim, filt) = bridge_list_params(
+                        opts.limit,
+                        opts.filter.clone(),
+                        opts.sort.as_deref(),
+                        opts.count,
+                        opts.offset,
+                        default_limit,
+                    );
+                    client.type_list(lim, filt.as_deref())
                 }
                 TypeCommands::Get(args) => client.type_get(&args.name),
                 TypeCommands::Create(args) => client.type_create(&args.definition),
@@ -972,7 +1072,15 @@ fn execute_via_bridge(
             use cli::CommentCommands;
             match cmd {
                 CommentCommands::List(opts) => {
-                    client.comment_list(opts.limit.or(default_limit), opts.filter.as_deref())
+                    let (lim, filt) = bridge_list_params(
+                        opts.limit,
+                        opts.filter.clone(),
+                        opts.sort.as_deref(),
+                        opts.count,
+                        opts.offset,
+                        default_limit,
+                    );
+                    client.comment_list(lim, filt.as_deref())
                 }
                 CommentCommands::Get(args) => client.comment_get(&args.address),
                 CommentCommands::Set(args) => {

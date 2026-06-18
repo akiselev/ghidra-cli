@@ -84,9 +84,13 @@ impl Query {
         let has_fields = opts.fields.is_some();
         let has_sort = opts.sort.is_some();
         let has_count = opts.count;
+        let has_offset = opts.offset.is_some();
 
-        // No query processing needed if no filter/fields/sort/count
-        if !has_filter && !has_fields && !has_sort && !has_count {
+        // No query processing needed if no filter/fields/sort/count/offset.
+        // Offset must be handled here because the bridge never paginates —
+        // when it's set, `bridge_list_params` (main.rs) fetches the full
+        // dataset and this Query must apply the real offset/limit itself.
+        if !has_filter && !has_fields && !has_sort && !has_count && !has_offset {
             return Ok(None);
         }
 
@@ -103,8 +107,11 @@ impl Query {
             filter,
             fields,
             format,
-            limit: None, // limit/offset already handled by bridge
-            offset: None,
+            // The bridge only skips limit/filter when filter/sort/count/offset is
+            // requested (see `bridge_list_params` in main.rs) — in that case it
+            // returns the full dataset and we must paginate here ourselves.
+            limit: opts.limit,
+            offset: opts.offset,
             sort,
             count_only: has_count,
         }))

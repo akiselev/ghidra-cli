@@ -420,16 +420,16 @@ impl BridgeClient {
     }
 
     pub fn program_close(&self) -> Result<serde_json::Value> {
-        self.send_command("close_program", None)
+        self.send_command("program_close", None)
     }
 
     pub fn program_delete(&self, program: &str) -> Result<serde_json::Value> {
-        self.send_command("delete_program", Some(json!({"program": program})))
+        self.send_command("program_delete", Some(json!({"program": program})))
     }
 
     pub fn program_export(&self, format: &str, output: Option<&str>) -> Result<serde_json::Value> {
         self.send_command(
-            "export_program",
+            "program_export",
             Some(json!({"format": format, "output": output})),
         )
     }
