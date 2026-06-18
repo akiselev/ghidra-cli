@@ -1,6 +1,6 @@
 [package]
 name = "ghidra-cli"
-version = "0.1.10"
+version = "0.2.0"
 edition = "2021"
 authors = ["Alexander Kiselev"]
 description = "Rust CLI to run Ghidra headless for reverse engineering with Claude Code and other agents"

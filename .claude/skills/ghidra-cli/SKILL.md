@@ -44,9 +44,8 @@ CLI (Rust/clap) ──TCP──► GhidraCliBridge.java (GhidraScript in Ghidra 
 ## Quick Start
 
 ```bash
-# Fastest path: import + analyze, bridge starts automatically
+# Fastest path: import runs auto-analysis automatically; bridge starts on demand
 ghidra import ./binary --project myproject
-ghidra analyze --project myproject --program mybinary
 
 # All subsequent queries reuse the running bridge
 ghidra function list --project myproject
@@ -77,11 +76,13 @@ ghidra project delete NAME
 ### Import & Analysis
 
 ```bash
-ghidra import BINARY [--project P] [--program PROG] [--detach]
+ghidra import BINARY [--project P] [--program PROG] [--no-analyze] [--detach]
 ghidra analyze [--project P] [--program PROG] [--detach]
 ```
 
-Both auto-start bridge. `--detach` returns immediately.
+Both auto-start the bridge. `ghidra import` runs auto-analysis by default (and
+persists the program); pass `--no-analyze` for a raw import without analysis.
+`--detach` returns immediately.
 
 ### Program Management
 

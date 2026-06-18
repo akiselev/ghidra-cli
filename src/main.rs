@@ -1551,13 +1551,44 @@ fn handle_project_command(cmd: cli::ProjectCommands) -> anyhow::Result<()> {
             }
         }
         ProjectCommands::Delete { name } => {
+            // analyzeHeadless materializes a project as sibling files
+            // `<parent>/<basename>.gpr` (descriptor) + `<basename>.rep` (data dir),
+            // NOT a `<parent>/<basename>` directory. Derive the real paths from the
+            // basename so absolute project names work too. `create_project` may
+            // also have left an empty `<parent>/<basename>` directory.
             let project_path = client.get_project_path(&name);
-            if project_path.exists() {
-                std::fs::remove_dir_all(&project_path)?;
-                println!("Project '{}' deleted", name);
-            } else {
+            let (basename, parent) =
+                match (project_path.file_name(), project_path.parent()) {
+                    (Some(f), Some(p)) => (f.to_string_lossy().to_string(), p.to_path_buf()),
+                    _ => {
+                        println!("Project '{}' not found", name);
+                        return Ok(());
+                    }
+                };
+            let gpr = parent.join(format!("{}.gpr", basename));
+            let rep = parent.join(format!("{}.rep", basename));
+            let legacy_dir = project_path.clone();
+
+            if !gpr.exists() && !rep.exists() && !legacy_dir.is_dir() {
                 println!("Project '{}' not found", name);
+                return Ok(());
             }
+
+            // Stop any running bridge first so the JVM releases the project lock
+            // before we delete its files. stop_bridge also clears the stale
+            // port/pid/`.lock`/`.lock~` files via cleanup_stale_files.
+            let _ = bridge::stop_bridge(&project_path);
+
+            if gpr.exists() {
+                std::fs::remove_file(&gpr)?;
+            }
+            if rep.exists() {
+                std::fs::remove_dir_all(&rep)?;
+            }
+            if legacy_dir.is_dir() {
+                std::fs::remove_dir_all(&legacy_dir)?;
+            }
+            println!("Project '{}' deleted", name);
         }
         ProjectCommands::Info { name } => {
             let project_name = name.unwrap_or_else(|| "default".to_string());
