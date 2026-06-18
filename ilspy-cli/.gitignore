@@ -1,7 +1,0 @@
-/target
-tests/fixtures/SampleLib/bin/
-tests/fixtures/SampleLib/obj/
-
-bridge/bin/
-bridge/obj/
-decompiled/
