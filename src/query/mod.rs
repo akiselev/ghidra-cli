@@ -85,12 +85,15 @@ impl Query {
         let has_sort = opts.sort.is_some();
         let has_count = opts.count;
         let has_offset = opts.offset.is_some();
+        let has_limit = opts.limit.is_some();
 
-        // No query processing needed if no filter/fields/sort/count/offset.
-        // Offset must be handled here because the bridge never paginates —
-        // when it's set, `bridge_list_params` (main.rs) fetches the full
-        // dataset and this Query must apply the real offset/limit itself.
-        if !has_filter && !has_fields && !has_sort && !has_count && !has_offset {
+        // No query processing needed if no filter/fields/sort/count/offset/limit.
+        // Offset and limit must be handled here because some bridge list handlers
+        // (e.g. imports/exports) never paginate — when either is set,
+        // `bridge_list_params` (main.rs) may fetch the full dataset and this Query
+        // must apply the real offset/limit itself. Applying the limit again on a
+        // dataset the bridge already capped is idempotent, so this is safe.
+        if !has_filter && !has_fields && !has_sort && !has_count && !has_offset && !has_limit {
             return Ok(None);
         }
 

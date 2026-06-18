@@ -1559,7 +1559,61 @@ public class GhidraCliBridge extends GhidraScript {
                 return data;
             }
         } else {
-            return errorResult("Unsupported export format: " + exportFormat);
+            // Generic path: dispatch to a built-in Ghidra Exporter resolved by name.
+            // Resolving via the exporter registry (rather than a hardcoded class +
+            // signature) keeps this working across Ghidra versions.
+            if (outputPath == null || outputPath.isEmpty()) {
+                return errorResult("Output path required for format: " + exportFormat);
+            }
+            try {
+                // Map short format codes to the concrete Ghidra Exporter classes.
+                // Instantiating the class directly avoids depending on a registry
+                // lookup API whose name has changed across Ghidra versions.
+                java.util.Map<String, String> classMap = new java.util.HashMap<>();
+                classMap.put("xml", "ghidra.app.util.exporter.XmlExporter");
+                classMap.put("c", "ghidra.app.util.exporter.CppExporter");
+                classMap.put("cpp", "ghidra.app.util.exporter.CppExporter");
+                classMap.put("binary", "ghidra.app.util.exporter.BinaryExporter");
+                classMap.put("bin", "ghidra.app.util.exporter.BinaryExporter");
+                classMap.put("gzf", "ghidra.app.util.exporter.GzfExporter");
+                classMap.put("asm", "ghidra.app.util.exporter.AsciiExporter");
+                classMap.put("ascii", "ghidra.app.util.exporter.AsciiExporter");
+                classMap.put("hex", "ghidra.app.util.exporter.IntelHexExporter");
+                classMap.put("html", "ghidra.app.util.exporter.HtmlExporter");
+
+                String className = classMap.get(exportFormat.toLowerCase());
+                if (className == null) {
+                    return errorResult("Unsupported export format: " + exportFormat
+                        + " (supported: json, xml, c, binary, gzf, ascii/asm, hex, html)");
+                }
+
+                Class<?> exporterClass = Class.forName(className);
+                Object exporter = exporterClass.getDeclaredConstructor().newInstance();
+
+                // Resolve export(File, DomainObject, AddressSetView, TaskMonitor) by
+                // name + arity to tolerate signature drift across Ghidra versions.
+                java.lang.reflect.Method exportMethod = null;
+                for (java.lang.reflect.Method m : exporterClass.getMethods()) {
+                    if (m.getName().equals("export") && m.getParameterCount() == 4) {
+                        exportMethod = m;
+                        break;
+                    }
+                }
+                if (exportMethod == null) {
+                    return errorResult("Exporter has no 4-arg export method: " + exportFormat);
+                }
+
+                TaskMonitor mon = new ConsoleTaskMonitor();
+                exportMethod.invoke(exporter, new File(outputPath), currentProgram, null, mon);
+
+                JsonObject result = new JsonObject();
+                result.addProperty("status", "exported");
+                result.addProperty("format", exportFormat);
+                result.addProperty("output", outputPath);
+                return result;
+            } catch (Exception e) {
+                return errorResult("Failed to export (" + exportFormat + "): " + e.getMessage());
+            }
         }
     }
 
@@ -3354,13 +3408,25 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         try {
-            // Use reflection to access BinaryExporter which may not always be available
+            // Use reflection to access BinaryExporter which may not always be available.
+            // The base Exporter.export() declares its second parameter as DomainObject
+            // (not Program), and the exact signature has drifted across Ghidra versions,
+            // so resolve the method by name + 4-arg arity rather than exact param types
+            // (a hardcoded Program.class lookup throws NoSuchMethodException on Ghidra 12).
             Class<?> exporterClass = Class.forName("ghidra.app.util.exporter.BinaryExporter");
             Object exporter = exporterClass.getDeclaredConstructor().newInstance();
 
-            java.lang.reflect.Method exportMethod = exporterClass.getMethod("export",
-                File.class, ghidra.program.model.listing.Program.class,
-                ghidra.program.model.address.AddressSetView.class, TaskMonitor.class);
+            java.lang.reflect.Method exportMethod = null;
+            for (java.lang.reflect.Method m : exporterClass.getMethods()) {
+                if (m.getName().equals("export") && m.getParameterCount() == 4) {
+                    exportMethod = m;
+                    break;
+                }
+            }
+            if (exportMethod == null) {
+                return errorResult(
+                    "BinaryExporter.export(File, DomainObject, AddressSetView, TaskMonitor) not found");
+            }
 
             File outputFile = new File(outputPath);
             TaskMonitor mon = new ConsoleTaskMonitor();

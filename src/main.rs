@@ -1703,7 +1703,10 @@ fn handle_project_command(cmd: cli::ProjectCommands) -> anyhow::Result<()> {
             let project_path = client.get_project_path(&project_name);
             println!("Project: {}", project_name);
             println!("Path: {}", project_path.display());
-            println!("Exists: {}", project_path.exists());
+            // The project lives on disk as sibling `<name>.gpr`/`<name>.rep`
+            // artifacts, not a `<name>` directory, so check those (see
+            // `project_exists`) rather than the bare path.
+            println!("Exists: {}", project_exists(&project_path));
         }
     }
 
