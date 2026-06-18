@@ -22,47 +22,6 @@ struct GithubRelease {
     assets: Vec<GithubAsset>,
 }
 
-/// Check if Java is installed and meets the minimum version requirement (JDK 17+).
-pub fn check_java_requirement() -> Result<()> {
-    use std::process::Command;
-
-    let output = Command::new("java")
-        .arg("-version")
-        .output()
-        .context("Failed to execute 'java -version'. Is Java installed and in PATH?")?;
-
-    // Java outputs version info to stderr
-    let version_output = String::from_utf8_lossy(&output.stderr);
-
-    // Look for version pattern like "17.0.x" or "21.0.x" in the output
-    // Java version string format is usually: 'java version "17.0.1"' or 'openjdk version "17.0.1"'
-    if version_output.is_empty() {
-        return Err(anyhow!("Could not determine Java version"));
-    }
-
-    // Extract version number
-    let version_regex = regex::Regex::new(r#"version "(\d+)"#)?;
-    if let Some(captures) = version_regex.captures(&version_output) {
-        if let Some(major_version) = captures.get(1) {
-            let major: u32 = major_version.as_str().parse().unwrap_or(0);
-            if major >= 17 {
-                println!("✓ Java {} detected", major);
-                return Ok(());
-            } else {
-                return Err(anyhow!(
-                    "Java {} detected, but Ghidra requires JDK 17 or higher",
-                    major
-                ));
-            }
-        }
-    }
-
-    // Fallback: if we got output but couldn't parse, warn but continue
-    println!("⚠ Could not parse Java version, but Java appears installed");
-    println!("  Output: {}", version_output.lines().next().unwrap_or(""));
-    Ok(())
-}
-
 /// Resolve the download URL for a Ghidra release.
 /// If version is None, fetches the latest release.
 pub async fn resolve_version_url(version: Option<String>) -> Result<(String, String, String)> {
@@ -255,9 +214,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_check_java_fails_gracefully() {
-        // This just ensures the function doesn't panic
-        // It may succeed or fail depending on the system
-        let _ = check_java_requirement();
+    fn test_ghidra_min_java_defaults() {
+        // Unknown install dir falls back to the documented default floor.
+        let min = crate::ghidra::java::ghidra_min_java(std::path::Path::new("/nonexistent"));
+        assert_eq!(min, crate::ghidra::java::DEFAULT_MIN_JAVA);
     }
 }

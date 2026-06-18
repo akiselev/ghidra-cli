@@ -23,6 +23,19 @@ pub struct Cli {
     /// Output JSON with pretty formatting
     #[arg(long, global = true)]
     pub pretty: bool,
+
+    /// Project name or path (can also be specified per-subcommand)
+    #[arg(long, global = true)]
+    pub project: Option<String>,
+
+    /// Program name within the project (can also be specified per-subcommand)
+    #[arg(long, global = true)]
+    pub program: Option<String>,
+
+    /// Full JDK home for Ghidra to use (must be a JDK, not a JRE).
+    /// Overrides config `java_home` and auto-detection.
+    #[arg(long, global = true)]
+    pub java_home: Option<std::path::PathBuf>,
 }
 
 #[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]

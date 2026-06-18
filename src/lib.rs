@@ -15,4 +15,5 @@ pub mod ipc;
 #[path = "ghidra"]
 pub mod ghidra {
     pub mod bridge;
+    pub mod java;
 }

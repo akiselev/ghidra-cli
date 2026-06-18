@@ -25,6 +25,12 @@ use tracing_subscriber::Layer;
 fn main() {
     let cli = Cli::parse();
 
+    // Fold the global --java-home flag into an env var so config and the bridge
+    // launcher pick it up without threading it through every call site.
+    if let Some(jh) = &cli.java_home {
+        std::env::set_var("GHIDRA_CLI_JAVA_HOME", jh);
+    }
+
     // --- Logging setup ---
     // File layer: always writes at debug level
     let log_dir = dirs::data_local_dir()
@@ -431,8 +437,9 @@ fn extract_query_options(command: &Commands) -> Option<QueryOptions> {
 fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
     let config = Config::load()?;
 
-    // Extract project from command args, fall back to config default
-    let project_from_cmd = extract_project_from_command(&cli.command);
+    // Extract project from command args, fall back to global --project, then config default
+    let project_from_cmd =
+        extract_project_from_command(&cli.command).or_else(|| cli.project.clone());
     let project_path = resolve_project_path(&project_from_cmd, &config)?;
 
     let ghidra_install_dir = config
@@ -536,6 +543,7 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
             } else {
                 // Auto-start bridge - use specific program if available, otherwise project mode
                 let mode = if let Some(program) = extract_program_from_command(&cli.command)
+                    .or_else(|| cli.program.clone())
                     .or_else(|| config.get_default_program())
                 {
                     BridgeStartMode::Process {
@@ -556,7 +564,9 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
             };
 
             // Switch to requested program if it differs from the bridge's current program
-            if let Some(requested_program) = extract_program_from_command(&cli.command) {
+            if let Some(requested_program) =
+                extract_program_from_command(&cli.command).or_else(|| cli.program.clone())
+            {
                 if let Ok(info) = client.program_info() {
                     let current = info.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     if current != requested_program {
@@ -580,6 +590,7 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                     // the embedded bridge matching this CLI version.
                     let _ = bridge::stop_bridge(&project_path);
                     let mode = if let Some(program) = extract_program_from_command(&cli.command)
+                        .or_else(|| cli.program.clone())
                         .or_else(|| config.get_default_program())
                     {
                         BridgeStartMode::Process {
@@ -592,7 +603,9 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                         bridge::ensure_bridge_running(&project_path, &ghidra_install_dir, mode)?;
                     let retry_client = BridgeClient::new(port);
 
-                    if let Some(requested_program) = extract_program_from_command(&cli.command) {
+                    if let Some(requested_program) =
+                        extract_program_from_command(&cli.command).or_else(|| cli.program.clone())
+                    {
                         if let Ok(info) = retry_client.program_info() {
                             let current = info.get("name").and_then(|n| n.as_str()).unwrap_or("");
                             if current != requested_program {
@@ -1026,16 +1039,23 @@ fn execute_via_bridge(
 
 /// Dispatch bridge management commands (top-level start/stop/restart/status/ping).
 fn handle_bridge_command(cli: Cli) -> anyhow::Result<()> {
+    // Global --project/--program flags serve as fallbacks for subcommand-level args
+    let global_project = cli.project.clone();
+    let global_program = cli.program.clone();
     match cli.command {
-        Commands::Start { project, program } => handle_bridge_start(project, program),
-        Commands::Stop { project } => handle_bridge_stop(project),
-        Commands::Restart { project, program } => {
-            handle_bridge_stop(project.clone())?;
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            handle_bridge_start(project, program)
+        Commands::Start { project, program } => {
+            handle_bridge_start(project.or(global_project), program.or(global_program))
         }
-        Commands::Status { project } => handle_bridge_status(project),
-        Commands::Ping { project } => handle_bridge_ping(project),
+        Commands::Stop { project } => handle_bridge_stop(project.or(global_project)),
+        Commands::Restart { project, program } => {
+            let proj = project.or(global_project);
+            let prog = program.or(global_program);
+            handle_bridge_stop(proj.clone())?;
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            handle_bridge_start(proj, prog)
+        }
+        Commands::Status { project } => handle_bridge_status(project.or(global_project)),
+        Commands::Ping { project } => handle_bridge_ping(project.or(global_project)),
         _ => unreachable!(),
     }
 }
@@ -1157,12 +1177,26 @@ async fn run_setup(cli: Cli) -> anyhow::Result<()> {
     println!("Ghidra Setup Wizard");
     println!("===================\n");
 
-    // 1. Check Java
+    // 1. Check Java — Ghidra needs a full JDK (not a JRE) to compile scripts.
     if !args.force {
-        if let Err(e) = ghidra::setup::check_java_requirement() {
-            eprintln!("Java prerequisite check failed: {}", e);
-            eprintln!("Ghidra requires JDK 17+. Use --force to continue anyway.");
-            std::process::exit(1);
+        let explicit = Config::load().ok().and_then(|c| c.get_java_home());
+        match ghidra::java::resolve_jdk(explicit.as_deref(), ghidra::java::DEFAULT_MIN_JAVA) {
+            ghidra::java::JavaStatus::Ok(info) => {
+                println!(
+                    "✓ JDK {} found at {} (via {})",
+                    info.major,
+                    info.home.display(),
+                    info.source
+                );
+            }
+            other => {
+                eprintln!(
+                    "Java prerequisite check failed: {}",
+                    ghidra::java::describe_failure(&other)
+                );
+                eprintln!("Use --force to continue anyway.");
+                std::process::exit(1);
+            }
         }
     } else {
         println!("Skipping Java check (--force specified)");
@@ -1272,12 +1306,66 @@ fn handle_doctor() -> anyhow::Result<()> {
     }
 
     // Check Java
-    print!("\nChecking Java... ");
-    match ghidra::setup::check_java_requirement() {
-        Ok(()) => println!("OK (JDK 17+)"),
-        Err(e) => {
+    // Check Java — must be a full JDK (Ghidra compiles scripts at runtime).
+    use ghidra::java::JavaStatus;
+    let install_dir = config.get_ghidra_install_dir().ok();
+    let min = install_dir
+        .as_deref()
+        .map(ghidra::java::ghidra_min_java)
+        .unwrap_or(ghidra::java::DEFAULT_MIN_JAVA);
+    let explicit = config.get_java_home();
+
+    print!("\nChecking Java (full JDK {}+)... ", min);
+    match ghidra::java::resolve_jdk(explicit.as_deref(), min) {
+        JavaStatus::Ok(info) => {
+            println!("OK");
+            println!(
+                "  JDK {} at {} (selected via {})",
+                info.major,
+                info.home.display(),
+                info.source
+            );
+
+            // Real health check: compile the embedded bridge script against the
+            // installed Ghidra. Catches API incompatibilities and JRE issues.
+            if let Some(install) = &install_dir {
+                print!("\nChecking bridge script compiles... ");
+                match ghidra::bridge::compile_check(install, &info.home) {
+                    Ok(()) => println!("OK"),
+                    Err(errs) => {
+                        println!("FAILED");
+                        for line in errs.lines() {
+                            println!("  {}", line);
+                        }
+                    }
+                }
+            }
+        }
+        JavaStatus::JreNoCompiler { home, major } => {
             println!("FAILED");
-            println!("  Error: {}", e);
+            println!(
+                "  JRE detected: Java {} at {} has no javac / jdk.compiler module.",
+                major,
+                home.display()
+            );
+            println!(
+                "  Ghidra requires a full JDK {}+ to compile scripts (a JRE cannot work).",
+                min
+            );
+            println!("  Install a JDK, or select one with --java-home / GHIDRA_CLI_JAVA_HOME / config `java_home`.");
+        }
+        JavaStatus::WrongVersion { home, major, min } => {
+            println!("FAILED");
+            println!(
+                "  JDK {} at {} is below the required JDK {}+.",
+                major,
+                home.display(),
+                min
+            );
+        }
+        JavaStatus::NotFound => {
+            println!("FAILED");
+            println!("  No Java found. Install a full JDK {}+ or set --java-home.", min);
         }
     }
 

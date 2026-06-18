@@ -2537,16 +2537,18 @@ public class GhidraCliBridge extends GhidraScript {
             Function func = findFunctionByNameOrAddress(target);
             if (func == null) return errorResult(buildFunctionTargetHint(target));
 
-            // Parse the signature using Ghidra's C parser
-            ghidra.app.util.cparser.C.CParserUtils.CParseResults parseResults =
-                ghidra.app.util.cparser.C.CParserUtils.parseSignature(
-                    this, currentProgram, sigStr);
+            // Parse the signature using Ghidra's headless-friendly signature parser.
+            // FunctionSignatureParser works without a PluginTool/ServiceProvider
+            // (the DataTypeQueryService arg may be null), so it is safe in headless.
+            ghidra.app.util.parser.FunctionSignatureParser sigParser =
+                new ghidra.app.util.parser.FunctionSignatureParser(
+                    currentProgram.getDataTypeManager(), null);
+            ghidra.program.model.data.FunctionDefinitionDataType funcDef =
+                sigParser.parse(func.getSignature(), sigStr);
 
-            if (parseResults == null || parseResults.getDataType() == null) {
+            if (funcDef == null) {
                 return errorResult("Failed to parse signature: " + sigStr);
             }
-
-            FunctionDefinition funcDef = (FunctionDefinition) parseResults.getDataType();
 
             int txId = currentProgram.startTransaction("Set function signature");
             try {
@@ -3260,8 +3262,13 @@ public class GhidraCliBridge extends GhidraScript {
             }
 
             Memory memory = currentProgram.getMemory();
+            Listing listing = currentProgram.getListing();
             int txId = currentProgram.startTransaction("Patch bytes");
             try {
+                // Clear any existing instructions/data at the target range
+                // so memory.setBytes doesn't conflict
+                Address endAddr = addr.add(patchData.length - 1);
+                listing.clearCodeUnits(addr, endAddr, false);
                 memory.setBytes(addr, patchData);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
@@ -3311,6 +3318,8 @@ public class GhidraCliBridge extends GhidraScript {
             Memory memory = currentProgram.getMemory();
             int txId = currentProgram.startTransaction("NOP instruction");
             try {
+                // Clear the existing instruction before writing NOP bytes
+                listing.clearCodeUnits(addr, addr.add(instrLength - 1), false);
                 memory.setBytes(addr, nopBytes);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {

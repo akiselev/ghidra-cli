@@ -7,6 +7,10 @@ use std::path::PathBuf;
 pub struct Config {
     pub ghidra_install_dir: Option<PathBuf>,
     pub ghidra_project_dir: Option<PathBuf>,
+    /// Full JDK home for Ghidra to use (must be a JDK, not a JRE). When unset,
+    /// ghidra-cli auto-detects a suitable JDK.
+    #[serde(default)]
+    pub java_home: Option<PathBuf>,
     pub default_program: Option<String>,
     pub default_project: Option<String>,
     pub default_output_format: Option<String>,
@@ -20,6 +24,7 @@ impl Default for Config {
         Self {
             ghidra_install_dir: None,
             ghidra_project_dir: None,
+            java_home: None,
             default_program: None,
             default_project: None,
             default_output_format: Some("auto".to_string()),
@@ -154,6 +159,16 @@ impl Config {
         }
 
         None
+    }
+
+    /// Explicit JDK home override: `GHIDRA_CLI_JAVA_HOME` env (set from the
+    /// `--java-home` flag in main) takes precedence over the config value.
+    pub fn get_java_home(&self) -> Option<PathBuf> {
+        std::env::var("GHIDRA_CLI_JAVA_HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| self.java_home.clone())
     }
 
     pub fn get_default_program(&self) -> Option<String> {

@@ -1,4 +1,5 @@
 pub mod bridge;
+pub mod java;
 pub mod setup;
 
 use crate::config::Config;
