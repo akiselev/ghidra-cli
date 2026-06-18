@@ -248,7 +248,10 @@ pub fn ensure_bridge_running(
     // Re-check under the lock: another process may have started the bridge
     // while we were waiting.
     if let Some(port) = is_bridge_running(project_path) {
-        info!("Bridge already running on port {} (detected after lock)", port);
+        info!(
+            "Bridge already running on port {} (detected after lock)",
+            port
+        );
         return Ok(port);
     }
 
@@ -328,7 +331,9 @@ pub fn start_bridge(
     // on the child overrides Ghidra's PATH-based auto-pick (honored by Ghidra's
     // LaunchSupport on all platforms). If we can't find a JDK, proceed and let
     // Ghidra try — the readiness failure path surfaces an actionable hint.
-    let explicit_java = crate::config::Config::load().ok().and_then(|c| c.get_java_home());
+    let explicit_java = crate::config::Config::load()
+        .ok()
+        .and_then(|c| c.get_java_home());
     match super::java::resolve_for_ghidra(ghidra_install_dir, explicit_java) {
         Ok(jdk) => {
             info!(
@@ -340,7 +345,10 @@ pub fn start_bridge(
             cmd.env("JAVA_HOME", &jdk.home);
         }
         Err(e) => {
-            warn!("No suitable JDK auto-selected; letting Ghidra choose. {}", e);
+            warn!(
+                "No suitable JDK auto-selected; letting Ghidra choose. {}",
+                e
+            );
         }
     }
 
@@ -771,7 +779,11 @@ pub fn compile_check(
         let stderr = String::from_utf8_lossy(&out.stderr);
         let errs: Vec<&str> = stderr
             .lines()
-            .filter(|l| l.contains("error:") || l.trim_start().starts_with("symbol:") || l.trim_start().starts_with("location:"))
+            .filter(|l| {
+                l.contains("error:")
+                    || l.trim_start().starts_with("symbol:")
+                    || l.trim_start().starts_with("location:")
+            })
             .collect();
         if errs.is_empty() {
             Err(stderr.lines().take(20).collect::<Vec<_>>().join("\n"))

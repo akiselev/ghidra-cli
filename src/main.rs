@@ -483,70 +483,69 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
             //      launch and driven over TCP below).
             // The launch is bounded (the bridge binds its socket before analysis);
             // analysis afterwards runs as an unbounded TCP operation.
-            let (client, program_name) = if let Some(port) =
-                bridge::is_bridge_running(&project_path)
-            {
-                let client = BridgeClient::new(port);
-                verify_bridge(&client)?;
-                if !cli.quiet {
-                    eprintln!("Importing into running bridge...");
-                }
-                let result = client.import_binary(&args.binary, args.program.as_deref())?;
-                let name = args.program.clone().unwrap_or_else(|| {
-                    result
-                        .get("program")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("unknown")
-                        .to_string()
-                });
-                client.open_program(&name)?;
-                (client, name)
-            } else if project_exists(&project_path) {
-                if !cli.quiet {
-                    eprintln!("Starting Ghidra bridge...");
-                }
-                let port = bridge::ensure_bridge_running(
-                    &project_path,
-                    &ghidra_install_dir,
-                    BridgeStartMode::Project,
-                )?;
-                let client = BridgeClient::new(port);
-                let result = client.import_binary(&args.binary, args.program.as_deref())?;
-                let name = args.program.clone().unwrap_or_else(|| {
-                    result
-                        .get("program")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("unknown")
-                        .to_string()
-                });
-                client.open_program(&name)?;
-                (client, name)
-            } else {
-                if !cli.quiet {
-                    eprintln!("Starting Ghidra bridge...");
-                }
-                let port = bridge::ensure_bridge_running(
-                    &project_path,
-                    &ghidra_install_dir,
-                    BridgeStartMode::Import {
-                        binary_path: args.binary.clone(),
-                    },
-                )?;
-                // `-import` already loaded the binary; the bridge's currentProgram
-                // is it. Prefer its real (domain) name for reporting.
-                let client = BridgeClient::new(port);
-                let name = client
-                    .program_info()
-                    .ok()
-                    .and_then(|i| {
-                        i.get("name")
-                            .and_then(|n| n.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .or_else(|| args.program.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-                (client, name)
-            };
+            let (client, program_name) =
+                if let Some(port) = bridge::is_bridge_running(&project_path) {
+                    let client = BridgeClient::new(port);
+                    verify_bridge(&client)?;
+                    if !cli.quiet {
+                        eprintln!("Importing into running bridge...");
+                    }
+                    let result = client.import_binary(&args.binary, args.program.as_deref())?;
+                    let name = args.program.clone().unwrap_or_else(|| {
+                        result
+                            .get("program")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("unknown")
+                            .to_string()
+                    });
+                    client.open_program(&name)?;
+                    (client, name)
+                } else if project_exists(&project_path) {
+                    if !cli.quiet {
+                        eprintln!("Starting Ghidra bridge...");
+                    }
+                    let port = bridge::ensure_bridge_running(
+                        &project_path,
+                        &ghidra_install_dir,
+                        BridgeStartMode::Project,
+                    )?;
+                    let client = BridgeClient::new(port);
+                    let result = client.import_binary(&args.binary, args.program.as_deref())?;
+                    let name = args.program.clone().unwrap_or_else(|| {
+                        result
+                            .get("program")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("unknown")
+                            .to_string()
+                    });
+                    client.open_program(&name)?;
+                    (client, name)
+                } else {
+                    if !cli.quiet {
+                        eprintln!("Starting Ghidra bridge...");
+                    }
+                    let port = bridge::ensure_bridge_running(
+                        &project_path,
+                        &ghidra_install_dir,
+                        BridgeStartMode::Import {
+                            binary_path: args.binary.clone(),
+                        },
+                    )?;
+                    // `-import` already loaded the binary; the bridge's currentProgram
+                    // is it. Prefer its real (domain) name for reporting.
+                    let client = BridgeClient::new(port);
+                    let name = client
+                        .program_info()
+                        .ok()
+                        .and_then(|i| {
+                            i.get("name")
+                                .and_then(|n| n.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .or_else(|| args.program.clone())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    (client, name)
+                };
 
             // Run analysis as an UNBOUNDED operation unless the user opted out.
             // handleAnalyze runs analyzeAll + program.save(), so the program
@@ -958,9 +957,10 @@ fn execute_via_bridge(
             match cmd {
                 XRefCommands::To(args) => client.xrefs_to(args.resolved_target().to_string()),
                 XRefCommands::From(args) => client.xrefs_from(args.resolved_target().to_string()),
-                XRefCommands::List(args) => {
-                    client.send_command("xrefs_list", Some(json!({"address": args.resolved_target()})))
-                }
+                XRefCommands::List(args) => client.send_command(
+                    "xrefs_list",
+                    Some(json!({"address": args.resolved_target()})),
+                ),
             }
         }
         Commands::Program(cmd) => {
@@ -1026,10 +1026,9 @@ fn execute_via_bridge(
                 TypeCommands::Get(args) => client.type_get(&args.name),
                 TypeCommands::Create(args) => client.type_create(&args.definition),
                 TypeCommands::Apply(args) => client.type_apply(&args.address, &args.type_name),
-                TypeCommands::Delete(args) => client.send_command(
-                    "type_delete",
-                    Some(json!({"name": args.name})),
-                ),
+                TypeCommands::Delete(args) => {
+                    client.send_command("type_delete", Some(json!({"name": args.name})))
+                }
                 TypeCommands::Rename(args) => client.send_command(
                     "type_rename",
                     Some(json!({"old_name": args.old_name, "new_name": args.new_name})),
@@ -1505,7 +1504,10 @@ fn handle_doctor() -> anyhow::Result<()> {
         }
         JavaStatus::NotFound => {
             println!("FAILED");
-            println!("  No Java found. Install a full JDK {}+ or set --java-home.", min);
+            println!(
+                "  No Java found. Install a full JDK {}+ or set --java-home.",
+                min
+            );
         }
     }
 
@@ -1665,14 +1667,13 @@ fn handle_project_command(cmd: cli::ProjectCommands) -> anyhow::Result<()> {
             // basename so absolute project names work too. `create_project` may
             // also have left an empty `<parent>/<basename>` directory.
             let project_path = client.get_project_path(&name);
-            let (basename, parent) =
-                match (project_path.file_name(), project_path.parent()) {
-                    (Some(f), Some(p)) => (f.to_string_lossy().to_string(), p.to_path_buf()),
-                    _ => {
-                        println!("Project '{}' not found", name);
-                        return Ok(());
-                    }
-                };
+            let (basename, parent) = match (project_path.file_name(), project_path.parent()) {
+                (Some(f), Some(p)) => (f.to_string_lossy().to_string(), p.to_path_buf()),
+                _ => {
+                    println!("Project '{}' not found", name);
+                    return Ok(());
+                }
+            };
             let gpr = parent.join(format!("{}.gpr", basename));
             let rep = parent.join(format!("{}.rep", basename));
             let legacy_dir = project_path.clone();

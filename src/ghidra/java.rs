@@ -91,7 +91,8 @@ fn has_jdk_compiler_module(java_exe: &Path) -> bool {
     match Command::new(java_exe).arg("--list-modules").output() {
         Ok(out) => {
             let text = String::from_utf8_lossy(&out.stdout);
-            text.lines().any(|l| l.starts_with("jdk.compiler@") || l == "jdk.compiler")
+            text.lines()
+                .any(|l| l.starts_with("jdk.compiler@") || l == "jdk.compiler")
         }
         Err(_) => false,
     }
@@ -142,7 +143,10 @@ fn candidate_homes(explicit: Option<&Path>) -> Vec<(PathBuf, String)> {
 
     // 1. Explicit (flag / env / config), already folded into `explicit` by caller.
     if let Some(p) = explicit {
-        push(p.to_path_buf(), "explicit (--java-home / GHIDRA_CLI_JAVA_HOME / config)");
+        push(
+            p.to_path_buf(),
+            "explicit (--java-home / GHIDRA_CLI_JAVA_HOME / config)",
+        );
     }
     // 2. JAVA_HOME environment variable.
     if let Ok(jh) = std::env::var("JAVA_HOME") {
@@ -277,9 +281,7 @@ pub fn describe_failure(status: &JavaStatus) -> String {
             "JDK {major} at {} is below the required JDK {min}+.",
             home.display()
         ),
-        JavaStatus::NotFound => {
-            "No Java found on PATH or in common JDK locations.".to_string()
-        }
+        JavaStatus::NotFound => "No Java found on PATH or in common JDK locations.".to_string(),
     }
 }
 

@@ -341,9 +341,12 @@ fn format_full<T: Serialize>(data: &[T]) -> Result<String> {
                             result.push_str("\nParameters:\n");
                             for p in params {
                                 if let JsonValue::Object(obj) = p {
-                                    let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let typ = obj.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let storage = obj.get("storage").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let name =
+                                        obj.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let typ =
+                                        obj.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let storage =
+                                        obj.get("storage").and_then(|v| v.as_str()).unwrap_or("?");
                                     result.push_str(&format!("  {} {} ({})\n", typ, name, storage));
                                 }
                             }
@@ -354,9 +357,12 @@ fn format_full<T: Serialize>(data: &[T]) -> Result<String> {
                             result.push_str("\nVariables:\n");
                             for v in vars {
                                 if let JsonValue::Object(obj) = v {
-                                    let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let typ = obj.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let storage = obj.get("storage").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let name =
+                                        obj.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let typ =
+                                        obj.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let storage =
+                                        obj.get("storage").and_then(|v| v.as_str()).unwrap_or("?");
                                     result.push_str(&format!("  {} {} ({})\n", typ, name, storage));
                                 }
                             }
