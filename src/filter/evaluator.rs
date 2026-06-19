@@ -177,10 +177,8 @@ fn evaluate_in(field: &str, values: &[Value], data: &JsonValue) -> Result<bool> 
                     }
                 }
             }
-            (JsonValue::Bool(b), Value::Boolean(v)) => {
-                if *b == *v {
-                    return Ok(true);
-                }
+            (JsonValue::Bool(b), Value::Boolean(v)) if *b == *v => {
+                return Ok(true);
             }
             _ => {}
         }
