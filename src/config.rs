@@ -219,9 +219,8 @@ impl Config {
 /// Whether any normal component of `path` begins with '.' (a hidden directory).
 /// Ghidra 12.1+ rejects such components in a project location path.
 fn has_hidden_component(path: &Path) -> bool {
-    path.components().any(|c| {
-        matches!(c, Component::Normal(s) if s.to_string_lossy().starts_with('.'))
-    })
+    path.components()
+        .any(|c| matches!(c, Component::Normal(s) if s.to_string_lossy().starts_with('.')))
 }
 
 #[cfg(test)]
@@ -247,9 +246,15 @@ mod tests {
 
     #[test]
     fn has_hidden_component_detects_dot_dirs() {
-        assert!(has_hidden_component(Path::new("/home/u/.cache/ghidra-cli/projects")));
-        assert!(has_hidden_component(Path::new("/home/u/.local/share/ghidra-cli")));
-        assert!(!has_hidden_component(Path::new("/home/u/ghidra-cli/projects")));
+        assert!(has_hidden_component(Path::new(
+            "/home/u/.cache/ghidra-cli/projects"
+        )));
+        assert!(has_hidden_component(Path::new(
+            "/home/u/.local/share/ghidra-cli"
+        )));
+        assert!(!has_hidden_component(Path::new(
+            "/home/u/ghidra-cli/projects"
+        )));
         assert!(!has_hidden_component(Path::new(
             "/Users/u/Library/Caches/ghidra-cli/projects"
         )));
