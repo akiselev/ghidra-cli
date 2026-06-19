@@ -87,7 +87,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/ghidra-cli/projects
+            ~/ghidra-cli-projects
             ~/Library/Caches/ghidra-cli/projects
             ~/AppData/Local/ghidra-cli/projects
           key: ghidra-projects-${{ matrix.os }}-v5-${{ hashFiles('tests/fixtures/sample_binary.rs') }}
@@ -161,7 +161,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/ghidra-cli/projects
+            ~/ghidra-cli-projects
             ~/Library/Caches/ghidra-cli/projects
             ~/AppData/Local/ghidra-cli/projects
           key: ghidra-projects-${{ matrix.os }}-v5-${{ hashFiles('tests/fixtures/sample_binary.rs') }}
@@ -234,7 +234,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/ghidra-cli/projects
+            ~/ghidra-cli-projects
             ~/Library/Caches/ghidra-cli/projects
             ~/AppData/Local/ghidra-cli/projects
           key: ghidra-projects-${{ matrix.os }}-v5-${{ hashFiles('tests/fixtures/sample_binary.rs') }}
@@ -307,7 +307,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/ghidra-cli/projects
+            ~/ghidra-cli-projects
             ~/Library/Caches/ghidra-cli/projects
             ~/AppData/Local/ghidra-cli/projects
           key: ghidra-projects-${{ matrix.os }}-v5-${{ hashFiles('tests/fixtures/sample_binary.rs') }}

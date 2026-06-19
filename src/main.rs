@@ -1418,11 +1418,9 @@ fn handle_init() -> anyhow::Result<()> {
         println!("Please set GHIDRA_INSTALL_DIR environment variable or run 'ghidra setup'.");
     }
 
-    // Set default project directory
-    let home = dirs::home_dir().ok_or_else(|| {
-        GhidraError::ConfigError("Could not determine home directory".to_string())
-    })?;
-    let project_dir = home.join(".ghidra-projects");
+    // Set default project directory. Must avoid dot-prefixed path components,
+    // which Ghidra 12.1+ rejects (see Config::default_project_dir).
+    let project_dir = Config::default_project_dir()?;
     config.ghidra_project_dir = Some(project_dir.clone());
 
     println!("\nProject directory: {}", project_dir.display());
