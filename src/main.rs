@@ -25,11 +25,7 @@ use tracing_subscriber::Layer;
 fn main() {
     let cli = Cli::parse();
 
-    // Fold the global --java-home flag into an env var so config and the bridge
-    // launcher pick it up without threading it through every call site.
-    if let Some(jh) = &cli.java_home {
-        std::env::set_var("GHIDRA_CLI_JAVA_HOME", jh);
-    }
+    apply_global_env_overrides(&cli);
 
     // --- Logging setup ---
     // File layer: always writes at debug level
@@ -87,12 +83,26 @@ fn main() {
     }
 }
 
+/// Fold global CLI flags that must reach code which independently reloads
+/// `Config` (e.g. the bridge launcher in `bridge.rs`) into process env vars.
+///
+/// Only flags that cross such a boundary belong here. `--projects-dir`, by
+/// contrast, is applied in-process via [`load_config`] and deliberately does
+/// not go through the environment.
+fn apply_global_env_overrides(cli: &Cli) {
+    // `--java-home` is read by `Config::get_java_home`, which the bridge launcher
+    // calls after reloading config from disk — so the flag must propagate via env.
+    if let Some(jh) = &cli.java_home {
+        std::env::set_var("GHIDRA_CLI_JAVA_HOME", jh);
+    }
+}
+
 /// Run a command, starting the bridge if needed.
 fn run_command(cli: Cli) -> anyhow::Result<()> {
     match &cli.command {
         // Non-bridge commands
         Commands::Init => handle_init(),
-        Commands::Doctor => handle_doctor(),
+        Commands::Doctor => handle_doctor(&cli.projects_dir),
         Commands::Version => handle_version(),
         Commands::Config(cmd) => handle_config_command(cmd.clone()),
         Commands::SetDefault(args) => handle_set_default(args.clone()),
@@ -447,7 +457,7 @@ fn extract_query_options(command: &Commands) -> Option<QueryOptions> {
 
 /// Run a command that requires the bridge.
 fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
-    let config = Config::load()?;
+    let config = load_config(&cli.projects_dir)?;
 
     // Extract project from command args, fall back to global --project, then config default
     let project_from_cmd =
@@ -1181,27 +1191,36 @@ fn handle_bridge_command(cli: Cli) -> anyhow::Result<()> {
     // Global --project/--program flags serve as fallbacks for subcommand-level args
     let global_project = cli.project.clone();
     let global_program = cli.program.clone();
+    let projects_dir = cli.projects_dir.clone();
     match cli.command {
-        Commands::Start { project, program } => {
-            handle_bridge_start(project.or(global_project), program.or(global_program))
-        }
-        Commands::Stop { project } => handle_bridge_stop(project.or(global_project)),
+        Commands::Start { project, program } => handle_bridge_start(
+            project.or(global_project),
+            program.or(global_program),
+            &projects_dir,
+        ),
+        Commands::Stop { project } => handle_bridge_stop(project.or(global_project), &projects_dir),
         Commands::Restart { project, program } => {
             let proj = project.or(global_project);
             let prog = program.or(global_program);
-            handle_bridge_stop(proj.clone())?;
+            handle_bridge_stop(proj.clone(), &projects_dir)?;
             std::thread::sleep(std::time::Duration::from_secs(1));
-            handle_bridge_start(proj, prog)
+            handle_bridge_start(proj, prog, &projects_dir)
         }
-        Commands::Status { project } => handle_bridge_status(project.or(global_project)),
-        Commands::Ping { project } => handle_bridge_ping(project.or(global_project)),
+        Commands::Status { project } => {
+            handle_bridge_status(project.or(global_project), &projects_dir)
+        }
+        Commands::Ping { project } => handle_bridge_ping(project.or(global_project), &projects_dir),
         _ => unreachable!(),
     }
 }
 
 /// Start the bridge for a project.
-fn handle_bridge_start(project: Option<String>, program: Option<String>) -> anyhow::Result<()> {
-    let config = Config::load()?;
+fn handle_bridge_start(
+    project: Option<String>,
+    program: Option<String>,
+    projects_dir: &Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let config = load_config(projects_dir)?;
     let project_path = resolve_project_path(&project, &config)?;
 
     let ghidra_install_dir = config
@@ -1241,8 +1260,11 @@ fn handle_bridge_start(project: Option<String>, program: Option<String>) -> anyh
 }
 
 /// Stop the bridge for a project.
-fn handle_bridge_stop(project: Option<String>) -> anyhow::Result<()> {
-    let config = Config::load()?;
+fn handle_bridge_stop(
+    project: Option<String>,
+    projects_dir: &Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let config = load_config(projects_dir)?;
     let project_path = resolve_project_path(&project, &config)?;
 
     if bridge::is_bridge_running(&project_path).is_some() {
@@ -1257,8 +1279,11 @@ fn handle_bridge_stop(project: Option<String>) -> anyhow::Result<()> {
 }
 
 /// Get bridge status for a project.
-fn handle_bridge_status(project: Option<String>) -> anyhow::Result<()> {
-    let config = Config::load()?;
+fn handle_bridge_status(
+    project: Option<String>,
+    projects_dir: &Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let config = load_config(projects_dir)?;
     let project_path = resolve_project_path(&project, &config)?;
 
     match bridge::bridge_status(&project_path)? {
@@ -1288,8 +1313,11 @@ fn handle_bridge_status(project: Option<String>) -> anyhow::Result<()> {
 }
 
 /// Ping the bridge.
-fn handle_bridge_ping(project: Option<String>) -> anyhow::Result<()> {
-    let config = Config::load()?;
+fn handle_bridge_ping(
+    project: Option<String>,
+    projects_dir: &Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let config = load_config(projects_dir)?;
     let project_path = resolve_project_path(&project, &config)?;
 
     if let Some(port) = bridge::is_bridge_running(&project_path) {
@@ -1411,11 +1439,11 @@ fn handle_init() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_doctor() -> anyhow::Result<()> {
+fn handle_doctor(projects_dir: &Option<PathBuf>) -> anyhow::Result<()> {
     println!("Ghidra CLI Doctor");
     println!("=================\n");
 
-    let config = Config::load()?;
+    let config = load_config(projects_dir)?;
 
     // Check Ghidra installation
     print!("Checking Ghidra installation... ");
@@ -1827,6 +1855,18 @@ fn project_exists(project_path: &Path) -> bool {
         }
         _ => false,
     }
+}
+
+/// Load config, applying the global `--projects-dir` override (if any) onto
+/// `ghidra_project_dir`. This keeps the precedence in [`Config::get_project_dir`]
+/// (env var > config field > default) while letting the CLI flag win in-process
+/// without mutating global state.
+fn load_config(projects_dir: &Option<PathBuf>) -> anyhow::Result<Config> {
+    let mut config = Config::load()?;
+    if let Some(dir) = projects_dir {
+        config.ghidra_project_dir = Some(dir.clone());
+    }
+    Ok(config)
 }
 
 /// Resolve a project name to its full path on disk.

@@ -32,6 +32,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub program: Option<String>,
 
+    /// Directory under which Ghidra projects are stored.
+    /// Overrides config `ghidra_project_dir` and the default location.
+    /// Note: Ghidra 12.1+ rejects paths containing a dot-prefixed component.
+    #[arg(long, global = true)]
+    pub projects_dir: Option<std::path::PathBuf>,
+
     /// Full JDK home for Ghidra to use (must be a JDK, not a JRE).
     /// Overrides config `java_home` and auto-detection.
     #[arg(long, global = true)]

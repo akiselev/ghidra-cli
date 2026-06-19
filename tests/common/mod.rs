@@ -52,10 +52,8 @@ pub fn ensure_test_project(project: &str, program: &str) {
         // NOT at <projects_dir>/<project_name>/<project_name>.gpr
         // because start_bridge passes (project_path.parent(), project_path.file_name())
         // to analyzeHeadless.
-        let projects_dir = dirs::cache_dir()
-            .expect("Could not determine cache directory")
-            .join("ghidra-cli")
-            .join("projects");
+        let projects_dir = ghidra_cli::config::Config::default_project_dir()
+            .expect("Could not determine default project dir");
         let gpr_file = projects_dir.join(format!("{}.gpr", project));
         let rep_dir = projects_dir.join(format!("{}.rep", project));
 
@@ -182,11 +180,9 @@ impl DaemonTestHarness {
     pub fn new(project: &str, program: &str) -> Result<Self> {
         let data_dir = get_unique_data_dir();
 
-        // Resolve the project path (must match CLI's default: cache_dir/ghidra-cli/projects)
-        let project_path = dirs::cache_dir()
-            .context("Could not determine cache directory")?
-            .join("ghidra-cli")
-            .join("projects")
+        // Resolve the project path (must match the CLI's default via get_project_dir)
+        let project_path = ghidra_cli::config::Config::default_project_dir()
+            .context("Could not determine default project dir")?
             .join(project);
 
         // Load config to find Ghidra installation

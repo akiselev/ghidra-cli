@@ -1,7 +1,7 @@
 use crate::error::{GhidraError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -115,12 +115,32 @@ impl Config {
             return Ok(dir.clone());
         }
 
-        // Default to cache dir (e.g., ~/.cache/ghidra-cli/projects)
-        let cache_dir = dirs::cache_dir().ok_or_else(|| {
-            GhidraError::ConfigError("Could not determine cache directory".to_string())
-        })?;
+        Self::default_project_dir()
+    }
 
-        Ok(cache_dir.join("ghidra-cli").join("projects"))
+    /// Default location for Ghidra projects when neither the `GHIDRA_PROJECT_DIR`
+    /// env var nor `ghidra_project_dir` config is set.
+    ///
+    /// Ghidra 12.1+ rejects any project *location* directory whose path contains a
+    /// component beginning with '.' (`ProjectLocator` ->
+    /// `GhidraURL.checkLocalAbsolutePath` -> `NamingUtilities.checkName`). On Linux
+    /// every XDG base directory lives under a hidden directory (`~/.cache`,
+    /// `~/.local/share`, `~/.config`), so the cache-dir default is unusable there.
+    /// macOS (`~/Library/Caches`) and Windows (`~/AppData/Local`) have no hidden
+    /// components, so we keep the cache-dir location for them and only fall back to
+    /// a non-hidden `~/ghidra-cli-projects` when the cache path has a dot element.
+    pub fn default_project_dir() -> Result<PathBuf> {
+        if let Some(cache_dir) = dirs::cache_dir() {
+            let candidate = cache_dir.join("ghidra-cli").join("projects");
+            if !has_hidden_component(&candidate) {
+                return Ok(candidate);
+            }
+        }
+
+        let home = dirs::home_dir().ok_or_else(|| {
+            GhidraError::ConfigError("Could not determine home directory".to_string())
+        })?;
+        Ok(home.join("ghidra-cli-projects"))
     }
 
     #[cfg(target_os = "windows")]
@@ -196,6 +216,14 @@ impl Config {
     }
 }
 
+/// Whether any normal component of `path` begins with '.' (a hidden directory).
+/// Ghidra 12.1+ rejects such components in a project location path.
+fn has_hidden_component(path: &Path) -> bool {
+    path.components().any(|c| {
+        matches!(c, Component::Normal(s) if s.to_string_lossy().starts_with('.'))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +233,25 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.timeout, Some(300));
         assert_eq!(config.default_limit, Some(1000));
+    }
+
+    #[test]
+    fn default_project_dir_has_no_hidden_component() {
+        let dir = Config::default_project_dir().expect("default project dir");
+        assert!(
+            !has_hidden_component(&dir),
+            "default project dir must not contain a dot-prefixed component (Ghidra 12.1+): {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn has_hidden_component_detects_dot_dirs() {
+        assert!(has_hidden_component(Path::new("/home/u/.cache/ghidra-cli/projects")));
+        assert!(has_hidden_component(Path::new("/home/u/.local/share/ghidra-cli")));
+        assert!(!has_hidden_component(Path::new("/home/u/ghidra-cli/projects")));
+        assert!(!has_hidden_component(Path::new(
+            "/Users/u/Library/Caches/ghidra-cli/projects"
+        )));
     }
 }
