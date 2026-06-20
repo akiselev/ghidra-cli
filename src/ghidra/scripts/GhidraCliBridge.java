@@ -1284,6 +1284,16 @@ public class GhidraCliBridge extends GhidraScript {
         // that it would materialize after the (forever-blocking) pre-script
         // returns; Program.save() against that proxy is a silent no-op. Detect
         // that and create the real file in the project root ourselves.
+        currentProgram.flushEvents();
+        printerr(String.format(
+            "persist diag2: committed=%s canLock=%s isLocked=%s canSave=%s tx=%s hasTermTx=%s",
+            (df != null && df.getParent() != null && df.exists()),
+            currentProgram.canLock(),
+            currentProgram.isLocked(),
+            currentProgram.canSave(),
+            currentProgram.getCurrentTransactionInfo(),
+            currentProgram.hasTerminatedTransaction()));
+
         boolean committed = df != null && df.getParent() != null && df.exists();
         if (committed) {
             currentProgram.save(comment, mon);
