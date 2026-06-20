@@ -125,12 +125,17 @@ pub fn ensure_test_project(project: &str, program: &str) {
         let gpr_file = projects_dir.join(format!("{}.gpr", project));
         let rep_dir = projects_dir.join(format!("{}.rep", project));
 
-        // Validate project has actual program data, not just metadata stubs.
-        // On macOS, Ghidra's project close (during `ghidra stop`) can truncate
-        // .gpr to 0 bytes and leave .rep with only metadata stubs (~index.dat,
-        // project.prp) but no actual program data. A valid project needs:
-        //   .gpr - non-empty project descriptor (XML)
-        //   .rep/idata/ - must contain more than just ~index.dat (needs 00/ subdirectories)
+        // Validate the cached project has actual program data, not just metadata
+        // stubs. The real signal is `.rep/idata/` containing more than just the
+        // index (i.e. a `00/` data subdirectory).
+        //
+        // NOTE: We do NOT require a non-empty `.gpr`. A correctly committed
+        // Ghidra 12.x project legitimately has a 0-byte `.gpr` descriptor (the
+        // project data lives under `.rep`). Requiring `.gpr` > 0 made EVERY run
+        // treat the cache as invalid, so every test binary deleted and
+        // re-imported the shared project — and since the mutation suite runs
+        // several test binaries concurrently, they raced to delete/re-import the
+        // same project, wiping it mid-use ("Could not find project: ci-test").
         let idata_dir = rep_dir.join("idata");
         let idata_has_data = idata_dir.is_dir()
             && std::fs::read_dir(&idata_dir)
@@ -140,9 +145,7 @@ pub fn ensure_test_project(project: &str, program: &str) {
                         .any(|e| e.file_name() != "~index.dat")
                 })
                 .unwrap_or(false);
-        let project_valid = gpr_file.exists()
-            && gpr_file.metadata().map(|m| m.len() > 0).unwrap_or(false)
-            && idata_has_data;
+        let project_valid = gpr_file.exists() && idata_has_data;
 
         if project_valid {
             eprintln!("=== Using cached test project: {:?} ===", gpr_file);
