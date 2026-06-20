@@ -52,7 +52,7 @@ jobs:
             ~/ghidra-cli-projects
             ~/Library/Caches/ghidra-cli/projects
             ~/AppData/Local/ghidra-cli/projects
-          key: ghidra-projects-${{ matrix.os }}-v5-${{ hashFiles('tests/fixtures/sample_binary.rs') }}
+          key: ghidra-projects-${{ matrix.os }}-v6-${{ hashFiles('tests/fixtures/sample_binary.rs') }}
 
       - name: Build
         run: cargo build --verbose
@@ -115,6 +115,10 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
+    # Gate all release artifacts on the full test suite passing. Because
+    # `release` and `publish` both `needs: build`, this transitively blocks the
+    # GitHub release and crates.io publish whenever any test job fails.
+    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

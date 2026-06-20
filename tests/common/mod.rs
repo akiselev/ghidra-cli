@@ -22,74 +22,6 @@ use std::path::PathBuf;
 use std::sync::Once;
 use std::time::Duration;
 
-/// Dump diagnostics about a project's on-disk persistence state plus the
-/// bridge's persistence log. Used to debug CI failures where a freshly
-/// imported+analyzed program is not durably written to the project (seen on
-/// macOS as "Requested project program file(s) not found").
-pub fn dump_persistence_diagnostics(project: &str, label: &str) {
-    eprintln!(
-        "=== persistence diagnostics [{}] for project '{}' ===",
-        label, project
-    );
-
-    let projects_dir = match ghidra_cli::config::Config::default_project_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("  could not resolve projects dir: {}", e);
-            return;
-        }
-    };
-    let gpr = projects_dir.join(format!("{}.gpr", project));
-    let rep = projects_dir.join(format!("{}.rep", project));
-
-    match std::fs::metadata(&gpr) {
-        Ok(m) => eprintln!("  {}.gpr: {} bytes", project, m.len()),
-        Err(e) => eprintln!("  {}.gpr: MISSING ({})", project, e),
-    }
-
-    let idata = rep.join("idata");
-    if idata.is_dir() {
-        match std::fs::read_dir(&idata) {
-            Ok(entries) => {
-                let names: Vec<String> = entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .collect();
-                eprintln!("  {}.rep/idata entries: {:?}", project, names);
-            }
-            Err(e) => eprintln!("  {}.rep/idata: unreadable ({})", project, e),
-        }
-    } else {
-        eprintln!("  {}.rep/idata: MISSING", project);
-    }
-
-    // Dump the bridge's persistence log (written by GhidraCliBridge.java). It
-    // lives next to the port file: bridge-<hash>.persist.log.
-    let project_path = projects_dir.join(project);
-    if let Ok(port_file) = ghidra_cli::ghidra::bridge::port_file_path(&project_path) {
-        let persist_log = port_file.with_file_name(
-            port_file
-                .file_name()
-                .map(|n| n.to_string_lossy().replace(".port", ".persist.log"))
-                .unwrap_or_default(),
-        );
-        match std::fs::read_to_string(&persist_log) {
-            Ok(contents) => {
-                eprintln!("  bridge persist log ({}):", persist_log.display());
-                for line in contents.lines() {
-                    eprintln!("    {}", line);
-                }
-            }
-            Err(e) => eprintln!(
-                "  bridge persist log {}: unavailable ({})",
-                persist_log.display(),
-                e
-            ),
-        }
-    }
-    eprintln!("=== end persistence diagnostics [{}] ===", label);
-}
-
 /// Get path to the sample_binary test fixture.
 pub fn fixture_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -246,8 +178,6 @@ pub fn ensure_test_project(project: &str, program: &str) {
             Err(e) => eprintln!("Stop error: {}", e),
         }
 
-        dump_persistence_diagnostics(project, "after setup stop");
-
         eprintln!("=== Test project setup complete ===");
     });
 }
@@ -288,23 +218,13 @@ impl DaemonTestHarness {
 
         // Start the bridge directly via bridge API (not CLI subprocess).
         // This gives us detailed error messages from Ghidra in the Err value.
-        let port = match ghidra_cli::ghidra::bridge::ensure_bridge_running(
+        let port = ghidra_cli::ghidra::bridge::ensure_bridge_running(
             &project_path,
             &ghidra_install_dir,
             ghidra_cli::ghidra::bridge::BridgeStartMode::Process {
                 program_name: program.to_string(),
             },
-        ) {
-            Ok(port) => port,
-            Err(e) => {
-                // The bridge could not open the program (e.g. "Requested project
-                // program file(s) not found"). Dump on-disk state to debug what
-                // the setup step actually persisted.
-                eprintln!("DaemonTestHarness::new failed to start bridge: {}", e);
-                dump_persistence_diagnostics(project, "on harness start failure");
-                return Err(e);
-            }
-        };
+        )?;
 
         // Store PID now so Drop can wait for it even if restart deletes the PID file
         let pid = ghidra_cli::ghidra::bridge::read_pid_file(&project_path)

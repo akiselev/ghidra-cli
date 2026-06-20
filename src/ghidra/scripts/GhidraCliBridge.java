@@ -62,10 +62,6 @@ public class GhidraCliBridge extends GhidraScript {
 
     private Gson gson = new GsonBuilder().serializeNulls().create();
     private long startTime;
-    // Path to a persistence diagnostic log, derived from the port file in run().
-    // The bridge's stderr is only read by the command that spawned it, so logs
-    // emitted during later TCP commands (analyze/stop) are otherwise lost.
-    private String persistLogPath;
     private static final Pattern NAMED_HEX_ADDRESS_PATTERN =
         Pattern.compile("(?i)^(?:FUN|SUB|LAB|DAT)_([0-9a-f]+)$");
 
@@ -79,14 +75,6 @@ public class GhidraCliBridge extends GhidraScript {
             return;
         }
         String portFilePath = scriptArgs[0];
-        persistLogPath = portFilePath.replaceAll("\\.port$", "") + ".persist.log";
-        // Truncate the persist log at startup so each bridge session has a clean
-        // log (the data dir is cached across CI runs, so appends would pile up).
-        try (FileWriter fw = new FileWriter(persistLogPath, false)) {
-            fw.write(System.currentTimeMillis() + " [persist] bridge session start\n");
-        } catch (Exception e) {
-            printerr("[persist] failed to init log file: " + e.getMessage());
-        }
 
         // Bind to dynamic port on localhost only.
         // Backlog of 50 lets many concurrent agents queue connections while one
@@ -153,55 +141,12 @@ public class GhidraCliBridge extends GhidraScript {
             }
         }
 
-        // Diagnostic: log program persistence state at clean shutdown. The
-        // durable flush happens after run() returns (HeadlessAnalyzer ends its
-        // ambient transaction and writes the program to the project). On macOS
-        // CI this sometimes leaves the project without program data, so capture
-        // what we know about the program/domain file right before we unwind.
-        logPersistenceState("at clean shutdown (before flush)");
-
         // Cleanup: close the server socket but leave port/pid files for the
         // Rust CLI to clean up. Deleting them here creates a race: the JVM is
         // still unwinding (closing the Ghidra project, releasing locks) but
         // stop_bridge() can no longer find the PID to wait on, so it returns
         // early while the project lock is still held.
         serverSocket.close();
-    }
-
-    /// Emit a one-line diagnostic about the current program's persistence
-    /// state. Written to both stderr (for the spawning command) and a log file
-    /// (so diagnostics from later TCP commands like analyze/stop survive).
-    private void logPersistenceState(String when) {
-        String msg;
-        try {
-            if (currentProgram == null) {
-                msg = "[persist] " + when + ": currentProgram=null";
-            } else {
-                DomainFile df = currentProgram.getDomainFile();
-                String pathname = (df != null) ? df.getPathname() : "<none>";
-                boolean changed = currentProgram.isChanged();
-                boolean writable = (df != null) && df.isInWritableProject();
-                boolean checkedOut = (df != null) && df.isCheckedOut();
-                long modCount = currentProgram.getModificationNumber();
-                msg = "[persist] " + when
-                    + ": program=" + currentProgram.getName()
-                    + " domainFile=" + pathname
-                    + " isChanged=" + changed
-                    + " writable=" + writable
-                    + " checkedOut=" + checkedOut
-                    + " modNum=" + modCount;
-            }
-        } catch (Exception e) {
-            msg = "[persist] " + when + ": failed to read state: " + e.getMessage();
-        }
-        printerr(msg);
-        if (persistLogPath != null) {
-            try (FileWriter fw = new FileWriter(persistLogPath, true)) {
-                fw.write(System.currentTimeMillis() + " " + msg + "\n");
-            } catch (Exception e) {
-                printerr("[persist] failed to write log file: " + e.getMessage());
-            }
-        }
     }
 
     // --- Request Handling ---
@@ -1339,19 +1284,13 @@ public class GhidraCliBridge extends GhidraScript {
             // Use GhidraScript's built-in analyzeAll which works across Ghidra versions
             analyzeAll(currentProgram);
 
-            // Best-effort incremental save. When the bridge is bootstrapped via
-            // `analyzeHeadless -import`, the program is held inside HeadlessAnalyzer's
-            // ambient transaction and this is a no-op ("Object is busy"); durable
-            // persistence then happens on a clean bridge shutdown, which lets
-            // HeadlessAnalyzer end that transaction and flush the program to disk.
+            // Save the analyzed program. The bridge opens the program in
+            // `-process` mode against a project created by a clean one-shot
+            // import, so the program is writable and this save is durable.
             try {
                 currentProgram.save("Analysis complete", mon);
-                logPersistenceState("after analyze save (ok)");
             } catch (Exception saveErr) {
-                // Best effort - durable save happens on clean shutdown.
-                printerr("[persist] analyze save best-effort failed: " + saveErr.getClass().getSimpleName()
-                    + ": " + saveErr.getMessage());
-                logPersistenceState("after analyze save (failed)");
+                // Best effort - durable persistence also happens on clean shutdown.
             }
 
             FunctionManager fm = currentProgram.getFunctionManager();
