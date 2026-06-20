@@ -1259,41 +1259,45 @@ public class GhidraCliBridge extends GhidraScript {
      * Persist {@code currentProgram} to the project on disk.
      *
      * <p>When the bridge is bootstrapped via {@code analyzeHeadless -import
-     * -noanalysis -postScript}, HeadlessAnalyzer imports the binary but only
-     * writes it into the project <em>after</em> the post-script returns. This
-     * bridge post-script never returns (it serves TCP forever), so the imported
-     * program is left uncommitted: it has no {@link DomainFile} in the project
-     * and {@link Program#save} is a silent no-op. In that case we must create
-     * the file in the project root ourselves so the program survives a bridge
-     * restart (and CI project caching). Once a file exists, fall back to a
-     * normal incremental save.
+     * -noanalysis -preScript}, HeadlessAnalyzer imports the binary but only
+     * writes it into the project <em>after</em> the script returns. The bridge
+     * script never returns (it serves TCP forever), so the imported program is
+     * left uncommitted (attached only to a proxy {@link DomainFile}) <em>and</em>
+     * the ambient HeadlessAnalyzer transaction stays open, locking the program.
+     * We must therefore (1) close that transaction and (2) create the file in the
+     * project root ourselves so the program survives a bridge teardown (and CI
+     * project caching). Once a file exists, fall back to a normal incremental
+     * save.
      */
     private void persistCurrentProgram(String comment, TaskMonitor mon) throws Exception {
         Project project = state.getProject();
         if (project == null) {
             throw new IllegalStateException("No project open");
         }
+        // Release any ambient transaction. When the bridge is bootstrapped via
+        // `analyzeHeadless -import`, HeadlessAnalyzer/GhidraScript runs the bridge
+        // inside a program transaction that only closes when the script's run()
+        // returns -- but the bridge serves TCP forever, so it never does. That
+        // open transaction holds a lock, so save() and DomainFolder.createFile
+        // fail with "Object is busy and can not be saved" (both call
+        // DomainObject.lock). Commit and close it so the program can be persisted;
+        // nothing reopens it.
+        currentProgram.flushEvents();
+        ghidra.framework.model.TransactionInfo txi;
+        while ((txi = currentProgram.getCurrentTransactionInfo()) != null) {
+            if (!currentProgram.endTransaction((int) txi.getID(), true)) {
+                break;
+            }
+        }
+
         DomainFolder root = project.getProjectData().getRootFolder();
         String name = currentProgram.getName();
         DomainFile df = currentProgram.getDomainFile();
 
         // A committed program has a DomainFile that lives under a folder in the
-        // project and is backed on disk. When the bridge is bootstrapped via
-        // `analyzeHeadless -import`, HeadlessAnalyzer leaves the imported program
-        // attached only to a *proxy* DomainFile (parent == null, exists == false)
-        // that it would materialize after the (forever-blocking) pre-script
-        // returns; Program.save() against that proxy is a silent no-op. Detect
-        // that and create the real file in the project root ourselves.
-        currentProgram.flushEvents();
-        printerr(String.format(
-            "persist diag2: committed=%s canLock=%s isLocked=%s canSave=%s tx=%s hasTermTx=%s",
-            (df != null && df.getParent() != null && df.exists()),
-            currentProgram.canLock(),
-            currentProgram.isLocked(),
-            currentProgram.canSave(),
-            currentProgram.getCurrentTransactionInfo(),
-            currentProgram.hasTerminatedTransaction()));
-
+        // project and is backed on disk. The bootstrap-import program is attached
+        // only to a proxy DomainFile (parent == null, exists == false); for it we
+        // must create the real file in the project root ourselves.
         boolean committed = df != null && df.getParent() != null && df.exists();
         if (committed) {
             currentProgram.save(comment, mon);
