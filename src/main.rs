@@ -532,28 +532,32 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                     (client, name)
                 } else {
                     if !cli.quiet {
+                        eprintln!("Creating project (importing {})...", args.binary);
+                    }
+                    // Brand-new project: create it with a clean, short-lived
+                    // one-shot import that durably commits the program, then start
+                    // the persistent bridge in Process mode against the committed
+                    // program. This replaces the old `-import` bridge bootstrap,
+                    // whose program persistence depended on HeadlessAnalyzer's
+                    // post-script teardown commit — a commit `stop` could kill
+                    // mid-write (the macOS "program file(s) not found" failures).
+                    let name = bridge::import_oneshot(
+                        &project_path,
+                        &binary_path,
+                        &ghidra_install_dir,
+                    )?;
+                    if !cli.quiet {
                         eprintln!("Starting Ghidra bridge...");
                     }
                     let port = bridge::ensure_bridge_running(
                         &project_path,
                         &ghidra_install_dir,
-                        BridgeStartMode::Import {
-                            binary_path: args.binary.clone(),
+                        BridgeStartMode::Process {
+                            program_name: name.clone(),
                         },
                     )?;
-                    // `-import` already loaded the binary; the bridge's currentProgram
-                    // is it. Prefer its real (domain) name for reporting.
                     let client = BridgeClient::new(port);
-                    let name = client
-                        .program_info()
-                        .ok()
-                        .and_then(|i| {
-                            i.get("name")
-                                .and_then(|n| n.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .or_else(|| args.program.clone())
-                        .unwrap_or_else(|| "unknown".to_string());
+                    client.open_program(&name)?;
                     (client, name)
                 };
 

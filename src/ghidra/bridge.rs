@@ -17,8 +17,6 @@ use crate::ipc::client::BridgeClient;
 
 /// How to start the bridge - import a new binary or open an existing program.
 pub enum BridgeStartMode {
-    /// Import a binary file into the project, then start bridge
-    Import { binary_path: String },
     /// Open an existing program in the project
     Process { program_name: String },
     /// Open the project without loading a specific program
@@ -260,6 +258,156 @@ pub fn ensure_bridge_running(
     start_bridge(project_path, ghidra_install_dir, mode)
 }
 
+/// Select a full JDK for Ghidra and set `JAVA_HOME` on the command. Ghidra
+/// compiles the bridge script at runtime via OSGi and needs javac/jdk.compiler,
+/// which a JRE lacks. Setting `JAVA_HOME` on the child overrides Ghidra's
+/// PATH-based auto-pick (honored by Ghidra's LaunchSupport on all platforms).
+/// If we can't find a JDK, proceed and let Ghidra try — the readiness failure
+/// path surfaces an actionable hint.
+fn apply_java_home(cmd: &mut Command, ghidra_install_dir: &Path) {
+    let explicit_java = crate::config::Config::load()
+        .ok()
+        .and_then(|c| c.get_java_home());
+    match super::java::resolve_for_ghidra(ghidra_install_dir, explicit_java) {
+        Ok(jdk) => {
+            info!(
+                "Using JDK {} at {} ({})",
+                jdk.major,
+                jdk.home.display(),
+                jdk.source
+            );
+            cmd.env("JAVA_HOME", &jdk.home);
+        }
+        Err(e) => {
+            warn!("No suitable JDK auto-selected; letting Ghidra choose. {}", e);
+        }
+    }
+}
+
+/// Import a binary into the project using a clean, short-lived `analyzeHeadless
+/// -import` run (no long-lived preScript), then return the imported program's
+/// name.
+///
+/// This is the durable way to create a brand-new project. Unlike bootstrapping
+/// the persistent bridge with `-import` (which holds the imported program inside
+/// HeadlessAnalyzer's transaction for the bridge's whole life and only commits
+/// it during teardown — a commit we then race by killing the JVM), this run
+/// imports, saves, commits the project, and exits on its own. The persistent
+/// bridge can then open the already-committed program in `-process` mode, where
+/// saves are durable and no teardown commit is required.
+pub fn import_oneshot(
+    project_path: &Path,
+    binary_path: &Path,
+    ghidra_install_dir: &Path,
+) -> Result<String> {
+    info!("Importing binary into new project (one-shot)...");
+
+    let headless_script = find_headless_script(ghidra_install_dir)?;
+
+    let ghidra_project_dir = project_path.parent().unwrap_or(project_path);
+    let ghidra_project_name = project_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "project".to_string());
+
+    // HeadlessAnalyzer names the imported program after the binary's filename;
+    // `-import` has no rename option, so that is the program's domain name.
+    let program_name = binary_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| anyhow::anyhow!("Binary path has no filename: {}", binary_path.display()))?;
+
+    let mut cmd = Command::new(&headless_script);
+    cmd.arg(ghidra_project_dir)
+        .arg(&ghidra_project_name)
+        .arg("-import")
+        .arg(binary_path)
+        .arg("-noanalysis")
+        .arg("-overwrite");
+
+    apply_java_home(&mut cmd, ghidra_install_dir);
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Own process group so the whole JVM tree is killable as a unit (parity with
+    // start_bridge), avoiding orphaned JVMs holding pipes open.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+
+    info!("Ghidra one-shot import command: {:?}", cmd);
+    let mut child = cmd.spawn().context("Failed to spawn Ghidra headless import")?;
+
+    // Drain stdout/stderr on threads so the pipes never fill (which would stall
+    // the JVM), logging each line and watching for the success/failure markers.
+    let stdout = child.stdout.take().expect("stdout should be piped");
+    let stdout_handle = std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        let mut saw_success = false;
+        for line in reader.lines().map_while(Result::ok) {
+            info!("[Ghidra import stdout] {}", line);
+            if line.contains("Import succeeded") || line.contains("REPORT: Save succeeded") {
+                saw_success = true;
+            }
+        }
+        saw_success
+    });
+    let stderr = child.stderr.take().expect("stderr should be piped");
+    let stderr_handle = std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        let mut last_error = String::new();
+        for line in reader.lines().map_while(Result::ok) {
+            info!("[Ghidra import stderr] {}", line);
+            if line.contains("ERROR") || line.contains("Exception") || line.contains("Abort") {
+                last_error = line.clone();
+            }
+        }
+        last_error
+    });
+
+    let status = child
+        .wait()
+        .context("Failed to wait for Ghidra headless import")?;
+
+    let saw_success = stdout_handle.join().unwrap_or(false);
+    let last_error = stderr_handle.join().unwrap_or_default();
+
+    if !status.success() {
+        anyhow::bail!(
+            "Ghidra import failed (exit {:?}){}",
+            status.code(),
+            if last_error.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", last_error)
+            }
+        );
+    }
+    if !saw_success {
+        anyhow::bail!(
+            "Ghidra import did not report success{}",
+            if last_error.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", last_error)
+            }
+        );
+    }
+
+    info!("One-shot import complete: {}", program_name);
+    Ok(program_name)
+}
+
 /// Start a new bridge process.
 /// Returns the port number once the bridge is ready.
 pub fn start_bridge(
@@ -302,9 +450,6 @@ pub fn start_bridge(
     // BEFORE any auto-analysis runs, so launch stays bounded. Analysis is driven
     // separately as an unbounded TCP `analyze` operation (which also saves).
     match &mode {
-        BridgeStartMode::Import { binary_path } => {
-            cmd.arg("-import").arg(binary_path).arg("-noanalysis");
-        }
         BridgeStartMode::Process { program_name } => {
             cmd.arg("-process").arg(program_name).arg("-noanalysis");
         }
@@ -326,31 +471,7 @@ pub fn start_bridge(
         .arg("GhidraCliBridge.java")
         .arg(port_file.to_str().unwrap());
 
-    // Select a full JDK for Ghidra. Ghidra compiles the bridge script at runtime
-    // via OSGi and needs javac/jdk.compiler, which a JRE lacks. Setting JAVA_HOME
-    // on the child overrides Ghidra's PATH-based auto-pick (honored by Ghidra's
-    // LaunchSupport on all platforms). If we can't find a JDK, proceed and let
-    // Ghidra try — the readiness failure path surfaces an actionable hint.
-    let explicit_java = crate::config::Config::load()
-        .ok()
-        .and_then(|c| c.get_java_home());
-    match super::java::resolve_for_ghidra(ghidra_install_dir, explicit_java) {
-        Ok(jdk) => {
-            info!(
-                "Using JDK {} at {} ({})",
-                jdk.major,
-                jdk.home.display(),
-                jdk.source
-            );
-            cmd.env("JAVA_HOME", &jdk.home);
-        }
-        Err(e) => {
-            warn!(
-                "No suitable JDK auto-selected; letting Ghidra choose. {}",
-                e
-            );
-        }
-    }
+    apply_java_home(&mut cmd, ghidra_install_dir);
 
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
