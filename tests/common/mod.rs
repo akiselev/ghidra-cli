@@ -126,8 +126,15 @@ pub fn ensure_test_project(project: &str, program: &str) {
         let rep_dir = projects_dir.join(format!("{}.rep", project));
 
         // Validate the cached project has actual program data, not just metadata
-        // stubs. The real signal is `.rep/idata/` containing more than just the
-        // index (i.e. a `00/` data subdirectory).
+        // stubs. Ghidra's local filesystem stores program data in bucketed
+        // subdirectories (`00/`, `01/`, ...) under `.rep/idata/`, alongside index
+        // files (`~index.dat`, `~index.bak`, `~journal.*`). The real signal of a
+        // populated project is therefore the presence of a *subdirectory* — index
+        // files alone (which is all an empty project has) do NOT count.
+        //
+        // (An earlier check accepted any entry != "~index.dat", so a bare
+        // `~index.bak` made an empty project look valid — the cause of Windows
+        // "Requested project program file(s) not found".)
         //
         // NOTE: We do NOT require a non-empty `.gpr`. A correctly committed
         // Ghidra 12.x project legitimately has a 0-byte `.gpr` descriptor (the
@@ -139,11 +146,7 @@ pub fn ensure_test_project(project: &str, program: &str) {
         let idata_dir = rep_dir.join("idata");
         let idata_has_data = idata_dir.is_dir()
             && std::fs::read_dir(&idata_dir)
-                .map(|entries| {
-                    entries
-                        .filter_map(|e| e.ok())
-                        .any(|e| e.file_name() != "~index.dat")
-                })
+                .map(|entries| entries.filter_map(|e| e.ok()).any(|e| e.path().is_dir()))
                 .unwrap_or(false);
         let project_valid = gpr_file.exists() && idata_has_data;
 

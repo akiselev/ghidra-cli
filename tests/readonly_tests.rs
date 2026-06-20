@@ -1241,6 +1241,15 @@ fn test_program_close() {
         "Expected success or 'Unknown command', got: {}",
         result.stderr
     );
+
+    // The bridge is shared across the whole suite, and `program close` clears the
+    // current program. Re-open it so later tests (which assume a program is
+    // loaded, e.g. test_program_info_no_program) aren't broken by test ordering.
+    let _ = ghidra(harness)
+        .arg("program")
+        .arg("info")
+        .with_project(TEST_PROJECT, TEST_PROGRAM)
+        .run();
 }
 
 #[test]
