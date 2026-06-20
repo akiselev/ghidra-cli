@@ -1718,8 +1718,16 @@ public class GhidraCliBridge extends GhidraScript {
 
             // Phase 2: If listing search found nothing and we have a pattern,
             // fall back to raw memory scanning. This catches strings that Ghidra's
-            // analyzer didn't classify as string data types (common on PE binaries).
+            // analyzer didn't classify as string data types (common on PE binaries,
+            // and on macOS arm64 Rust binaries where literals stay undefined).
+            //
+            // This is a heuristic: it walks back to the start of the surrounding
+            // printable run and reads forward, capped at MEM_SCAN_MAX_LEN. Strings
+            // without a NUL/non-printable separator (e.g. packed Rust &str literals)
+            // can't have their exact boundaries recovered from raw bytes alone, so
+            // these results are marked with "source":"memory-scan".
             if (results.size() == 0 && !pattern.isEmpty()) {
+                final int MEM_SCAN_MAX_LEN = 256;
                 Memory memory = currentProgram.getMemory();
                 byte[] searchBytes = pattern.getBytes(java.nio.charset.StandardCharsets.UTF_8);
 
@@ -1728,17 +1736,22 @@ public class GhidraCliBridge extends GhidraScript {
                     Address found = memory.findBytes(addr, searchBytes, null, true, monitor);
                     if (found == null) break;
 
-                    // Try to extract the full null-terminated string at this address
-                    String extracted = extractStringAt(memory, found, 4096);
+                    // Walk back to the start of the printable run so the result
+                    // isn't truncated to the match offset (e.g. losing "Hello, ").
+                    Address start = backScanToStringStart(memory, found, MEM_SCAN_MAX_LEN);
+                    String extracted = extractStringAt(memory, start, MEM_SCAN_MAX_LEN);
                     if (extracted != null && !extracted.isEmpty()) {
                         JsonObject item = new JsonObject();
-                        item.addProperty("address", found.toString());
+                        item.addProperty("address", start.toString());
                         item.addProperty("value", extracted);
                         item.addProperty("length", extracted.length());
+                        item.addProperty("source", "memory-scan");
                         results.add(item);
                     }
 
-                    addr = found.add(Math.max(1, extracted != null ? extracted.length() : 1));
+                    // Advance past this match (use the matched pattern length so we
+                    // don't loop forever if extraction came back empty).
+                    addr = found.add(Math.max(1, searchBytes.length));
                 }
             }
 
@@ -1749,6 +1762,31 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to find strings: " + e.getMessage());
         }
+    }
+
+    /**
+     * Walk backward from a match address to the start of the surrounding
+     * printable-ASCII run (stopping at a null/non-printable byte, the memory
+     * block start, or after maxBack bytes). Returns the start address.
+     *
+     * For NUL-terminated strings this recovers the true start. For packed
+     * non-terminated strings (Rust &str literals) there is no separator, so
+     * the run may include preceding literals — bounded by maxBack.
+     */
+    private Address backScanToStringStart(Memory memory, Address matchAddr, int maxBack) {
+        Address start = matchAddr;
+        try {
+            for (int i = 0; i < maxBack; i++) {
+                Address prev = start.subtract(1);
+                if (prev == null || !memory.contains(prev)) break;
+                byte b = memory.getByte(prev);
+                if (b == 0 || b < 0x20 || b > 0x7e) break;
+                start = prev;
+            }
+        } catch (Exception e) {
+            // Hit a block boundary or unreadable byte; current start is fine.
+        }
+        return start;
     }
 
     /**

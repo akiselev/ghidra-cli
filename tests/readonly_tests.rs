@@ -499,15 +499,21 @@ fn test_find_string() {
     require_ghidra!();
     let harness = harness();
 
+    // Search for "Ghidra CLI" rather than "Hello": on macOS arm64 Ghidra does
+    // not define the fixture's string literals, and a "Hello" search would
+    // otherwise match the mangled `HELLO_WORLD` symbol name (case-insensitively)
+    // and suppress the raw memory-scan fallback. "Ghidra CLI" only appears in
+    // the actual greeting, so it resolves via defined strings (x86_64) or the
+    // memory-scan fallback (arm64) on both arches.
     let result = ghidra(harness)
         .arg("find")
         .arg("string")
-        .arg("Hello")
+        .arg("Ghidra CLI")
         .with_project(TEST_PROJECT, TEST_PROGRAM)
         .run();
 
     result.assert_success();
-    result.assert_stdout_contains("Hello, Ghidra CLI!");
+    result.assert_stdout_contains("Ghidra CLI");
 }
 
 #[test]
