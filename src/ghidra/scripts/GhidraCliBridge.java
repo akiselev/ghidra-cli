@@ -1255,6 +1255,50 @@ public class GhidraCliBridge extends GhidraScript {
         }
     }
 
+    /**
+     * Persist {@code currentProgram} to the project on disk.
+     *
+     * <p>When the bridge is bootstrapped via {@code analyzeHeadless -import
+     * -noanalysis -postScript}, HeadlessAnalyzer imports the binary but only
+     * writes it into the project <em>after</em> the post-script returns. This
+     * bridge post-script never returns (it serves TCP forever), so the imported
+     * program is left uncommitted: it has no {@link DomainFile} in the project
+     * and {@link Program#save} is a silent no-op. In that case we must create
+     * the file in the project root ourselves so the program survives a bridge
+     * restart (and CI project caching). Once a file exists, fall back to a
+     * normal incremental save.
+     */
+    private void persistCurrentProgram(String comment, TaskMonitor mon) throws Exception {
+        Project project = state.getProject();
+        if (project == null) {
+            throw new IllegalStateException("No project open");
+        }
+        DomainFolder root = project.getProjectData().getRootFolder();
+        String name = currentProgram.getName();
+        DomainFile df = currentProgram.getDomainFile();
+
+        // A committed program has a DomainFile that lives under a folder in the
+        // project and is backed on disk. When the bridge is bootstrapped via
+        // `analyzeHeadless -import`, HeadlessAnalyzer leaves the imported program
+        // attached only to a *proxy* DomainFile (parent == null, exists == false)
+        // that it would materialize after the (forever-blocking) pre-script
+        // returns; Program.save() against that proxy is a silent no-op. Detect
+        // that and create the real file in the project root ourselves.
+        boolean committed = df != null && df.getParent() != null && df.exists();
+        if (committed) {
+            currentProgram.save(comment, mon);
+            return;
+        }
+
+        if (root.getFile(name) == null) {
+            root.createFile(name, currentProgram, mon);
+        } else {
+            // A file already exists under this name but the program is not bound
+            // to it; best-effort incremental save.
+            currentProgram.save(comment, mon);
+        }
+    }
+
     private JsonObject handleAnalyze(JsonObject args) {
         String programName = getArgString(args, "program");
         if (programName == null || programName.isEmpty()) {
@@ -1284,11 +1328,11 @@ public class GhidraCliBridge extends GhidraScript {
             // Use GhidraScript's built-in analyzeAll which works across Ghidra versions
             analyzeAll(currentProgram);
 
-            // Save the program
+            // Persist the program to the project on disk.
             try {
-                currentProgram.save("Analysis complete", mon);
+                persistCurrentProgram("Analysis complete", mon);
             } catch (Exception saveErr) {
-                // Best effort
+                printerr("Persist after analyze failed: " + saveErr);
             }
 
             FunctionManager fm = currentProgram.getFunctionManager();
