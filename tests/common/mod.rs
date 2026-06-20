@@ -149,11 +149,28 @@ pub fn ensure_test_project(project: &str, program: &str) {
             Err(e) => eprintln!("Analyze error: {}", e),
         }
 
-        // NOTE: We intentionally do NOT stop the bridge here.
-        // On macOS, stopping the bridge triggers Ghidra's project close which
-        // can truncate .gpr to 0 bytes and destroy project data. Instead, we
-        // leave the bridge running. DaemonTestHarness::new() will detect the
-        // existing bridge via ensure_bridge_running() and reuse it.
+        // Step 3: Cleanly stop the bridge so the imported+analyzed program is
+        // durably written to disk. A bridge launched via `analyzeHeadless
+        // -import` holds the program inside HeadlessAnalyzer's ambient
+        // transaction; the program is only flushed to the project when the
+        // script returns (i.e. on a clean shutdown). Without this stop the
+        // program lives only in the bridge's memory and is lost when the bridge
+        // is torn down (e.g. CI process-group teardown), leaving a fresh bridge
+        // to open an empty project ("Program not found").
+        //
+        // Subsequent tests reuse the project, not this bridge:
+        // DaemonTestHarness::new() starts a fresh bridge in Process mode that
+        // opens the now-durable program from disk.
+        eprintln!("Step 3: Stopping bridge to flush project to disk...");
+        let stop_status = run_cli_with_timeout(
+            ghidra_bin,
+            &["stop", "--project", project],
+            Duration::from_secs(120),
+        );
+        match stop_status {
+            Ok(status) => eprintln!("Stop finished with status: {}", status),
+            Err(e) => eprintln!("Stop error: {}", e),
+        }
 
         eprintln!("=== Test project setup complete ===");
     });

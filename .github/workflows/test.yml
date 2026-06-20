@@ -116,6 +116,10 @@ jobs:
         run: |
           cargo run -- import tests/fixtures/sample_binary --project ci-test --program sample_binary || true
           cargo run -- analyze --project ci-test --program sample_binary || true
+          # Cleanly stop the bridge so the imported+analyzed program is flushed to
+          # disk (HeadlessAnalyzer only writes the program out on a clean shutdown);
+          # otherwise the cached project would be empty.
+          cargo run -- stop --project ci-test || true
         shell: bash
         timeout-minutes: 20
 
