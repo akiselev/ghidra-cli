@@ -541,11 +541,8 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                     // whose program persistence depended on HeadlessAnalyzer's
                     // post-script teardown commit — a commit `stop` could kill
                     // mid-write (the macOS "program file(s) not found" failures).
-                    let name = bridge::import_oneshot(
-                        &project_path,
-                        &binary_path,
-                        &ghidra_install_dir,
-                    )?;
+                    let name =
+                        bridge::import_oneshot(&project_path, &binary_path, &ghidra_install_dir)?;
                     if !cli.quiet {
                         eprintln!("Starting Ghidra bridge...");
                     }

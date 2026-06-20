@@ -279,7 +279,10 @@ fn apply_java_home(cmd: &mut Command, ghidra_install_dir: &Path) {
             cmd.env("JAVA_HOME", &jdk.home);
         }
         Err(e) => {
-            warn!("No suitable JDK auto-selected; letting Ghidra choose. {}", e);
+            warn!(
+                "No suitable JDK auto-selected; letting Ghidra choose. {}",
+                e
+            );
         }
     }
 }
@@ -346,7 +349,9 @@ pub fn import_oneshot(
     }
 
     info!("Ghidra one-shot import command: {:?}", cmd);
-    let mut child = cmd.spawn().context("Failed to spawn Ghidra headless import")?;
+    let mut child = cmd
+        .spawn()
+        .context("Failed to spawn Ghidra headless import")?;
 
     // Drain stdout/stderr on threads so the pipes never fill (which would stall
     // the JVM), logging each line and watching for the success/failure markers.

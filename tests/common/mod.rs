@@ -27,7 +27,10 @@ use std::time::Duration;
 /// imported+analyzed program is not durably written to the project (seen on
 /// macOS as "Requested project program file(s) not found").
 pub fn dump_persistence_diagnostics(project: &str, label: &str) {
-    eprintln!("=== persistence diagnostics [{}] for project '{}' ===", label, project);
+    eprintln!(
+        "=== persistence diagnostics [{}] for project '{}' ===",
+        label, project
+    );
 
     let projects_dir = match ghidra_cli::config::Config::default_project_dir() {
         Ok(d) => d,
@@ -77,7 +80,11 @@ pub fn dump_persistence_diagnostics(project: &str, label: &str) {
                     eprintln!("    {}", line);
                 }
             }
-            Err(e) => eprintln!("  bridge persist log {}: unavailable ({})", persist_log.display(), e),
+            Err(e) => eprintln!(
+                "  bridge persist log {}: unavailable ({})",
+                persist_log.display(),
+                e
+            ),
         }
     }
     eprintln!("=== end persistence diagnostics [{}] ===", label);
