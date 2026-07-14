@@ -281,7 +281,12 @@ impl Query {
 
     fn apply_pagination(&self, data: &[JsonValue]) -> Vec<JsonValue> {
         let offset = self.offset.unwrap_or(0);
-        let limit = self.limit.unwrap_or(usize::MAX);
+        // `--limit 0` means "no limit", matching the bridge's convention
+        // (its list handlers only cap when limit > 0).
+        let limit = match self.limit {
+            None | Some(0) => usize::MAX,
+            Some(n) => n,
+        };
 
         data.iter().skip(offset).take(limit).cloned().collect()
     }
@@ -383,5 +388,41 @@ mod tests {
         assert!(!keys[0].descending);
         assert_eq!(keys[1].field, "size");
         assert!(keys[1].descending);
+    }
+
+    fn rows(n: usize) -> Vec<JsonValue> {
+        (0..n).map(|i| serde_json::json!({ "id": i })).collect()
+    }
+
+    #[test]
+    fn test_limit_zero_means_all_rows() {
+        // Regression: `--limit 0` used to produce take(0) => empty output
+        let mut query = Query::new(DataType::Functions);
+        query.limit = Some(0);
+        assert_eq!(query.apply_pagination(&rows(5)).len(), 5);
+    }
+
+    #[test]
+    fn test_limit_none_means_all_rows() {
+        let query = Query::new(DataType::Functions);
+        assert_eq!(query.apply_pagination(&rows(5)).len(), 5);
+    }
+
+    #[test]
+    fn test_limit_applies_after_offset() {
+        let mut query = Query::new(DataType::Functions);
+        query.limit = Some(2);
+        query.offset = Some(1);
+        let page = query.apply_pagination(&rows(5));
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0]["id"], 1);
+    }
+
+    #[test]
+    fn test_limit_zero_with_offset_returns_remainder() {
+        let mut query = Query::new(DataType::Functions);
+        query.limit = Some(0);
+        query.offset = Some(2);
+        assert_eq!(query.apply_pagination(&rows(5)).len(), 3);
     }
 }

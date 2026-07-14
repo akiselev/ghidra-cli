@@ -1,6 +1,6 @@
 use super::{CompareOp, ExistenceCheck, FilterExpr, LogicalOp, StringOp, Value};
 use crate::error::{GhidraError, Result};
-use regex::Regex;
+use regex::RegexBuilder;
 use serde_json::Value as JsonValue;
 
 pub fn evaluate(expr: &FilterExpr, data: &JsonValue) -> Result<bool> {
@@ -106,11 +106,35 @@ fn evaluate_string_op(field: &str, op: StringOp, value: &str, data: &JsonValue) 
         StringOp::Contains => field_str.contains(&value_lower),
         StringOp::StartsWith => field_str.starts_with(&value_lower),
         StringOp::EndsWith => field_str.ends_with(&value_lower),
-        StringOp::Regex => {
-            let re = Regex::new(value)
-                .map_err(|e| GhidraError::InvalidFilter(format!("Invalid regex: {}", e)))?;
-            re.is_match(&field_str)
+        StringOp::Regex => compiled_regex(value)?.is_match(&field_str),
+    })
+}
+
+/// Compile a filter regex once per pattern; `evaluate` runs per row, and
+/// recompiling on every row dominates runtime on large datasets.
+/// Case-insensitive because field values are lowercased before matching —
+/// an uppercase pattern like `^PK_` could otherwise never match.
+fn compiled_regex(pattern: &str) -> Result<std::rc::Rc<regex::Regex>> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, Rc<regex::Regex>>> = RefCell::new(HashMap::new());
+    }
+
+    CACHE.with(|cache| {
+        if let Some(re) = cache.borrow().get(pattern) {
+            return Ok(re.clone());
         }
+        let re = Rc::new(
+            RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+                .map_err(|e| GhidraError::InvalidFilter(format!("Invalid regex: {}", e)))?,
+        );
+        cache.borrow_mut().insert(pattern.to_string(), re.clone());
+        Ok(re)
     })
 }
 
@@ -218,6 +242,21 @@ mod tests {
             field: "name".to_string(),
             op: StringOp::Contains,
             value: "func".to_string(),
+        };
+
+        assert!(evaluate(&expr, &data).unwrap());
+    }
+
+    #[test]
+    fn test_evaluate_regex_is_case_insensitive() {
+        // Regression: fields are lowercased before matching, so an uppercase
+        // pattern like ^PK_ silently matched nothing.
+        let data = json!({ "name": "PK_APPITEM_ask" });
+
+        let expr = FilterExpr::StringOp {
+            field: "name".to_string(),
+            op: StringOp::Regex,
+            value: "^PK_".to_string(),
         };
 
         assert!(evaluate(&expr, &data).unwrap());

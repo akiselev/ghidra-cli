@@ -217,7 +217,9 @@ pub struct QueryArgs {
     #[arg(long, env = "GHIDRA_DEFAULT_PROJECT")]
     pub project: Option<String>,
 
-    /// Filter expression
+    /// Filter expression: <field><op><value>, e.g. 'name~PK' (contains),
+    /// 'name=~"^PK_"' (regex), 'size>100'. Ops: = != > >= < <= ~ ^ $ =~.
+    /// Combine with AND/OR/NOT. Bare words are rejected.
     #[arg(short, long)]
     pub filter: Option<String>,
 
@@ -229,7 +231,7 @@ pub struct QueryArgs {
     #[arg(long, short = 'o')]
     pub format: Option<String>,
 
-    /// Maximum number of results
+    /// Maximum number of results (0 = unlimited; default 1000)
     #[arg(long)]
     pub limit: Option<usize>,
 
@@ -1154,6 +1156,9 @@ pub struct QueryOptions {
     #[arg(long)]
     pub project: Option<String>,
 
+    /// Filter expression: <field><op><value>, e.g. 'name~PK' (contains),
+    /// 'name=~"^PK_"' (regex), 'size>100'. Ops: = != > >= < <= ~ ^ $ =~.
+    /// Combine with AND/OR/NOT. Bare words are rejected.
     #[arg(short, long)]
     pub filter: Option<String>,
 
@@ -1163,6 +1168,7 @@ pub struct QueryOptions {
     #[arg(long, short = 'o')]
     pub format: Option<String>,
 
+    /// Maximum number of results (0 = unlimited; default 1000)
     #[arg(long)]
     pub limit: Option<usize>,
 

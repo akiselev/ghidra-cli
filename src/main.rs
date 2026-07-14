@@ -457,6 +457,15 @@ fn extract_query_options(command: &Commands) -> Option<QueryOptions> {
 
 /// Run a command that requires the bridge.
 fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
+    // Reject a malformed --filter up front, before any bridge work: the bridge
+    // fetch for a filtered query pulls the *full* dataset, so failing late
+    // wastes that transfer (and used to silently dump it — TODO.md Bug 2).
+    if let Some(opts) = extract_query_options(&cli.command) {
+        if let Some(expr) = &opts.filter {
+            filter::Filter::parse(expr).map_err(describe_query_error)?;
+        }
+    }
+
     let config = load_config(&cli.projects_dir)?;
 
     // Extract project from command args, fall back to global --project, then config default
@@ -710,9 +719,11 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
     // Unwrap bridge response envelopes before formatting
     let values = unwrap_bridge_response(result);
 
-    // Apply Rust-side query processing (filter, fields, sort) if QueryOptions are present
+    // Apply Rust-side query processing (filter, fields, sort) if QueryOptions are present.
+    // A parse error (e.g. malformed --filter) must abort: falling through to the
+    // default formatter would dump the entire unfiltered dataset (TODO.md Bug 2).
     if let Some(opts) = &opts {
-        if let Ok(Some(query)) = Query::from_options(opts, format) {
+        if let Some(query) = Query::from_options(opts, format).map_err(describe_query_error)? {
             let output = query.process_results(values)?;
             if !output.is_empty() {
                 println!("{}", output);
@@ -733,6 +744,20 @@ fn is_unknown_command_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("Unknown command:")
 }
 
+/// Make filter parse failures actionable: the DSL needs a field and operator,
+/// so a bare word like `PK` is invalid (use `name~PK` instead).
+fn describe_query_error(err: GhidraError) -> anyhow::Error {
+    match &err {
+        GhidraError::FilterParseError(_) | GhidraError::InvalidFilter(_) => anyhow::anyhow!(err)
+            .context(
+                "invalid --filter expression: expected <field><operator><value>, \
+                 e.g. --filter 'name~PK' (contains), --filter 'name=~\"^PK_\"' (regex), \
+                 --filter 'size>100'; combine with AND/OR/NOT",
+            ),
+        _ => anyhow::anyhow!(err),
+    }
+}
+
 /// The bridge's list handlers only support a literal substring match on the
 /// primary name field, not the full filter DSL implemented client-side in
 /// `query::Filter`. When a full filter expression, sort, or count is requested,
@@ -749,7 +774,14 @@ fn bridge_list_params(
     if filter.is_some() || sort.is_some() || count || offset.is_some() {
         (None, None)
     } else {
-        (limit.or(default_limit), filter)
+        // `--limit 0` means "all rows": suppress both the explicit limit and
+        // the config default. Omitting --limit still applies default_limit.
+        let limit = match limit {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => default_limit,
+        };
+        (limit, filter)
     }
 }
 
@@ -1881,5 +1913,56 @@ fn resolve_project_path(project: &Option<String>, config: &Config) -> anyhow::Re
         Ok(PathBuf::from(project_name))
     } else {
         Ok(project_dir.join(project_name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_list_params_limit_zero_means_unlimited() {
+        // Regression (TODO.md Bug 1): --limit 0 must fetch all rows, not zero,
+        // and must not fall back to the config default limit.
+        let (limit, filter) = bridge_list_params(Some(0), None, None, false, None, Some(1000));
+        assert_eq!(limit, None);
+        assert_eq!(filter, None);
+    }
+
+    #[test]
+    fn bridge_list_params_no_limit_uses_default() {
+        let (limit, _) = bridge_list_params(None, None, None, false, None, Some(1000));
+        assert_eq!(limit, Some(1000));
+    }
+
+    #[test]
+    fn bridge_list_params_explicit_limit_wins() {
+        let (limit, _) = bridge_list_params(Some(25), None, None, false, None, Some(1000));
+        assert_eq!(limit, Some(25));
+    }
+
+    #[test]
+    fn bridge_list_params_filter_fetches_full_dataset() {
+        let (limit, filter) = bridge_list_params(
+            Some(20),
+            Some("name~PK".to_string()),
+            None,
+            false,
+            None,
+            Some(1000),
+        );
+        assert_eq!(limit, None);
+        assert_eq!(filter, None);
+    }
+
+    #[test]
+    fn describe_query_error_mentions_filter_usage() {
+        // Regression (TODO.md Bug 2): a bare word is not a valid filter and the
+        // error must surface (previously swallowed, dumping the whole dataset).
+        let Err(err) = filter::Filter::parse("PK") else {
+            panic!("bare word must not parse");
+        };
+        let msg = format!("{:#}", describe_query_error(err));
+        assert!(msg.contains("invalid --filter expression"), "got: {msg}");
     }
 }

@@ -89,6 +89,15 @@ pub fn ensure_test_project(project: &str, program: &str) {
 
         if gpr_file.exists() {
             eprintln!("=== Project cache invalid (missing program data), re-importing ===");
+            // A bridge from a previous test binary may still be running (the
+            // static HARNESS OnceLock is never dropped, so its bridge leaks
+            // across test binaries). Stop it BEFORE deleting the project files:
+            // deleting them from under a live bridge makes the import below go
+            // over TCP into the doomed in-memory project, which then persists
+            // nothing on stop — and every test in this binary fails with
+            // "Could not find project".
+            let project_path = projects_dir.join(project);
+            let _ = ghidra_cli::ghidra::bridge::stop_bridge(&project_path);
             // Remove stale project files to avoid conflicts during import
             let _ = std::fs::remove_file(&gpr_file);
             let _ = std::fs::remove_dir_all(&rep_dir);

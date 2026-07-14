@@ -166,7 +166,7 @@ fn test_function_list_filter() {
         .with_project(TEST_PROJECT, TEST_PROGRAM)
         .json_format()
         .arg("--filter")
-        .arg("main")
+        .arg("name~main")
         .run();
 
     result.assert_success();
@@ -174,17 +174,38 @@ fn test_function_list_filter() {
     let functions: Vec<Function> = result.json();
     assert!(
         !functions.is_empty(),
-        "Filter 'main' should match at least one function"
+        "Filter 'name~main' should match at least one function"
     );
 
-    let has_main = functions
-        .iter()
-        .any(|f| f.name.to_lowercase().contains("main"));
+    // The filter must actually filter: EVERY returned row matches, not just one
+    // (a bare-word filter used to silently dump the whole unfiltered dataset).
     assert!(
-        has_main,
-        "At least one filtered result should contain 'main'. Got: {:?}",
+        functions
+            .iter()
+            .all(|f| f.name.to_lowercase().contains("main")),
+        "All filtered results should contain 'main'. Got: {:?}",
         functions.iter().map(|f| &f.name).collect::<Vec<_>>()
     );
+}
+
+#[test]
+#[serial]
+fn test_function_list_bare_word_filter_rejected() {
+    require_ghidra!();
+    let harness = harness();
+
+    // A bare word is not a valid filter expression. It must fail with a
+    // nonzero exit instead of dumping the entire unfiltered dataset.
+    let result = ghidra(harness)
+        .arg("function")
+        .arg("list")
+        .with_project(TEST_PROJECT, TEST_PROGRAM)
+        .json_format()
+        .arg("--filter")
+        .arg("main")
+        .run();
+
+    result.assert_failure();
 }
 
 // ============================================================================
