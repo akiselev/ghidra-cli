@@ -73,7 +73,9 @@ fn main() {
         | Commands::Stop { .. }
         | Commands::Restart { .. }
         | Commands::Status { .. }
-        | Commands::Ping { .. } => handle_bridge_command(cli),
+        | Commands::Ping { .. }
+        | Commands::Jobs { .. }
+        | Commands::Cancel { .. } => handle_bridge_command(cli),
         _ => run_command(cli),
     };
 
@@ -1222,12 +1224,13 @@ fn execute_via_bridge(
     }
 }
 
-/// Dispatch bridge management commands (top-level start/stop/restart/status/ping).
+/// Dispatch bridge management commands.
 fn handle_bridge_command(cli: Cli) -> anyhow::Result<()> {
     // Global --project/--program flags serve as fallbacks for subcommand-level args
     let global_project = cli.project.clone();
     let global_program = cli.program.clone();
     let projects_dir = cli.projects_dir.clone();
+    let json_output = cli.json || cli.pretty || !std::io::stdout().is_terminal();
     match cli.command {
         Commands::Start { project, program } => handle_bridge_start(
             project.or(global_project),
@@ -1246,6 +1249,20 @@ fn handle_bridge_command(cli: Cli) -> anyhow::Result<()> {
             handle_bridge_status(project.or(global_project), &projects_dir)
         }
         Commands::Ping { project } => handle_bridge_ping(project.or(global_project), &projects_dir),
+        Commands::Jobs { job_id, project } => handle_bridge_jobs(
+            project.or(global_project),
+            &projects_dir,
+            job_id,
+            json_output,
+            cli.pretty,
+        ),
+        Commands::Cancel { job_id, project } => handle_bridge_cancel(
+            project.or(global_project),
+            &projects_dir,
+            job_id,
+            json_output,
+            cli.pretty,
+        ),
         _ => unreachable!(),
     }
 }
@@ -1338,6 +1355,31 @@ fn handle_bridge_status(
                 if let Some(count) = info.get("program_count").and_then(|v| v.as_u64()) {
                     println!("  Programs: {}", count);
                 }
+                if let Some(state) = info.get("bridge_state").and_then(|v| v.as_str()) {
+                    println!("  State: {}", state);
+                }
+                if let Some(depth) = info.get("queue_depth").and_then(|v| v.as_u64()) {
+                    println!("  Queue depth: {}", depth);
+                }
+                if let Some(job) = info.get("active_job").filter(|v| !v.is_null()) {
+                    let id = job.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let command = job
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let state = job
+                        .get("state")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let elapsed = job.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                    println!(
+                        "  Active job: {} {} ({}, {:.1}s)",
+                        id,
+                        command,
+                        state,
+                        elapsed as f64 / 1000.0
+                    );
+                }
             }
         }
         BridgeStatus::Stopped => {
@@ -1367,6 +1409,129 @@ fn handle_bridge_ping(
         println!("No bridge running for project: {}", project_path.display());
     }
 
+    Ok(())
+}
+
+fn handle_bridge_jobs(
+    project: Option<String>,
+    projects_dir: &Option<PathBuf>,
+    job_id: Option<u64>,
+    json_output: bool,
+    pretty: bool,
+) -> anyhow::Result<()> {
+    let config = load_config(projects_dir)?;
+    let project_path = resolve_project_path(&project, &config)?;
+    let port = bridge::is_bridge_running(&project_path).ok_or_else(|| {
+        anyhow::anyhow!("No bridge running for project: {}", project_path.display())
+    })?;
+    let client = BridgeClient::new(port);
+    let jobs = if job_id.is_some() {
+        client.job_status(job_id)?
+    } else {
+        client.status()?
+    };
+    if pretty {
+        println!("{}", serde_json::to_string_pretty(&jobs)?);
+    } else if json_output {
+        println!("{}", serde_json::to_string(&jobs)?);
+    } else if let Some(job) = jobs.get("job") {
+        print_bridge_job("Job", job);
+    } else if jobs.get("found").and_then(|v| v.as_bool()) == Some(false) {
+        println!("Job {} was not found", job_id.unwrap_or_default());
+    } else {
+        let state = jobs
+            .get("bridge_state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let depth = jobs
+            .get("queue_depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        println!("Bridge: {} ({} queued)", state, depth);
+
+        match jobs.get("active_job").filter(|v| !v.is_null()) {
+            Some(job) => print_bridge_job("Active", job),
+            None => println!("Active: none"),
+        }
+
+        if let Some(queued) = jobs.get("queued_jobs").and_then(|v| v.as_array()) {
+            for job in queued {
+                print_bridge_job("Queued", job);
+            }
+        }
+        if let Some(recent) = jobs.get("recent_jobs").and_then(|v| v.as_array()) {
+            for job in recent {
+                print_bridge_job("Recent", job);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_bridge_job(label: &str, job: &serde_json::Value) {
+    let id = job.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+    let command = job
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let state = job
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let elapsed = job.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut details = format!(
+        "{label}: {id} {command} ({state}, {:.1}s",
+        elapsed as f64 / 1000.0
+    );
+
+    let progress = job.get("progress").and_then(|v| v.as_u64()).unwrap_or(0);
+    let maximum = job.get("maximum").and_then(|v| v.as_u64()).unwrap_or(0);
+    if maximum > 0 {
+        details.push_str(&format!(", {progress}/{maximum}"));
+    }
+    details.push(')');
+    if let Some(message) = job.get("progress_message").and_then(|v| v.as_str()) {
+        details.push_str(": ");
+        details.push_str(message);
+    } else if let Some(error) = job.get("error").and_then(|v| v.as_str()) {
+        details.push_str(": ");
+        details.push_str(error);
+    }
+    println!("{details}");
+}
+
+fn handle_bridge_cancel(
+    project: Option<String>,
+    projects_dir: &Option<PathBuf>,
+    job_id: Option<u64>,
+    json_output: bool,
+    pretty: bool,
+) -> anyhow::Result<()> {
+    let config = load_config(projects_dir)?;
+    let project_path = resolve_project_path(&project, &config)?;
+    let port = bridge::is_bridge_running(&project_path).ok_or_else(|| {
+        anyhow::anyhow!("No bridge running for project: {}", project_path.display())
+    })?;
+    let result = BridgeClient::new(port).cancel_job(job_id)?;
+    if pretty {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if json_output {
+        println!("{}", serde_json::to_string(&result)?);
+    } else {
+        let id = result
+            .get("job_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_default();
+        let state = result
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let message = result
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Cancellation request handled");
+        println!("Job {id}: {state} - {message}");
+    }
     Ok(())
 }
 

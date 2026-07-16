@@ -66,21 +66,41 @@ Returns the port directly so callers never need a separate `read_port_file()` ca
 
 Stronger verification than `is_bridge_running`: uses `BridgeClient::new(port).ping()` instead of raw TCP connect. Returns `BridgeStatus::Running { port, pid }` or `BridgeStatus::Stopped`.
 
-### Pre-flight liveness (no ping gate on the hot path)
+### Responsive control plane and serialized program lane
 
-Command dispatch used to call a `verify_bridge()` helper that pinged the bridge (5s
-timeout) before running the requested command. That was **removed**: it conflated a
-*busy* bridge with a *dead* one. The bridge is single-threaded, so while it serves one
-request it cannot answer a ping — under concurrent agents the ping timed out and the whole
-command failed with "Bridge not responding to ping", even though the bridge was healthy and
-would have served the request as soon as it was free.
+Command dispatch no longer treats a failed pre-flight ping as proof that the bridge is
+dead. More importantly, socket handling is now separate from Ghidra program execution:
 
-`is_bridge_running()` already proves liveness (port file + PID alive + TCP accept) right
-before dispatch, and the OS accept backlog (50) queues concurrent connections, so a busy
-bridge simply makes the client **wait its turn** on the read rather than fail. See
-`ipc/client.rs`: `connect_with_retry()` waits out transient connect failures (bridge
-(re)start / saturated backlog) with backoff up to `GHIDRA_CLI_CONNECT_DEADLINE` (default
-60s), and the read blocks up to `GHIDRA_CLI_READ_TIMEOUT` (default 300s; `0` = indefinite).
+```text
+TCP acceptor -> bounded client pool -> control commands (immediate)
+                                  \-> bounded FIFO -> GhidraScript thread
+```
+
+`ping`, `status`, `bridge_info`, `job_status`, `job_cancel`, and `shutdown` run on the
+control plane using thread-safe snapshots. Every command that can touch `currentProgram`,
+`state`, a transaction, or another Ghidra object is assigned a job ID and executed on the
+original `GhidraScript.run()` thread. This keeps the conservative one-owner program model
+without making a long analysis look like a dead bridge.
+
+The explicit queue is bounded at 256 program jobs. Connection handlers only parse and
+enqueue; they do not block while a program future is pending. Completed futures hand socket
+writes to a separate bounded response pool, preserving the existing synchronous
+request/response protocol without starving controls behind waiting clients. Status retains
+the 100 most recent jobs and exposes active progress, queued work, cancellation state, and
+elapsed time. Cancellation uses a per-job `TaskMonitorAdapter`; active cancellation is
+cooperative, while a job that has not started can be removed from the queue immediately.
+
+See `ipc/client.rs`: `connect_with_retry()` waits out transient connect failures (bridge
+(re)start / saturated client capacity) with backoff up to
+`GHIDRA_CLI_CONNECT_DEADLINE` (default 60s). A program request waits up to
+`GHIDRA_CLI_READ_TIMEOUT` (default 300s; `0` = indefinite), while long analyze/import
+operations use `GHIDRA_CLI_OP_TIMEOUT` (`0` or unset = indefinite). Use `ghidra jobs` to
+inspect work and `ghidra cancel [JOB_ID]` to request cancellation.
+
+`shutdown` stops accepting new work and drains every program job accepted before it. The
+Rust lifecycle waits up to `GHIDRA_CLI_SHUTDOWN_TIMEOUT` (default 300s; `0` = indefinite)
+before force termination. This replaces the old three-second window that could kill a
+healthy bridge while it was finishing work or closing the project.
 
 ## BridgeClient Adoption
 

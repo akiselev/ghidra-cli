@@ -30,8 +30,8 @@ import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
-import ghidra.util.task.ConsoleTaskMonitor;
 import ghidra.util.task.TaskMonitor;
+import ghidra.util.task.TaskMonitorAdapter;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -56,14 +56,162 @@ import java.io.*;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
 import java.util.Iterator;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class GhidraCliBridge extends GhidraScript {
 
-    private Gson gson = new GsonBuilder().serializeNulls().create();
-    private long startTime;
+    private static final int MAX_PROGRAM_QUEUE = 256;
+    private static final int MAX_CLIENT_THREADS = 32;
+    private static final int MAX_PENDING_CLIENTS = 128;
+    private static final int MAX_RESPONSE_THREADS = 16;
+    private static final int MAX_RETAINED_JOBS = 100;
+    private static final int MAX_STATUS_JOBS = 25;
+
+    private final Gson gson = new GsonBuilder().serializeNulls().create();
+    private final Object lifecycleLock = new Object();
+    private final BlockingQueue<ProgramJob> programQueue =
+        new ArrayBlockingQueue<>(MAX_PROGRAM_QUEUE);
+    private final ConcurrentHashMap<Long, JobRecord> jobs = new ConcurrentHashMap<>();
+    private final ConcurrentLinkedDeque<Long> completedJobIds = new ConcurrentLinkedDeque<>();
+    private final AtomicLong nextJobId = new AtomicLong(1);
+    private final AtomicLong nextClientThreadId = new AtomicLong(1);
+    private final AtomicLong nextResponseThreadId = new AtomicLong(1);
+
+    private volatile long startTime;
+    private volatile boolean acceptingJobs;
+    private volatile boolean shutdownRequested;
+    private volatile ServerSocket serverSocket;
+    private volatile ExecutorService connectionExecutor;
+    private volatile ExecutorService responseExecutor;
+    private volatile JobRecord activeJob;
+    private volatile Thread programThread;
+
+    // Immutable bridge-info values published by the program execution thread.
+    // Control-plane threads read these instead of dereferencing Ghidra objects.
+    private volatile String currentProgramNameSnapshot;
+    private volatile String projectNameSnapshot;
+    private volatile int programCountSnapshot;
+
     private static final Pattern NAMED_HEX_ADDRESS_PATTERN =
         Pattern.compile("(?i)^(?:FUN|SUB|LAB|DAT)_([0-9a-f]+)$");
+
+    private static class JobTaskMonitor extends TaskMonitorAdapter {
+        private volatile String message = "";
+        private volatile long progress;
+        private volatile long maximum;
+        private volatile boolean indeterminate;
+
+        JobTaskMonitor() {
+            super(true);
+        }
+
+        @Override
+        public void setMessage(String value) {
+            message = value == null ? "" : value;
+            super.setMessage(value);
+        }
+
+        @Override
+        public String getMessage() {
+            return message;
+        }
+
+        @Override
+        public void setProgress(long value) {
+            progress = value;
+            super.setProgress(value);
+        }
+
+        @Override
+        public long getProgress() {
+            return progress;
+        }
+
+        @Override
+        public void initialize(long value) {
+            maximum = value;
+            progress = 0;
+            super.initialize(value);
+        }
+
+        @Override
+        public void setMaximum(long value) {
+            maximum = value;
+            super.setMaximum(value);
+        }
+
+        @Override
+        public long getMaximum() {
+            return maximum;
+        }
+
+        @Override
+        public void setIndeterminate(boolean value) {
+            indeterminate = value;
+            super.setIndeterminate(value);
+        }
+
+        @Override
+        public boolean isIndeterminate() {
+            return indeterminate;
+        }
+
+        @Override
+        public void incrementProgress(long amount) {
+            progress += amount;
+            super.incrementProgress(amount);
+        }
+    }
+
+    private static class JobRecord {
+        final long id;
+        final String command;
+        final long enqueuedAt;
+        final JobTaskMonitor monitor = new JobTaskMonitor();
+        final CompletableFuture<HandleResult> completion = new CompletableFuture<>();
+
+        volatile String state = "queued";
+        volatile long startedAt;
+        volatile long finishedAt;
+        volatile String error;
+
+        JobRecord(long id, String command) {
+            this.id = id;
+            this.command = command;
+            this.enqueuedAt = System.currentTimeMillis();
+        }
+    }
+
+    private static class ProgramJob {
+        final JobRecord record;
+        final JsonObject args;
+        final boolean poison;
+
+        ProgramJob(JobRecord record, JsonObject args) {
+            this(record, args, false);
+        }
+
+        private ProgramJob(JobRecord record, JsonObject args, boolean poison) {
+            this.record = record;
+            this.args = args;
+            this.poison = poison;
+        }
+
+        static ProgramJob poison() {
+            return new ProgramJob(null, null, true);
+        }
+    }
 
     @Override
     public void run() throws Exception {
@@ -76,12 +224,46 @@ public class GhidraCliBridge extends GhidraScript {
         }
         String portFilePath = scriptArgs[0];
 
-        // Bind to dynamic port on localhost only.
-        // Backlog of 50 lets many concurrent agents queue connections while one
-        // is being served (the accept loop is intentionally single-threaded to
-        // keep Ghidra API access serialized).
-        ServerSocket serverSocket = new ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"));
+        // Bind to dynamic port on localhost only. Socket handling happens on
+        // separate threads; this original GhidraScript thread remains the sole
+        // executor for operations that dereference currentProgram/state.
+        serverSocket = new ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"));
         int port = serverSocket.getLocalPort();
+
+        connectionExecutor = new ThreadPoolExecutor(
+            MAX_CLIENT_THREADS,
+            MAX_CLIENT_THREADS,
+            60L,
+            TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(MAX_PENDING_CLIENTS),
+            runnable -> {
+                Thread thread = new Thread(
+                    runnable,
+                    "ghidra-cli-client-" + nextClientThreadId.getAndIncrement());
+                thread.setDaemon(true);
+                return thread;
+            },
+            new ThreadPoolExecutor.AbortPolicy());
+
+        responseExecutor = new ThreadPoolExecutor(
+            4,
+            MAX_RESPONSE_THREADS,
+            60L,
+            TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(MAX_PROGRAM_QUEUE),
+            runnable -> {
+                Thread thread = new Thread(
+                    runnable,
+                    "ghidra-cli-response-" + nextResponseThreadId.getAndIncrement());
+                thread.setDaemon(true);
+                return thread;
+            },
+            new ThreadPoolExecutor.AbortPolicy());
+
+        acceptingJobs = true;
+        shutdownRequested = false;
+        programThread = Thread.currentThread();
+        refreshBridgeSnapshot();
 
         // Write port file
         File portFile = new File(portFilePath);
@@ -106,47 +288,270 @@ public class GhidraCliBridge extends GhidraScript {
         println("---GHIDRA_CLI_END---");
         System.out.flush();
 
-        // Accept loop
-        boolean running = true;
-        while (running) {
+        Thread acceptor = new Thread(this::acceptClients, "ghidra-cli-acceptor");
+        acceptor.setDaemon(true);
+        acceptor.start();
+
+        try {
+            // Deliberately run program jobs on the original GhidraScript thread.
+            // Communications remain responsive while Ghidra access stays serialized.
+            runProgramJobs();
+        } finally {
+            beginShutdown();
             try {
-                Socket client = serverSocket.accept();
-                try (
-                    BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
-                    PrintWriter out = new PrintWriter(new OutputStreamWriter(client.getOutputStream()), true)
-                ) {
-                    String line;
-                    while ((line = in.readLine()) != null) {
-                        line = line.trim();
-                        if (line.isEmpty()) continue;
+                acceptor.join(5000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
 
-                        HandleResult result = handleRequest(line);
-                        out.println(gson.toJson(result.response));
-                        out.flush();
-
-                        if (result.shouldShutdown) {
-                            running = false;
-                            break;
-                        }
+            ExecutorService executor = connectionExecutor;
+            if (executor != null) {
+                executor.shutdown();
+                try {
+                    if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
+                        executor.shutdownNow();
                     }
-                } catch (IOException e) {
-                    printerr("Client error: " + e.getMessage());
-                } finally {
-                    client.close();
+                } catch (InterruptedException e) {
+                    executor.shutdownNow();
+                    Thread.currentThread().interrupt();
                 }
-            } catch (IOException e) {
-                if (running) {
-                    printerr("Accept error: " + e.getMessage());
+            }
+
+            ExecutorService responses = responseExecutor;
+            if (responses != null) {
+                responses.shutdown();
+                try {
+                    if (!responses.awaitTermination(30, TimeUnit.SECONDS)) {
+                        responses.shutdownNow();
+                    }
+                } catch (InterruptedException e) {
+                    responses.shutdownNow();
+                    Thread.currentThread().interrupt();
                 }
+            }
+
+            // Leave port/pid files for the Rust CLI to clean up. Deleting them
+            // here races the JVM's project close and lock release.
+            closeServerSocket();
+        }
+    }
+
+    private void acceptClients() {
+        try {
+            while (!shutdownRequested) {
+                Socket client = serverSocket.accept();
+                try {
+                    connectionExecutor.execute(() -> serveClient(client));
+                } catch (RejectedExecutionException e) {
+                    rejectClient(client, "Bridge has too many concurrent clients; retry shortly");
+                }
+            }
+        } catch (SocketException e) {
+            if (!shutdownRequested) {
+                printerr("Accept error: " + e.getMessage());
+                beginShutdown();
+            }
+        } catch (IOException e) {
+            if (!shutdownRequested) {
+                printerr("Accept error: " + e.getMessage());
+                beginShutdown();
+            }
+        } finally {
+            ExecutorService executor = connectionExecutor;
+            if (executor != null) {
+                executor.shutdown();
+            }
+        }
+    }
+
+    private void serveClient(Socket client) {
+        try {
+            // The wire protocol is one JSON request per connection. Parse and
+            // enqueue here, but never occupy a connection thread while waiting
+            // for serialized Ghidra work to finish.
+            client.setSoTimeout(30000);
+            BufferedReader in = new BufferedReader(
+                new InputStreamReader(client.getInputStream()));
+            String line = in.readLine();
+            if (line == null || line.trim().isEmpty()) {
+                client.close();
+                return;
+            }
+
+            CompletableFuture<HandleResult> completion = handleRequest(line.trim());
+            if (completion.isDone()) {
+                respondAndClose(client, completion.join());
+                return;
+            }
+
+            completion.whenComplete((result, error) -> {
+                HandleResult response = result;
+                if (error != null) {
+                    Throwable cause = error.getCause() == null ? error : error.getCause();
+                    response = new HandleResult(errorResponse(cause.getMessage()), false);
+                }
+                final HandleResult completedResponse = response;
+                try {
+                    responseExecutor.execute(
+                        () -> respondAndClose(client, completedResponse));
+                } catch (RejectedExecutionException e) {
+                    try {
+                        client.close();
+                    } catch (IOException ignored) {
+                        // The client may already have disconnected.
+                    }
+                }
+            });
+        } catch (IOException e) {
+            try {
+                client.close();
+            } catch (IOException ignored) {
+                // Already closed.
+            }
+            if (!shutdownRequested) {
+                printerr("Client error: " + e.getMessage());
+            }
+        }
+    }
+
+    private void respondAndClose(Socket client, HandleResult result) {
+        try (
+            Socket closeableClient = client;
+            PrintWriter out = new PrintWriter(
+                new OutputStreamWriter(closeableClient.getOutputStream()), true)
+        ) {
+            out.println(gson.toJson(result.response));
+            out.flush();
+        } catch (IOException e) {
+            if (!shutdownRequested) {
+                printerr("Client response error: " + e.getMessage());
+            }
+        }
+    }
+
+    private void rejectClient(Socket client, String message) {
+        try (
+            Socket closeableClient = client;
+            PrintWriter out = new PrintWriter(
+                new OutputStreamWriter(closeableClient.getOutputStream()), true)
+        ) {
+            out.println(gson.toJson(errorResponse(message)));
+        } catch (IOException ignored) {
+            // The client may already have disconnected.
+        }
+    }
+
+    private void runProgramJobs() {
+        while (true) {
+            ProgramJob job;
+            try {
+                job = programQueue.take();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                beginShutdown();
+                return;
+            }
+
+            if (job.poison) {
+                return;
+            }
+            executeProgramJob(job);
+        }
+    }
+
+    private void executeProgramJob(ProgramJob job) {
+        JobRecord record = job.record;
+        TaskMonitor bridgeMonitor = monitor;
+        activeJob = record;
+        record.state = "running";
+        record.startedAt = System.currentTimeMillis();
+        monitor = record.monitor;
+
+        HandleResult result;
+        try {
+            result = executeProgramRequest(record.command, job.args);
+            result.response.addProperty("job_id", record.id);
+
+            String responseStatus = result.response.has("status")
+                ? result.response.get("status").getAsString()
+                : "error";
+            if (record.monitor.isCancelled()) {
+                record.state = "error".equals(responseStatus)
+                    ? "cancelled"
+                    : "completed_after_cancel";
+            } else {
+                record.state = "error".equals(responseStatus) ? "failed" : "complete";
+            }
+            if ("error".equals(responseStatus) && result.response.has("message")) {
+                record.error = result.response.get("message").getAsString();
+            }
+        } catch (Exception e) {
+            record.state = record.monitor.isCancelled() ? "cancelled" : "failed";
+            record.error = e.getMessage();
+            result = new HandleResult(errorResponse(e.getMessage()), false);
+            result.response.addProperty("job_id", record.id);
+        } finally {
+            monitor = bridgeMonitor;
+            record.finishedAt = System.currentTimeMillis();
+            activeJob = null;
+            refreshBridgeSnapshot();
+        }
+
+        record.completion.complete(result);
+        retainCompletedJob(record.id);
+    }
+
+    private void beginShutdown() {
+        ServerSocket socketToClose;
+        boolean enqueuePoison = false;
+        synchronized (lifecycleLock) {
+            if (shutdownRequested) {
+                return;
+            }
+            shutdownRequested = true;
+            acceptingJobs = false;
+            socketToClose = serverSocket;
+            if (Thread.currentThread() != programThread) {
+                enqueuePoison = true;
             }
         }
 
-        // Cleanup: close the server socket but leave port/pid files for the
-        // Rust CLI to clean up. Deleting them here creates a race: the JVM is
-        // still unwinding (closing the Ghidra project, releasing locks) but
-        // stop_bridge() can no longer find the PID to wait on, so it returns
-        // early while the project lock is still held.
-        serverSocket.close();
+        if (socketToClose != null) {
+            try {
+                socketToClose.close();
+            } catch (IOException ignored) {
+                // Already closed.
+            }
+        }
+
+        if (enqueuePoison) {
+            // FIFO placement drains every job accepted before shutdown. Preserve
+            // interruption but do not strand the GhidraScript thread without its
+            // shutdown sentinel if the bounded queue is temporarily full.
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    programQueue.put(ProgramJob.poison());
+                    break;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void closeServerSocket() {
+        ServerSocket socket = serverSocket;
+        if (socket != null && !socket.isClosed()) {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // Best-effort cleanup during JVM teardown.
+            }
+        }
     }
 
     // --- Request Handling ---
@@ -161,31 +566,101 @@ public class GhidraCliBridge extends GhidraScript {
         }
     }
 
-    private HandleResult handleRequest(String line) {
+    private CompletableFuture<HandleResult> handleRequest(String line) {
         try {
             JsonObject req = JsonParser.parseString(line).getAsJsonObject();
             String command = req.has("command") ? req.get("command").getAsString() : null;
             JsonObject args = req.has("args") && !req.get("args").isJsonNull()
                 ? req.getAsJsonObject("args") : new JsonObject();
 
-            if ("shutdown".equals(command)) {
-                JsonObject resp = new JsonObject();
-                resp.addProperty("status", "shutdown");
-                return new HandleResult(resp, true);
+            if (command == null || command.isEmpty()) {
+                return CompletableFuture.completedFuture(
+                    new HandleResult(errorResponse("Command required"), false));
             }
 
+            if (isControlCommand(command)) {
+                return CompletableFuture.completedFuture(handleControlCommand(command, args));
+            }
+
+            JobRecord record = new JobRecord(nextJobId.getAndIncrement(), command);
+            ProgramJob job = new ProgramJob(record, args.deepCopy());
+
+            synchronized (lifecycleLock) {
+                if (!acceptingJobs) {
+                    return CompletableFuture.completedFuture(new HandleResult(
+                        errorResponse("Bridge is draining and is not accepting new program jobs"),
+                        false));
+                }
+                jobs.put(record.id, record);
+                if (!programQueue.offer(job)) {
+                    jobs.remove(record.id);
+                    return CompletableFuture.completedFuture(new HandleResult(
+                        errorResponse("Bridge program queue is full; retry shortly"), false));
+                }
+            }
+            return record.completion;
+        } catch (Exception e) {
+            return CompletableFuture.completedFuture(
+                new HandleResult(errorResponse(e.getMessage()), false));
+        }
+    }
+
+    private boolean isControlCommand(String command) {
+        switch (command) {
+            case "ping":
+            case "status":
+            case "bridge_info":
+            case "job_status":
+            case "job_cancel":
+            case "shutdown":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private HandleResult handleControlCommand(String command, JsonObject args) {
+        switch (command) {
+            case "ping":
+                return new HandleResult(successResponse(handlePing()), false);
+            case "status":
+                return new HandleResult(successResponse(handleStatus()), false);
+            case "bridge_info":
+                return new HandleResult(successResponse(handleBridgeInfo()), false);
+            case "job_status":
+                return new HandleResult(successResponse(handleJobStatus(args)), false);
+            case "job_cancel": {
+                JsonObject result = handleJobCancel(args);
+                if (result.has("error")) {
+                    return new HandleResult(
+                        errorResponse(result.get("error").getAsString()), false);
+                }
+                return new HandleResult(successResponse(result), false);
+            }
+            case "shutdown": {
+                beginShutdown();
+                JsonObject response = new JsonObject();
+                response.addProperty("status", "shutdown");
+                response.addProperty("mode", "drain");
+                return new HandleResult(response, true);
+            }
+            default:
+                return new HandleResult(errorResponse("Unknown control command: " + command), false);
+        }
+    }
+
+    private HandleResult executeProgramRequest(String command, JsonObject args) {
+        try {
             JsonObject result = dispatchCommand(command, args);
             if (result == null) {
                 return new HandleResult(errorResponse("Unknown command: " + command), false);
             }
 
-            // Check if the handler returned an error
             if (result.has("error")) {
                 return new HandleResult(errorResponse(result.get("error").getAsString()), false);
             }
 
             return new HandleResult(successResponse(result), false);
-
         } catch (Exception e) {
             return new HandleResult(errorResponse(e.getMessage()), false);
         }
@@ -194,7 +669,6 @@ public class GhidraCliBridge extends GhidraScript {
     private JsonObject dispatchCommand(String command, JsonObject args) {
         if (command == null) return null;
         switch (command) {
-            case "ping":            return handlePing();
             case "program_info":    return handleProgramInfo();
             case "list_functions":  return handleListFunctions(args);
             case "get_function":    return handleGetFunction(args);
@@ -272,8 +746,6 @@ public class GhidraCliBridge extends GhidraScript {
             case "script_list":     return handleScriptList();
             // Batch
             case "batch":           return handleBatch(args);
-            // Bridge info
-            case "bridge_info":     return handleBridgeInfo();
             // Memory read
             case "read_memory":     return handleReadMemory(args);
             default:                return null;
@@ -393,29 +865,230 @@ public class GhidraCliBridge extends GhidraScript {
     private JsonObject handlePing() {
         JsonObject result = new JsonObject();
         result.addProperty("message", "pong");
+        result.addProperty("bridge_state", acceptingJobs ? "running" : "draining");
+        result.addProperty("queue_depth", programQueue.size());
+        JobRecord active = activeJob;
+        if (active != null) {
+            result.addProperty("active_job_id", active.id);
+            result.addProperty("active_command", active.command);
+        }
         return result;
     }
 
     private JsonObject handleBridgeInfo() {
         JsonObject result = new JsonObject();
-        result.addProperty("has_current_program", currentProgram != null);
-        if (currentProgram != null) {
-            result.addProperty("current_program", currentProgram.getName());
+        String programName = currentProgramNameSnapshot;
+        result.addProperty("protocol_version", 2);
+        result.addProperty("has_current_program", programName != null);
+        if (programName != null) {
+            result.addProperty("current_program", programName);
         }
         result.addProperty("uptime_ms", System.currentTimeMillis() - startTime);
+        if (projectNameSnapshot != null) {
+            result.addProperty("project_name", projectNameSnapshot);
+        }
+        result.addProperty("program_count", programCountSnapshot);
+        addQueueSummary(result, false);
+        return result;
+    }
 
-        Project project = state.getProject();
+    private JsonObject handleStatus() {
+        JsonObject result = new JsonObject();
+        result.addProperty("protocol_version", 2);
+        result.addProperty("uptime_ms", System.currentTimeMillis() - startTime);
+        addQueueSummary(result, true);
+        return result;
+    }
+
+    private JsonObject handleJobStatus(JsonObject args) {
+        if (args != null && args.has("job_id") && !args.get("job_id").isJsonNull()) {
+            long id = args.get("job_id").getAsLong();
+            JobRecord record = jobs.get(id);
+            if (record == null) {
+                JsonObject result = new JsonObject();
+                result.addProperty("found", false);
+                result.addProperty("job_id", id);
+                return result;
+            }
+            JsonObject result = new JsonObject();
+            result.addProperty("found", true);
+            result.add("job", jobToJson(record, queuePosition(id)));
+            return result;
+        }
+        return handleStatus();
+    }
+
+    private JsonObject handleJobCancel(JsonObject args) {
+        JobRecord target;
+        if (args != null && args.has("job_id") && !args.get("job_id").isJsonNull()) {
+            target = jobs.get(args.get("job_id").getAsLong());
+        } else {
+            target = activeJob;
+        }
+
+        if (target == null) {
+            return errorResult("No matching active or queued job");
+        }
+
+        JobRecord active = activeJob;
+        if (active != null && active.id == target.id) {
+            target.state = "cancel_requested";
+            target.monitor.cancel();
+            JsonObject result = new JsonObject();
+            result.addProperty("job_id", target.id);
+            result.addProperty("state", target.state);
+            result.addProperty("message", "Cancellation requested; completion is cooperative");
+            return result;
+        }
+
+        ProgramJob queued = findQueuedJob(target.id);
+        if (queued != null && programQueue.remove(queued)) {
+            target.monitor.cancel();
+            target.state = "cancelled";
+            target.finishedAt = System.currentTimeMillis();
+            target.error = "Cancelled before execution";
+            JsonObject response = errorResponse(target.error);
+            response.addProperty("job_id", target.id);
+            target.completion.complete(new HandleResult(response, false));
+            retainCompletedJob(target.id);
+
+            JsonObject result = new JsonObject();
+            result.addProperty("job_id", target.id);
+            result.addProperty("state", target.state);
+            result.addProperty("message", target.error);
+            return result;
+        }
+
+        // It may have moved from the queue to active between the checks above.
+        active = activeJob;
+        if (active != null && active.id == target.id) {
+            target.state = "cancel_requested";
+            target.monitor.cancel();
+            JsonObject result = new JsonObject();
+            result.addProperty("job_id", target.id);
+            result.addProperty("state", target.state);
+            result.addProperty("message", "Cancellation requested; completion is cooperative");
+            return result;
+        }
+
+        JsonObject result = new JsonObject();
+        result.addProperty("job_id", target.id);
+        result.addProperty("state", target.state);
+        result.addProperty("message", "Job is no longer cancellable");
+        return result;
+    }
+
+    private ProgramJob findQueuedJob(long id) {
+        for (ProgramJob job : programQueue) {
+            if (!job.poison && job.record != null && job.record.id == id) {
+                return job;
+            }
+        }
+        return null;
+    }
+
+    private int queuePosition(long id) {
+        int position = 0;
+        for (ProgramJob job : programQueue) {
+            if (job.poison) continue;
+            if (job.record != null && job.record.id == id) {
+                return position;
+            }
+            position++;
+        }
+        return -1;
+    }
+
+    private void addQueueSummary(JsonObject result, boolean includeJobs) {
+        result.addProperty("bridge_state", acceptingJobs ? "running" : "draining");
+        result.addProperty("accepting_jobs", acceptingJobs);
+        result.addProperty("shutdown_requested", shutdownRequested);
+        result.addProperty("queue_depth", queuedJobCount());
+
+        JobRecord active = activeJob;
+        if (active == null) {
+            result.add("active_job", JsonNull.INSTANCE);
+        } else {
+            result.add("active_job", jobToJson(active, -1));
+        }
+
+        if (!includeJobs) return;
+
+        JsonArray queued = new JsonArray();
+        int position = 0;
+        for (ProgramJob job : programQueue) {
+            if (job.poison || job.record == null) continue;
+            if (queued.size() >= MAX_STATUS_JOBS) break;
+            queued.add(jobToJson(job.record, position++));
+        }
+        result.add("queued_jobs", queued);
+
+        JsonArray recent = new JsonArray();
+        Iterator<Long> ids = completedJobIds.descendingIterator();
+        while (ids.hasNext() && recent.size() < MAX_STATUS_JOBS) {
+            JobRecord record = jobs.get(ids.next());
+            if (record != null) {
+                recent.add(jobToJson(record, -1));
+            }
+        }
+        result.add("recent_jobs", recent);
+    }
+
+    private int queuedJobCount() {
+        int count = 0;
+        for (ProgramJob job : programQueue) {
+            if (!job.poison) count++;
+        }
+        return count;
+    }
+
+    private JsonObject jobToJson(JobRecord record, int queuePosition) {
+        JsonObject result = new JsonObject();
+        result.addProperty("id", record.id);
+        result.addProperty("command", record.command);
+        result.addProperty("state", record.state);
+        result.addProperty("enqueued_at_ms", record.enqueuedAt);
+        if (record.startedAt > 0) result.addProperty("started_at_ms", record.startedAt);
+        if (record.finishedAt > 0) result.addProperty("finished_at_ms", record.finishedAt);
+        long end = record.finishedAt > 0 ? record.finishedAt : System.currentTimeMillis();
+        long start = record.startedAt > 0 ? record.startedAt : record.enqueuedAt;
+        result.addProperty("elapsed_ms", Math.max(0, end - start));
+        if (queuePosition >= 0) result.addProperty("queue_position", queuePosition);
+        result.addProperty("cancel_requested", record.monitor.isCancelled());
+        result.addProperty("cancel_enabled", record.monitor.isCancelEnabled());
+        result.addProperty("progress", record.monitor.getProgress());
+        result.addProperty("maximum", record.monitor.getMaximum());
+        result.addProperty("indeterminate", record.monitor.isIndeterminate());
+        String message = record.monitor.getMessage();
+        if (message != null && !message.isEmpty()) result.addProperty("progress_message", message);
+        if (record.error != null) result.addProperty("error", record.error);
+        return result;
+    }
+
+    private void retainCompletedJob(long id) {
+        completedJobIds.addLast(id);
+        while (completedJobIds.size() > MAX_RETAINED_JOBS) {
+            Long expired = completedJobIds.pollFirst();
+            if (expired != null) jobs.remove(expired);
+        }
+    }
+
+    private void refreshBridgeSnapshot() {
+        Program program = currentProgram;
+        currentProgramNameSnapshot = program == null ? null : program.getName();
+
+        Project project = state == null ? null : state.getProject();
+        projectNameSnapshot = project == null ? null : project.getName();
+        programCountSnapshot = 0;
         if (project != null) {
-            result.addProperty("project_name", project.getName());
             try {
                 ProjectData projectData = project.getProjectData();
                 DomainFolder rootFolder = projectData.getRootFolder();
-                result.addProperty("program_count", rootFolder.getFiles().length);
-            } catch (Exception e) {
-                result.addProperty("program_count", 0);
+                programCountSnapshot = rootFolder.getFiles().length;
+            } catch (Exception ignored) {
+                programCountSnapshot = 0;
             }
         }
-        return result;
     }
 
     private JsonObject handleProgramInfo() {
@@ -765,7 +1438,7 @@ public class GhidraCliBridge extends GhidraScript {
         try {
             decompiler.openProgram(currentProgram);
 
-            TaskMonitor mon = new ConsoleTaskMonitor();
+            TaskMonitor mon = monitor;
             DecompileResults results = decompiler.decompileFunction(func, 30, mon);
 
             if (results.decompileCompleted()) {
@@ -1213,7 +1886,7 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         try {
-            TaskMonitor mon = new ConsoleTaskMonitor();
+            TaskMonitor mon = monitor;
             MessageLog log = new MessageLog();
             Object consumer = project;
 
@@ -1279,7 +1952,7 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         try {
-            TaskMonitor mon = new ConsoleTaskMonitor();
+            TaskMonitor mon = monitor;
 
             // Use GhidraScript's built-in analyzeAll which works across Ghidra versions
             analyzeAll(currentProgram);
@@ -1425,7 +2098,7 @@ public class GhidraCliBridge extends GhidraScript {
             }
 
             Object consumer = project;
-            TaskMonitor mon = new ConsoleTaskMonitor();
+            TaskMonitor mon = monitor;
 
             // Release current program if one is open
             if (currentProgram != null) {
@@ -1605,7 +2278,7 @@ public class GhidraCliBridge extends GhidraScript {
                     return errorResult("Exporter has no 4-arg export method: " + exportFormat);
                 }
 
-                TaskMonitor mon = new ConsoleTaskMonitor();
+                TaskMonitor mon = monitor;
                 exportMethod.invoke(exporter, new File(outputPath), currentProgram, null, mon);
 
                 JsonObject result = new JsonObject();
@@ -2409,7 +3082,7 @@ public class GhidraCliBridge extends GhidraScript {
             DataTypeManager dtm = currentProgram.getDataTypeManager();
             int txId = currentProgram.startTransaction("Delete type");
             try {
-                boolean removed = dtm.remove(dataType, new ConsoleTaskMonitor());
+                boolean removed = dtm.remove(dataType, monitor);
                 currentProgram.endTransaction(txId, true);
                 if (!removed) {
                     return errorResult("Failed to remove type: " + typeName + " (may be in use or built-in)");
@@ -2762,7 +3435,7 @@ public class GhidraCliBridge extends GhidraScript {
             DecompInterface decompiler = new DecompInterface();
             try {
                 decompiler.openProgram(currentProgram);
-                TaskMonitor mon = new ConsoleTaskMonitor();
+                TaskMonitor mon = monitor;
                 DecompileResults results = decompiler.decompileFunction(func, 30, mon);
                 if (!results.decompileCompleted())
                     return errorResult("Decompilation failed for " + funcTarget);
@@ -3289,7 +3962,7 @@ public class GhidraCliBridge extends GhidraScript {
             DecompInterface decompiler = new DecompInterface();
             try {
                 decompiler.openProgram(currentProgram);
-                TaskMonitor mon = new ConsoleTaskMonitor();
+                TaskMonitor mon = monitor;
 
                 DecompileResults res1 = decompiler.decompileFunction(func1, 30, mon);
                 DecompileResults res2 = decompiler.decompileFunction(func2, 30, mon);
@@ -3469,7 +4142,7 @@ public class GhidraCliBridge extends GhidraScript {
             }
 
             File outputFile = new File(outputPath);
-            TaskMonitor mon = new ConsoleTaskMonitor();
+            TaskMonitor mon = monitor;
             exportMethod.invoke(exporter, outputFile, currentProgram, null, mon);
 
             JsonObject result = new JsonObject();

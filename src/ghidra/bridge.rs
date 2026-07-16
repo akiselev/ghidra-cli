@@ -26,6 +26,21 @@ pub enum BridgeStartMode {
 /// Embedded Java bridge script
 const JAVA_BRIDGE_SCRIPT: &str = include_str!("scripts/GhidraCliBridge.java");
 
+/// Grace period for a bridge to drain accepted program jobs and let Ghidra
+/// close the project cleanly before the CLI falls back to process termination.
+const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 300;
+
+fn parse_shutdown_timeout(raw: Option<&str>) -> Option<Duration> {
+    let seconds = raw
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_SECS);
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
+fn shutdown_timeout() -> Option<Duration> {
+    parse_shutdown_timeout(std::env::var("GHIDRA_CLI_SHUTDOWN_TIMEOUT").ok().as_deref())
+}
+
 /// Get the data directory for bridge port/PID files.
 pub fn get_data_dir() -> Result<PathBuf> {
     let dir = dirs::data_local_dir()
@@ -747,18 +762,31 @@ pub fn stop_bridge(project_path: &Path) -> Result<()> {
         }
     }
 
-    // Wait for the process to exit gracefully, then force-kill if needed
+    // Wait for the process to drain accepted jobs and exit cleanly, then
+    // force-kill only after the configured grace period. A value of 0 waits
+    // indefinitely, which is useful for very large analysis jobs.
     if let Some(pid) = pid {
-        // Wait up to 3 seconds for graceful exit
-        for _ in 0..30 {
-            if !is_pid_alive(pid) {
-                break;
+        let timed_out = match shutdown_timeout() {
+            Some(timeout) => {
+                let deadline = std::time::Instant::now() + timeout;
+                while is_pid_alive(pid) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                is_pid_alive(pid)
             }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        // If still alive after waiting, force kill
-        if is_pid_alive(pid) {
-            warn!("Killing bridge process {} as fallback", pid);
+            None => {
+                while is_pid_alive(pid) {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                false
+            }
+        };
+
+        if timed_out {
+            warn!(
+                "Bridge {} did not finish draining before GHIDRA_CLI_SHUTDOWN_TIMEOUT; killing as fallback",
+                pid
+            );
             #[cfg(unix)]
             unsafe {
                 // Kill the whole process group (the JVM was spawned into the
@@ -958,6 +986,23 @@ pub fn find_headless_script(ghidra_install_dir: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn shutdown_timeout_defaults_and_supports_unbounded_wait() {
+        assert_eq!(
+            parse_shutdown_timeout(None),
+            Some(Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS))
+        );
+        assert_eq!(
+            parse_shutdown_timeout(Some(" 45 ")),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(parse_shutdown_timeout(Some("0")), None);
+        assert_eq!(
+            parse_shutdown_timeout(Some("invalid")),
+            Some(Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS))
+        );
+    }
 
     #[test]
     fn ready_when_socket_binds_while_alive() {

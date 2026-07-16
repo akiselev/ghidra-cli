@@ -194,6 +194,14 @@ ghidra start --project myproject --program mybinary
 # Check bridge status
 ghidra status --project myproject
 
+# Inspect active, queued, and recent jobs (or one job by ID)
+ghidra jobs --project myproject
+ghidra jobs 42 --project myproject
+
+# Cooperatively cancel the active job, or select a queued/running job by ID
+ghidra cancel --project myproject
+ghidra cancel 42 --project myproject
+
 # All commands use the bridge automatically
 ghidra function list --project myproject    # Fast!
 ghidra decompile main --project myproject   # Fast!
@@ -204,6 +212,13 @@ ghidra stop --project myproject
 # Restart with different program
 ghidra restart --project myproject --program otherbinary
 ```
+
+The bridge handles networking and lifecycle controls independently from Ghidra
+program access. Program operations remain serialized on one Ghidra-owned thread,
+but `ping`, `status`, `jobs`, `cancel`, and drain requests remain responsive while
+analysis or another long operation is running. Queued program operations receive
+job IDs and wait in an explicit bounded FIFO rather than an invisible socket
+backlog.
 
 ### Multi-Project Support
 

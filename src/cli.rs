@@ -196,6 +196,24 @@ pub enum Commands {
         project: Option<String>,
     },
 
+    /// List active, queued, and recently completed bridge jobs
+    Jobs {
+        /// Show one job by ID; omit for the bridge queue and recent jobs
+        job_id: Option<u64>,
+        /// Project path
+        #[arg(long)]
+        project: Option<String>,
+    },
+
+    /// Request cooperative cancellation of a bridge job (defaults to active job)
+    Cancel {
+        /// Job ID; omit to cancel the currently active job
+        job_id: Option<u64>,
+        /// Project path
+        #[arg(long)]
+        project: Option<String>,
+    },
+
     /// Download and setup Ghidra automatically
     Setup(SetupArgs),
 

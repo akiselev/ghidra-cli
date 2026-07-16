@@ -15,10 +15,10 @@ use super::protocol::{BridgeRequest, BridgeResponse};
 
 /// Default socket read timeout for short, interactive commands, in seconds.
 ///
-/// The bridge is single-threaded and serves requests one at a time, so a command
-/// that arrives while another is in flight simply queues (the OS accept backlog
-/// holds the connection) and waits its turn. This budget must therefore be
-/// generous enough to outlast whatever is ahead of it. Override with
+/// Ghidra program access is serialized through the bridge's explicit job queue,
+/// so a command that arrives while another is in flight waits its turn while
+/// control requests remain responsive. This budget must therefore be generous
+/// enough to outlast whatever is ahead of it. Override with
 /// `GHIDRA_CLI_READ_TIMEOUT` (seconds); `0` means block indefinitely.
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 300;
 
@@ -83,9 +83,9 @@ fn is_transient_connect_error(e: &std::io::Error) -> bool {
 
 /// Connect to the bridge, waiting out transient failures.
 ///
-/// A busy single-threaded bridge still *accepts* connections (the OS backlog
-/// queues them), so connect normally succeeds immediately and the wait happens
-/// on the read. But during bridge (re)start or a saturated backlog, connect can
+/// A busy bridge still accepts connections and queues program jobs, so connect
+/// normally succeeds immediately and the wait happens on the read. But during
+/// bridge (re)start or saturated client capacity, connect can
 /// fail transiently; rather than surfacing that as a hard error we retry with
 /// exponential backoff until [`connect_deadline`] elapses. Only pre-send connect
 /// failures are retried — nothing has been written yet — so this stays safe for
@@ -98,9 +98,7 @@ fn connect_with_retry(addr: &std::net::SocketAddr) -> Result<TcpStream> {
     loop {
         match TcpStream::connect_timeout(addr, Duration::from_secs(10)) {
             Ok(stream) => return Ok(stream),
-            Err(e)
-                if is_transient_connect_error(&e) && std::time::Instant::now() < deadline =>
-            {
+            Err(e) if is_transient_connect_error(&e) && std::time::Instant::now() < deadline => {
                 debug!("bridge connect transient ({e}); retrying in {backoff:?}");
                 last_err = Some(e);
                 std::thread::sleep(backoff);
@@ -201,9 +199,9 @@ impl BridgeClient {
                 ) =>
             {
                 anyhow::bail!(
-                    "Bridge did not respond within {}s while running '{}' — it is likely busy \
-                     serving another request. The bridge serializes work, so raise the wait via \
-                     GHIDRA_CLI_READ_TIMEOUT (seconds; 0 = wait indefinitely), or \
+                    "Bridge did not respond within {}s while running '{}' — the program job is \
+                     still queued or running. Inspect `ghidra jobs`, raise the wait via \
+                     GHIDRA_CLI_READ_TIMEOUT (seconds; 0 = wait indefinitely), or use \
                      GHIDRA_CLI_OP_TIMEOUT for long analyze/import operations.",
                     read_timeout.map(|d| d.as_secs()).unwrap_or(0),
                     command
@@ -247,9 +245,18 @@ impl BridgeClient {
     }
 
     /// Get bridge status.
-    #[allow(dead_code)]
     pub fn status(&self) -> Result<serde_json::Value> {
         self.send_command("status", None)
+    }
+
+    /// Get one job, or the full bridge job status when no ID is supplied.
+    pub fn job_status(&self, job_id: Option<u64>) -> Result<serde_json::Value> {
+        self.send_command("job_status", Some(json!({"job_id": job_id})))
+    }
+
+    /// Request cooperative cancellation of a job. With no ID, cancel the active job.
+    pub fn cancel_job(&self, job_id: Option<u64>) -> Result<serde_json::Value> {
+        self.send_command("job_cancel", Some(json!({"job_id": job_id})))
     }
 
     /// Get bridge info (current program, project name, program count, uptime).
