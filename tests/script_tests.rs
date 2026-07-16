@@ -21,6 +21,15 @@ fn harness() -> &'static DaemonTestHarness {
     })
 }
 
+fn echo_args_script_path() -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("tests");
+    path.push("fixtures");
+    path.push("scripts");
+    path.push("EchoArgs.java");
+    path
+}
+
 fn get_test_script_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("tests");
@@ -94,12 +103,62 @@ fn test_script_run() {
         output.status.success()
             || stderr.contains("Script does not exist")
             || stderr.contains("Script not found")
+            || stderr.contains("No script provider") // Python provider not installed
+            || stderr.contains("Script failed")
+            || stderr.contains("Script threw")
             || stderr.contains("Failed to run script"),
         "Expected success or script-not-found error, got: {}",
         stderr
     );
 
     fs::remove_file(script_path).ok();
+}
+
+/// A checked-in Java script runs by absolute path (no global-scripts-dir copy),
+/// receives real positional arguments (Phase 4.1), and its stdout is captured
+/// into the structured result. Java is used deliberately: it compiles via the
+/// doctor-resolved JDK, whereas Python needs a provider that may be absent.
+#[test]
+#[serial]
+fn test_script_run_java_args() {
+    require_ghidra!();
+    let _harness = harness();
+
+    let script_path = echo_args_script_path();
+    assert!(
+        script_path.exists(),
+        "fixture missing: {}",
+        script_path.display()
+    );
+
+    let output = assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        .arg("script")
+        .arg("run")
+        .arg(script_path.to_str().unwrap())
+        .arg("--project")
+        .arg(TEST_PROJECT)
+        .arg("--program")
+        .arg(TEST_PROGRAM)
+        .arg("--")
+        .arg("hello")
+        .arg("world")
+        .output()
+        .expect("Failed to run command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "script run failed.\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+    // The captured script println() output lands in the result's `stdout` field.
+    assert!(
+        stdout.contains("ARGC=2") && stdout.contains("ARG0=hello") && stdout.contains("ARG1=world"),
+        "expected echoed args in captured stdout, got: {}",
+        stdout
+    );
 }
 
 #[test]

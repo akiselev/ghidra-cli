@@ -1180,7 +1180,16 @@ fn execute_via_bridge(
         Commands::Script(cmd) => {
             use cli::ScriptCommands;
             match cmd {
-                ScriptCommands::Run(args) => client.script_run(&args.script_path, &args.args),
+                ScriptCommands::Run(args) => {
+                    // Canonicalize client-side so the bridge receives an absolute
+                    // path independent of the working directory its JVM inherited.
+                    // Fall back to the raw path if the file is missing; the bridge
+                    // then reports a clear "Script not found".
+                    let path = std::fs::canonicalize(&args.script_path)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| args.script_path.clone());
+                    client.script_run(&path, &args.args)
+                }
                 ScriptCommands::Python(args) => client.script_python(&args.code),
                 ScriptCommands::Java(args) => client.script_java(&args.code),
                 ScriptCommands::List => client.script_list(),

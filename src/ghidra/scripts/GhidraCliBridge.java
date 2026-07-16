@@ -9,6 +9,12 @@
 // implementation using Ghidra's bundled Gson for JSON serialization.
 
 import ghidra.app.script.GhidraScript;
+import ghidra.app.script.GhidraScriptProvider;
+import ghidra.app.script.GhidraScriptUtil;
+import ghidra.app.script.GhidraScriptLoadException;
+import ghidra.app.script.GhidraState;
+import ghidra.util.exception.CancelledException;
+import generic.jar.ResourceFile;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.cmd.function.ApplyFunctionSignatureCmd;
@@ -858,6 +864,20 @@ public class GhidraCliBridge extends GhidraScript {
     private boolean getArgBool(JsonObject args, String key, boolean defaultVal) {
         if (args == null || !args.has(key) || args.get(key).isJsonNull()) return defaultVal;
         return args.get(key).getAsBoolean();
+    }
+
+    private String[] getArgStringArray(JsonObject args, String key) {
+        if (args == null || !args.has(key) || !args.get(key).isJsonArray()) return new String[0];
+        JsonArray arr = args.getAsJsonArray(key);
+        String[] out = new String[arr.size()];
+        for (int i = 0; i < arr.size(); i++) out[i] = arr.get(i).getAsString();
+        return out;
+    }
+
+    private JsonArray toJsonArray(String[] values) {
+        JsonArray arr = new JsonArray();
+        for (String v : values) arr.add(v);
+        return arr;
     }
 
     // --- Command Handlers (M1: Core) ---
@@ -4303,19 +4323,79 @@ public class GhidraCliBridge extends GhidraScript {
         String scriptPath = getArgString(args, "path");
         if (scriptPath == null) return errorResult("Script path required");
 
-        try {
-            File scriptFile = new File(scriptPath);
-            if (!scriptFile.exists()) return errorResult("Script not found: " + scriptPath);
+        // Resolve to an absolute path so the script is found regardless of the
+        // working directory the bridge JVM inherited. This removes the RE-repo
+        // workaround of copying scripts into a global scripts directory.
+        File scriptFile = new File(scriptPath).getAbsoluteFile();
+        if (!scriptFile.exists()) return errorResult("Script not found: " + scriptFile.getPath());
 
-            // Use GhidraScript's runScript method
-            runScript(scriptPath);
+        String[] scriptArgs = getArgStringArray(args, "args");
+        ResourceFile source = new ResourceFile(scriptFile);
+        ResourceFile sourceDir = source.getParentFile();
+
+        StringWriter buffer = new StringWriter();
+        PrintWriter out = new PrintWriter(buffer);
+        try {
+            // A script only resolves if its parent directory is a registered
+            // bundle/source directory (GhidraScriptUtil.findSourceDirectoryContaining
+            // scans BundleHost.getBundleFiles()). Register it if it is not already.
+            //
+            // Done via reflection on purpose: referencing BundleHost directly would
+            // add an OSGi Import-Package on ghidra.app.plugin.core.osgi, which the
+            // bridge's own script bundle cannot wire, so the whole bridge fails to
+            // load. handleScriptList() uses the same reflection pattern.
+            Object bundleHost = GhidraScriptUtil.class
+                .getMethod("getBundleHost").invoke(null);
+            if (bundleHost == null) return errorResult("Ghidra script bundle host unavailable");
+            Class<?> bhClass = bundleHost.getClass();
+            Object existing = bhClass
+                .getMethod("getExistingGhidraBundle", ResourceFile.class)
+                .invoke(bundleHost, sourceDir);
+            if (existing == null) {
+                bhClass.getMethod("add", ResourceFile.class, boolean.class, boolean.class)
+                    .invoke(bundleHost, sourceDir, true, false);
+            }
+
+            GhidraScriptProvider provider = GhidraScriptUtil.getProvider(source);
+            if (provider == null) {
+                return errorResult("No script provider for " + scriptFile.getName()
+                    + " (unsupported script type)");
+            }
+
+            // getScriptInstance compiles the source via the bundle host.
+            GhidraScript script = provider.getScriptInstance(source, out);
+            script.setScriptArgs(scriptArgs);
+
+            // Run on the program executor's exclusive objects. `monitor` is the
+            // per-job cancellable JobTaskMonitor installed in executeProgramJob,
+            // so cancel/status work for scripts with no extra machinery.
+            //
+            // Use the copy constructor rather than the 6-arg form: it only
+            // references ghidra.app.script, avoiding OSGi Import-Package entries
+            // on ghidra.framework.plugintool / ghidra.program.util that the bridge
+            // bundle may not be able to wire.
+            if (state == null) return errorResult("Bridge script state unavailable");
+            GhidraState scriptState = new GhidraState(state);
+            scriptState.setCurrentProgram(currentProgram);
+            script.execute(scriptState, monitor, out);
+            out.flush();
 
             JsonObject result = new JsonObject();
-            result.addProperty("status", "executed");
-            result.addProperty("script", scriptPath);
+            result.addProperty("script", scriptFile.getName());
+            result.addProperty("path", scriptFile.getAbsolutePath());
+            result.addProperty("stdout", buffer.toString());
+            result.add("args", toJsonArray(scriptArgs));
             return result;
+        } catch (GhidraScriptLoadException e) {
+            return errorResult("Script failed to compile: " + e.getMessage());
+        } catch (CancelledException e) {
+            return errorResult("Script cancelled");
         } catch (Exception e) {
-            return errorResult("Failed to run script: " + e.getMessage());
+            // Preserve any output the script produced before it threw.
+            out.flush();
+            JsonObject err = errorResult("Script threw: " + e.getMessage());
+            err.addProperty("stdout", buffer.toString());
+            return err;
         }
     }
 
