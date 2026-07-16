@@ -66,9 +66,21 @@ Returns the port directly so callers never need a separate `read_port_file()` ca
 
 Stronger verification than `is_bridge_running`: uses `BridgeClient::new(port).ping()` instead of raw TCP connect. Returns `BridgeStatus::Running { port, pid }` or `BridgeStatus::Stopped`.
 
-### `verify_bridge(client)` (in `main.rs`)
+### Pre-flight liveness (no ping gate on the hot path)
 
-Called after connecting to an existing bridge (not after `ensure_bridge_running` which already verified). Sends a ping command through `BridgeClient` and fails if the bridge does not respond. Catches the case where a bridge process exists but is unresponsive.
+Command dispatch used to call a `verify_bridge()` helper that pinged the bridge (5s
+timeout) before running the requested command. That was **removed**: it conflated a
+*busy* bridge with a *dead* one. The bridge is single-threaded, so while it serves one
+request it cannot answer a ping — under concurrent agents the ping timed out and the whole
+command failed with "Bridge not responding to ping", even though the bridge was healthy and
+would have served the request as soon as it was free.
+
+`is_bridge_running()` already proves liveness (port file + PID alive + TCP accept) right
+before dispatch, and the OS accept backlog (50) queues concurrent connections, so a busy
+bridge simply makes the client **wait its turn** on the read rather than fail. See
+`ipc/client.rs`: `connect_with_retry()` waits out transient connect failures (bridge
+(re)start / saturated backlog) with backoff up to `GHIDRA_CLI_CONNECT_DEADLINE` (default
+60s), and the read blocks up to `GHIDRA_CLI_READ_TIMEOUT` (default 300s; `0` = indefinite).
 
 ## BridgeClient Adoption
 

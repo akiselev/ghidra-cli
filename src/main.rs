@@ -504,8 +504,10 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
             // analysis afterwards runs as an unbounded TCP operation.
             let (client, program_name) =
                 if let Some(port) = bridge::is_bridge_running(&project_path) {
+                    // is_bridge_running() already proved the bridge process is alive
+                    // and its socket is accepting; a busy bridge just queues this
+                    // request, so there is no pre-flight ping gate to fail here.
                     let client = BridgeClient::new(port);
-                    verify_bridge(&client)?;
                     if !cli.quiet {
                         eprintln!("Importing into running bridge...");
                     }
@@ -600,9 +602,10 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
         _ => {
             // For all bridge commands (including Analyze), ensure bridge is running
             let client = if let Some(port) = bridge::is_bridge_running(&project_path) {
-                let client = BridgeClient::new(port);
-                verify_bridge(&client)?;
-                client
+                // Liveness already proven by is_bridge_running() (PID alive + socket
+                // accepting). A busy bridge queues the request rather than failing a
+                // pre-flight ping, so connect directly and let it wait its turn.
+                BridgeClient::new(port)
             } else {
                 // Auto-start bridge - use specific program if available, otherwise project mode
                 let mode = if let Some(program) = extract_program_from_command(&cli.command)
@@ -1862,14 +1865,6 @@ fn unwrap_bridge_response(value: serde_json::Value) -> Vec<serde_json::Value> {
 
     // No known array key found - return as single-item vec
     vec![value]
-}
-
-/// Verify that a bridge is actually responding to commands.
-fn verify_bridge(client: &BridgeClient) -> anyhow::Result<()> {
-    if !client.ping()? {
-        anyhow::bail!("Bridge not responding to ping");
-    }
-    Ok(())
 }
 
 /// Whether a Ghidra project already exists on disk for the given project path.
