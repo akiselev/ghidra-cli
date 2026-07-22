@@ -41,11 +41,8 @@ fn echo_args_script_path() -> PathBuf {
 /// unregistered parent — exactly the arbitrary-absolute-path case users hit.
 fn stage_script(fixture: &PathBuf) -> PathBuf {
     let stem = fixture.file_stem().unwrap().to_string_lossy().into_owned();
-    let dir = std::env::temp_dir().join(format!(
-        "ghidra_cli_script_{}_{}",
-        std::process::id(),
-        stem
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("ghidra_cli_script_{}_{}", std::process::id(), stem));
     fs::create_dir_all(&dir).expect("create staging dir");
     let dest = dir.join(fixture.file_name().unwrap());
     fs::copy(fixture, &dest).expect("copy fixture script");
@@ -230,7 +227,8 @@ fn test_script_run_artifact_contract() {
     assert!(fixture.exists(), "fixture missing: {}", fixture.display());
     let script = stage_script(&fixture);
 
-    let out = std::env::temp_dir().join(format!("ghidra_cli_artifact_{}.jsonl", std::process::id()));
+    let out =
+        std::env::temp_dir().join(format!("ghidra_cli_artifact_{}.jsonl", std::process::id()));
     let out_str = out.to_str().unwrap();
     let _ = fs::remove_file(&out);
 
@@ -272,10 +270,10 @@ fn test_script_run_artifact_contract() {
     let _ = fs::remove_file(&out);
 
     // Failure: declare an artifact the script never writes -> job fails closed.
-    let missing = std::env::temp_dir()
-        .join(format!("ghidra_cli_missing_{}.jsonl", std::process::id()));
-    let out2 = std::env::temp_dir()
-        .join(format!("ghidra_cli_artifact2_{}.jsonl", std::process::id()));
+    let missing =
+        std::env::temp_dir().join(format!("ghidra_cli_missing_{}.jsonl", std::process::id()));
+    let out2 =
+        std::env::temp_dir().join(format!("ghidra_cli_artifact2_{}.jsonl", std::process::id()));
     let output2 = assert_cmd::cargo::cargo_bin_cmd!("ghidra")
         .arg("script")
         .arg("run")
