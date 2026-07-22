@@ -59,6 +59,7 @@ import com.google.gson.JsonParser;
 import com.google.gson.JsonPrimitive;
 
 import java.io.*;
+import java.security.MessageDigest;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -1459,7 +1460,11 @@ public class GhidraCliBridge extends GhidraScript {
             decompiler.openProgram(currentProgram);
 
             TaskMonitor mon = monitor;
-            DecompileResults results = decompiler.decompileFunction(func, 30, mon);
+            // Ghidra defines zero as no native decompiler timeout. Large but
+            // valid functions can exceed the historical hard-coded 30 seconds,
+            // so default to unbounded and let callers opt into a ceiling.
+            int timeoutSecs = Math.max(0, getArgInt(args, "timeout_secs", 0));
+            DecompileResults results = decompiler.decompileFunction(func, timeoutSecs, mon);
 
             if (results.decompileCompleted()) {
                 String code = results.getDecompiledFunction().getC();
@@ -1525,7 +1530,23 @@ public class GhidraCliBridge extends GhidraScript {
 
                 return result;
             } else {
-                return errorResult("Decompilation failed");
+                String detail = results.getErrorMessage();
+                if (detail == null || detail.trim().isEmpty()) {
+                    detail = "no diagnostic returned by Ghidra";
+                }
+                String prefix;
+                if (results.isTimedOut()) {
+                    prefix = "Decompilation timed out" +
+                        (timeoutSecs == 0 ? "" : " after " + timeoutSecs + " seconds");
+                } else if (results.isCancelled()) {
+                    prefix = "Decompilation cancelled";
+                } else if (results.failedToStart()) {
+                    prefix = "Decompiler failed to start";
+                } else {
+                    prefix = "Decompilation failed";
+                }
+                return errorResult(prefix + " for " + func.getName() + " at " +
+                    func.getEntryPoint() + ": " + detail.trim());
             }
         } finally {
             decompiler.dispose();
@@ -4385,7 +4406,11 @@ public class GhidraCliBridge extends GhidraScript {
             result.addProperty("path", scriptFile.getAbsolutePath());
             result.addProperty("stdout", buffer.toString());
             result.add("args", toJsonArray(scriptArgs));
-            return result;
+
+            // Artifact contract: validate declared outputs and fail closed on a
+            // missing/empty/under-count artifact, so callers can trust the job
+            // succeeded only when its expected records actually exist.
+            return validateArtifacts(result, args, buffer.toString());
         } catch (GhidraScriptLoadException e) {
             return errorResult("Script failed to compile: " + e.getMessage());
         } catch (CancelledException e) {
@@ -4397,6 +4422,137 @@ public class GhidraCliBridge extends GhidraScript {
             err.addProperty("stdout", buffer.toString());
             return err;
         }
+    }
+
+    /**
+     * Validate the caller's declared output artifacts (the "expect" array) and
+     * attach a manifest for each. A missing artifact, an empty one (unless
+     * allow_empty), or one below its min_rows fails the whole job.
+     */
+    private JsonObject validateArtifacts(JsonObject result, JsonObject args, String stdout) {
+        if (args == null || !args.has("expect") || !args.get("expect").isJsonArray()) {
+            return result;
+        }
+        JsonArray expect = args.getAsJsonArray("expect");
+        if (expect.size() == 0) return result;
+
+        boolean allowEmpty = getArgBool(args, "allow_empty", false);
+        JsonArray artifacts = new JsonArray();
+        List<String> failures = new ArrayList<>();
+
+        for (JsonElement el : expect) {
+            if (!el.isJsonObject()) continue;
+            JsonObject spec = el.getAsJsonObject();
+            String path = getArgString(spec, "path");
+            if (path == null) {
+                failures.add("expected artifact with no path");
+                continue;
+            }
+            String schema = getArgString(spec, "schema");
+            JsonObject manifest = buildArtifactManifest(path, schema);
+            artifacts.add(manifest);
+
+            if (!manifest.get("exists").getAsBoolean()) {
+                failures.add("missing: " + manifest.get("path").getAsString());
+                continue;
+            }
+            if (manifest.get("bytes").getAsLong() == 0 && !allowEmpty) {
+                failures.add("empty: " + manifest.get("path").getAsString());
+            }
+            if (spec.has("min_rows") && !spec.get("min_rows").isJsonNull()) {
+                long minRows = spec.get("min_rows").getAsLong();
+                if (!manifest.has("rows")) {
+                    failures.add("min_rows set but " + manifest.get("path").getAsString()
+                        + " is not a row-countable (.jsonl/.ndjson) artifact");
+                } else if (manifest.get("rows").getAsLong() < minRows) {
+                    failures.add(manifest.get("path").getAsString() + " has "
+                        + manifest.get("rows").getAsLong() + " rows, expected >= " + minRows);
+                }
+            }
+        }
+
+        result.add("artifacts", artifacts);
+        if (failures.isEmpty()) {
+            return result;
+        }
+        JsonObject err = errorResult("Artifact validation failed: " + String.join("; ", failures));
+        err.add("artifacts", artifacts);
+        err.addProperty("stdout", stdout);
+        return err;
+    }
+
+    /** Manifest for one output file: existence, size, row count, checksum, provenance. */
+    private JsonObject buildArtifactManifest(String rawPath, String schema) {
+        JsonObject m = new JsonObject();
+        File f = new File(rawPath).getAbsoluteFile();
+        m.addProperty("path", f.getAbsolutePath());
+        if (schema != null) m.addProperty("schema", schema);
+        if (!f.exists() || !f.isFile()) {
+            m.addProperty("exists", false);
+            return m;
+        }
+        m.addProperty("exists", true);
+        m.addProperty("bytes", f.length());
+        String lower = rawPath.toLowerCase();
+        try {
+            if (lower.endsWith(".jsonl") || lower.endsWith(".ndjson")) {
+                m.addProperty("rows", countLines(f));
+            }
+            m.addProperty("sha256", sha256File(f));
+        } catch (IOException e) {
+            m.addProperty("manifest_error", e.getMessage());
+        }
+        if (currentProgram != null) {
+            m.addProperty("program", currentProgram.getName());
+            String binSha = currentProgram.getExecutableSHA256();
+            if (binSha != null && !binSha.isEmpty()) m.addProperty("binary_sha256", binSha);
+            m.addProperty("executable_format", currentProgram.getExecutableFormat());
+        }
+        String gv = ghidraVersion();
+        if (!gv.isEmpty()) m.addProperty("ghidra_version", gv);
+        return m;
+    }
+
+    /** Stream the file counting newlines; handles multi-GB JSONL exports. */
+    private long countLines(File f) throws IOException {
+        long count = 0;
+        try (BufferedReader r = new BufferedReader(new FileReader(f))) {
+            while (r.readLine() != null) count++;
+        }
+        return count;
+    }
+
+    /** Streaming SHA-256 so large artifacts are not fully buffered. */
+    private String sha256File(File f) throws IOException {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] buf = new byte[65536];
+            try (InputStream in = new BufferedInputStream(new FileInputStream(f))) {
+                int n;
+                while ((n = in.read(buf)) != -1) md.update(buf, 0, n);
+            }
+            byte[] digest = md.digest();
+            StringBuilder sb = new StringBuilder(digest.length * 2);
+            for (byte b : digest) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IOException("SHA-256 unavailable", e);
+        }
+    }
+
+    private volatile String cachedGhidraVersion;
+
+    /** Ghidra application version via reflection (avoids an OSGi import on ghidra.framework). */
+    private String ghidraVersion() {
+        if (cachedGhidraVersion != null) return cachedGhidraVersion;
+        try {
+            Object v = Class.forName("ghidra.framework.Application")
+                .getMethod("getApplicationVersion").invoke(null);
+            cachedGhidraVersion = v == null ? "" : v.toString();
+        } catch (Throwable t) {
+            cachedGhidraVersion = "";
+        }
+        return cachedGhidraVersion;
     }
 
     private JsonObject handleScriptJava(JsonObject args) {

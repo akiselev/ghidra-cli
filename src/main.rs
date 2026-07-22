@@ -763,6 +763,29 @@ fn describe_query_error(err: GhidraError) -> anyhow::Error {
     }
 }
 
+/// Parse a `--expect` spec (`PATH` or `PATH:MIN_ROWS`) into the wire form
+/// `{path, min_rows?}`. The path is made absolute against the *client's* CWD so
+/// the bridge validates the same file the script wrote, regardless of the CWD
+/// the bridge JVM inherited. A trailing `:<digits>` is treated as MIN_ROWS;
+/// anything else (e.g. a Windows drive letter) stays part of the path.
+fn parse_expect_spec(spec: &str) -> serde_json::Value {
+    let (path_part, min_rows) = match spec.rsplit_once(':') {
+        Some((p, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+            (p, n.parse::<u64>().ok())
+        }
+        _ => (spec, None),
+    };
+    let abs = std::path::absolute(path_part)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path_part.to_string());
+    let mut obj = serde_json::Map::new();
+    obj.insert("path".to_string(), serde_json::Value::String(abs));
+    if let Some(n) = min_rows {
+        obj.insert("min_rows".to_string(), serde_json::json!(n));
+    }
+    serde_json::Value::Object(obj)
+}
+
 /// The bridge's list handlers only support a literal substring match on the
 /// primary name field, not the full filter DSL implemented client-side in
 /// `query::Filter`. When a full filter expression, sort, or count is requested,
@@ -1188,7 +1211,9 @@ fn execute_via_bridge(
                     let path = std::fs::canonicalize(&args.script_path)
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_else(|_| args.script_path.clone());
-                    client.script_run(&path, &args.args)
+                    let expect: Vec<serde_json::Value> =
+                        args.expect.iter().map(|s| parse_expect_spec(s)).collect();
+                    client.script_run(&path, &args.args, &expect, args.allow_empty)
                 }
                 ScriptCommands::Python(args) => client.script_python(&args.code),
                 ScriptCommands::Java(args) => client.script_java(&args.code),

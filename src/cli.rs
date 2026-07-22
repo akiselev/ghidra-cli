@@ -1084,6 +1084,13 @@ pub struct ScriptRunArgs {
     pub program: Option<String>,
     #[arg(long)]
     pub project: Option<String>,
+    /// Expected output artifact: PATH or PATH:MIN_ROWS (repeatable). The job
+    /// fails if the artifact is missing, empty, or below MIN_ROWS.
+    #[arg(long = "expect", value_name = "PATH[:MIN_ROWS]")]
+    pub expect: Vec<String>,
+    /// Allow an expected artifact to exist but be empty.
+    #[arg(long)]
+    pub allow_empty: bool,
     /// Script arguments (after --)
     #[arg(last = true)]
     pub args: Vec<String>,

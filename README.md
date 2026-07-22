@@ -108,6 +108,12 @@ ghidra function set-calling-convention <func> --convention __cdecl
 ghidra function set-var-type <func> --var local_10 --type "MyStruct *"
 ```
 
+Decompilation has no native time limit by default, so large valid functions are
+not aborted after 30 seconds. Set `GHIDRA_CLI_DECOMPILE_TIMEOUT` to a positive
+number of seconds to impose a Ghidra-side limit; `0` means unbounded. The socket
+wait follows the long-operation policy controlled by `GHIDRA_CLI_OP_TIMEOUT`,
+which is also unbounded by default.
+
 ### Symbols & Types
 ```bash
 ghidra symbol list                     # List symbols

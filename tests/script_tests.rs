@@ -30,6 +30,37 @@ fn echo_args_script_path() -> PathBuf {
     path
 }
 
+/// Copy a fixture script into a unique, fresh temp directory and return the copy.
+///
+/// Ghidra resolves a script to the FIRST registered source directory that is an
+/// ancestor of it (GhidraScriptUtil.findSourceDirectoryContaining), and bundle
+/// registrations persist in the OSGi cache across bridge sessions. Running a
+/// fixture straight out of tests/fixtures/** can therefore be shadowed by a
+/// previously-registered ancestor (e.g. tests/fixtures itself), which corrupts
+/// the derived class name. Staging into a unique temp dir gives each run an
+/// unregistered parent — exactly the arbitrary-absolute-path case users hit.
+fn stage_script(fixture: &PathBuf) -> PathBuf {
+    let stem = fixture.file_stem().unwrap().to_string_lossy().into_owned();
+    let dir = std::env::temp_dir().join(format!(
+        "ghidra_cli_script_{}_{}",
+        std::process::id(),
+        stem
+    ));
+    fs::create_dir_all(&dir).expect("create staging dir");
+    let dest = dir.join(fixture.file_name().unwrap());
+    fs::copy(fixture, &dest).expect("copy fixture script");
+    dest
+}
+
+fn write_artifact_script_path() -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("tests");
+    path.push("fixtures");
+    path.push("scripts");
+    path.push("WriteArtifact.java");
+    path
+}
+
 fn get_test_script_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("tests");
@@ -124,12 +155,9 @@ fn test_script_run_java_args() {
     require_ghidra!();
     let _harness = harness();
 
-    let script_path = echo_args_script_path();
-    assert!(
-        script_path.exists(),
-        "fixture missing: {}",
-        script_path.display()
-    );
+    let fixture = echo_args_script_path();
+    assert!(fixture.exists(), "fixture missing: {}", fixture.display());
+    let script_path = stage_script(&fixture);
 
     let output = assert_cmd::cargo::cargo_bin_cmd!("ghidra")
         .arg("script")
@@ -186,6 +214,100 @@ fn test_script_python_inline() {
         "Expected success or Python-not-available error, got: {}",
         stderr
     );
+}
+
+/// Phase 4.2: a declared JSONL artifact is validated and a manifest (row count,
+/// checksum, binary provenance) is attached; a missing declared artifact fails
+/// the job closed. Absolute paths are used for both the script's output arg and
+/// `--expect` so the bridge validates exactly the file the script wrote.
+#[test]
+#[serial]
+fn test_script_run_artifact_contract() {
+    require_ghidra!();
+    let _harness = harness();
+
+    let fixture = write_artifact_script_path();
+    assert!(fixture.exists(), "fixture missing: {}", fixture.display());
+    let script = stage_script(&fixture);
+
+    let out = std::env::temp_dir().join(format!("ghidra_cli_artifact_{}.jsonl", std::process::id()));
+    let out_str = out.to_str().unwrap();
+    let _ = fs::remove_file(&out);
+
+    // Success: script writes 5 rows, we require >= 3.
+    let output = assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        .arg("script")
+        .arg("run")
+        .arg(script.to_str().unwrap())
+        .arg("--project")
+        .arg(TEST_PROJECT)
+        .arg("--program")
+        .arg(TEST_PROGRAM)
+        .arg("--expect")
+        .arg(format!("{}:3", out_str))
+        .arg("--")
+        .arg(out_str)
+        .arg("5")
+        .output()
+        .expect("Failed to run command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected success.\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("artifacts") && stdout.contains("\"rows\""),
+        "expected artifact manifest with row count, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("wrote 5 records"),
+        "expected captured script stdout, got: {}",
+        stdout
+    );
+    let _ = fs::remove_file(&out);
+
+    // Failure: declare an artifact the script never writes -> job fails closed.
+    let missing = std::env::temp_dir()
+        .join(format!("ghidra_cli_missing_{}.jsonl", std::process::id()));
+    let out2 = std::env::temp_dir()
+        .join(format!("ghidra_cli_artifact2_{}.jsonl", std::process::id()));
+    let output2 = assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        .arg("script")
+        .arg("run")
+        .arg(script.to_str().unwrap())
+        .arg("--project")
+        .arg(TEST_PROJECT)
+        .arg("--program")
+        .arg(TEST_PROGRAM)
+        .arg("--expect")
+        .arg(missing.to_str().unwrap())
+        .arg("--")
+        .arg(out2.to_str().unwrap())
+        .arg("5")
+        .output()
+        .expect("Failed to run command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output2.stdout),
+        String::from_utf8_lossy(&output2.stderr)
+    );
+    assert!(
+        !output2.status.success(),
+        "expected failure for a missing declared artifact, got success: {}",
+        combined
+    );
+    assert!(
+        combined.contains("validation failed") || combined.contains("missing"),
+        "expected artifact-validation error, got: {}",
+        combined
+    );
+    let _ = fs::remove_file(&out2);
 }
 
 #[test]

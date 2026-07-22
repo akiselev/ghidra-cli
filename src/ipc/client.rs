@@ -62,6 +62,16 @@ fn long_op_timeout() -> Option<Duration> {
     }
 }
 
+/// Native decompiler execution budget sent to Ghidra. Ghidra defines zero as
+/// unbounded; that is the default because large, valid functions routinely take
+/// longer than its historical 30-second background-analysis default.
+fn decompile_timeout_secs() -> u32 {
+    std::env::var("GHIDRA_CLI_DECOMPILE_TIMEOUT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
 /// Overall connect budget, from `GHIDRA_CLI_CONNECT_DEADLINE` (min 1s).
 fn connect_deadline() -> Duration {
     let secs = std::env::var("GHIDRA_CLI_CONNECT_DEADLINE")
@@ -283,13 +293,15 @@ impl BridgeClient {
         with_vars: bool,
         with_params: bool,
     ) -> Result<serde_json::Value> {
-        self.send_command(
+        self.send_command_with_timeout(
             "decompile",
             Some(json!({
                 "address": address,
                 "with_vars": with_vars,
                 "with_params": with_params,
+                "timeout_secs": decompile_timeout_secs(),
             })),
+            long_op_timeout(),
         )
     }
 
@@ -545,11 +557,19 @@ impl BridgeClient {
         self.send_command("stats", None)
     }
 
-    pub fn script_run(&self, script_path: &str, args: &[String]) -> Result<serde_json::Value> {
-        self.send_command(
-            "script_run",
-            Some(json!({"path": script_path, "args": args})),
-        )
+    pub fn script_run(
+        &self,
+        script_path: &str,
+        args: &[String],
+        expect: &[serde_json::Value],
+        allow_empty: bool,
+    ) -> Result<serde_json::Value> {
+        let mut payload = json!({"path": script_path, "args": args});
+        if !expect.is_empty() {
+            payload["expect"] = serde_json::Value::Array(expect.to_vec());
+            payload["allow_empty"] = json!(allow_empty);
+        }
+        self.send_command("script_run", Some(payload))
     }
 
     pub fn script_python(&self, code: &str) -> Result<serde_json::Value> {
@@ -582,7 +602,7 @@ impl BridgeClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_transient_connect_error, parse_secs};
+    use super::{decompile_timeout_secs, is_transient_connect_error, parse_secs};
     use std::io::{Error, ErrorKind};
     use std::time::Duration;
 
@@ -603,6 +623,15 @@ mod tests {
         assert_eq!(parse_secs(Some("nope"), 42), Some(Duration::from_secs(42)));
         // Fallback default of 0 still means "no timeout".
         assert_eq!(parse_secs(None, 0), None);
+    }
+
+    #[test]
+    fn decompile_timeout_defaults_to_unbounded() {
+        // Avoid changing the process environment because this suite runs tests
+        // concurrently. The assertion applies to the normal unset case.
+        if std::env::var_os("GHIDRA_CLI_DECOMPILE_TIMEOUT").is_none() {
+            assert_eq!(decompile_timeout_secs(), 0);
+        }
     }
 
     #[test]
