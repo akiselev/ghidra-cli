@@ -1196,7 +1196,7 @@ fn execute_via_bridge(
             use cli::PatchCommands;
             match cmd {
                 PatchCommands::Bytes(args) => client.patch_bytes(&args.address, &args.hex),
-                PatchCommands::Nop(args) => client.patch_nop(&args.address),
+                PatchCommands::Nop(args) => client.patch_nop(&args.address, args.count),
                 PatchCommands::Export(args) => client.patch_export(&args.output),
             }
         }

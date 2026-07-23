@@ -58,7 +58,8 @@ ghidra summary --program=<binary>
 # Query any data type
 ghidra query <data-type> --program=<binary> [options]
 
-# Data types: functions, strings, imports, exports, memory, symbols, xrefs
+# Data types: functions, strings, imports, exports, memory
+# (symbols and xrefs have their own commands: `ghidra symbol list`, `ghidra x-ref ...`)
 
 # Essential options:
   --filter="<expression>"    # Filter results

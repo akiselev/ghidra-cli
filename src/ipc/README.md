@@ -45,7 +45,7 @@ BridgeClient wraps all bridge commands as typed methods:
 
 | Category | Methods |
 |----------|---------|
-| Core | `ping()`, `shutdown()`, `status()` |
+| Core | `ping()`, `shutdown()`, `status()`, `bridge_info()`, `job_status()`, `cancel_job()` |
 | Program | `program_info()`, `list_programs()`, `open_program()`, `program_close()`, `program_delete()`, `program_export()` |
 | Import/Analysis | `import_binary()`, `analyze()` |
 | Functions | `list_functions()`, `decompile()` |

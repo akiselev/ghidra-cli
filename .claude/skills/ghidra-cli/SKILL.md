@@ -36,10 +36,17 @@ CLI (Rust/clap) ──TCP──► GhidraCliBridge.java (GhidraScript in Ghidra 
 |------|--------|
 | `--json` | Compact JSON output (single line) |
 | `--pretty` | Pretty-printed JSON |
+| `--project P` / `--program PROG` | Target project/program; global, so they may precede the subcommand |
+| `--projects-dir DIR` | Where Ghidra projects are stored (overrides `ghidra_project_dir`) |
+| `--java-home PATH` | Full JDK for Ghidra (overrides auto-detection) |
 | `-v` / `-vv` / `-vvv` | Log verbosity: warn / info / debug |
 | `-q` / `--quiet` | Suppress non-essential stderr |
 
+All flags are global, so `ghidra --project P --program bin function list` works the same as putting them after the subcommand.
+
 **Format auto-detection**: TTY → compact human-readable; pipe → json-compact. Override with `--json`, `--pretty`, or `-o FORMAT`.
+
+Ghidra 12.1+ rejects project dirs with a dot-prefixed component (e.g. `~/.cache`); on Linux the default falls back to `~/ghidra-cli-projects`. Use `--projects-dir` to override.
 
 ## Quick Start
 
@@ -62,7 +69,11 @@ ghidra stop [--project P]
 ghidra restart [--project P] [--program PROG]
 ghidra status [--project P]
 ghidra ping [--project P]
+ghidra jobs [JOB_ID] [--project P]      # bridge queue + recent jobs, or one job by ID
+ghidra cancel [JOB_ID] [--project P]    # cooperatively cancel active (or given) job
 ```
+
+`ping`, `status`, `jobs`, and `cancel` answer on a control plane that stays responsive while a long `analyze`/`import`/decompile occupies the serialized program lane. Queued program operations get job IDs and wait in a bounded FIFO.
 
 ### Project Management
 
@@ -92,7 +103,7 @@ ghidra program open --program PROG [--project P]   # --program required by runti
 ghidra program close [--project P]
 ghidra program delete --program PROG [--project P]
 ghidra program info [--project P]
-ghidra program export FORMAT [--project P] [-o OUTPUT]   # FORMAT: xml, json, asm, c
+ghidra program export FORMAT [--project P] [-o OUTPUT]   # FORMAT: json, xml, c/cpp, binary/bin, gzf, ascii/asm, hex, html
 ```
 
 ### Function Operations
@@ -155,10 +166,10 @@ ghidra memory search PATTERN [QUERY_OPTS]
 ```bash
 ghidra x-ref to ADDRESS [QUERY_OPTS]        # aliases: xref, xrefs, crossref
 ghidra x-ref from ADDRESS [QUERY_OPTS]
-ghidra x-ref list [TARGET] [QUERY_OPTS]
+ghidra x-ref list TARGET [QUERY_OPTS]   # refs both to and from the target
 ```
 
-Note: `x-ref list` currently accepts an optional target in clap, but runtime ignores it and lists all xrefs.
+`x-ref list` takes a target (name, `0xADDR`, or `FUN_<hex>`) and returns references in both directions. If the target is a function, the "from" side scans the whole function body, not just its entry.
 
 ### Type Operations
 
@@ -184,7 +195,7 @@ ghidra comment set ADDRESS TEXT [--comment-type TYPE] [--project P] [--program P
 ghidra comment delete ADDRESS [QUERY_OPTS]
 ```
 
-Note: current bridge expects `comment_type`, but client sends `type`; in practice comment type falls back to `EOL`.
+`--comment-type` takes `EOL` (default), `PRE`, `POST`, or `PLATE`.
 
 ### Search / Find
 
@@ -230,16 +241,18 @@ ghidra patch nop ADDRESS [--count N] [--project P] [--program PROG]
 ghidra patch export -o OUTPUT [--project P] [--program PROG]
 ```
 
-Note: `--count` is parsed but currently not forwarded to the bridge. Runtime NOP behavior is single-address based.
+`--count N` NOPs N consecutive instructions from ADDRESS (default 1), walking instruction by instruction. If any address in the run has no instruction, the whole patch rolls back.
 
 ### Script Execution
 
 ```bash
-ghidra script run PATH [--project P] [--program PROG] [-- ARGS...]
+ghidra script run PATH [--expect PATH[:MIN_ROWS]]... [--allow-empty] [--project P] [--program PROG] [-- ARGS...]
 ghidra script python CODE [--project P] [--program PROG]
 ghidra script java CODE [--project P] [--program PROG]
 ghidra script list
 ```
+
+`script run` resolves PATH to an absolute location, forwards the args after `--` to the script as real positional arguments, and captures stdout in the response (`{script, path, stdout, args}`). `--expect PATH[:MIN_ROWS]` (repeatable) fails the job if that artifact is missing, empty, or below MIN_ROWS; `--allow-empty` lets an expected artifact exist while empty. Scripts run on the cancellable job lane, so `ghidra cancel` works on them.
 
 ### Batch
 
@@ -378,10 +391,13 @@ ghidra set-default program mybinary
 
 ## .NET Warning
 
-ghidra decompile emits a warning for .NET IL bytecode:
-> "This appears to be .NET managed code. Consider using ilspy-cli."
+`ghidra decompile` prints a warning when the output looks like .NET managed code
+(e.g. `halt_baddata()` or a `.NET CLR Managed Code` marker):
 
-Use `ilspy detect` to classify binaries before decompiling.
+> "This appears to be .NET managed code. Ghidra cannot decompile .NET IL bytecode. Consider using a .NET decompiler (e.g., ilspy-cli) for better results."
+
+Ghidra won't produce useful output for IL. Reach for a dedicated .NET
+decompiler instead. `ilspy-cli` is a separate tool, not part of ghidra-cli.
 
 ## Analysis Workflow
 
@@ -428,9 +444,16 @@ ghidra patch export -o patched.exe --project analysis
 |----------|---------|
 | `GHIDRA_INSTALL_DIR` | Ghidra installation path |
 | `GHIDRA_PROJECT_DIR` | Base directory for projects |
+| `GHIDRA_CLI_JAVA_HOME` | Full JDK for Ghidra (overrides auto-detection) |
 | `GHIDRA_DEFAULT_PROJECT` | Default `--project` for `ghidra query` |
 | `GHIDRA_DEFAULT_PROGRAM` | Default `--program` for `ghidra query` and program auto-selection |
 | `GHIDRA_CLI_CONFIG` | Override config path |
+| `GHIDRA_CLI_LAUNCH_TIMEOUT` | Cap on bridge launch readiness (default 180s) |
+| `GHIDRA_CLI_OP_TIMEOUT` | Cap on long `analyze`/`import` ops (default unbounded) |
+| `GHIDRA_CLI_DECOMPILE_TIMEOUT` | Ghidra-side decompiler limit, seconds; `0` = unbounded (default unbounded) |
+| `GHIDRA_CLI_READ_TIMEOUT` | Per-request socket read timeout; `0` = indefinite (default 300s) |
+| `GHIDRA_CLI_CONNECT_DEADLINE` | Retry window for connecting to a (re)starting bridge (default 60s) |
+| `GHIDRA_CLI_SHUTDOWN_TIMEOUT` | Grace period to drain jobs before force-kill; `0` = indefinite (default 300s) |
 
 ## File Locations
 

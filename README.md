@@ -1,13 +1,13 @@
 # Ghidra CLI
 
-A high-performance Rust CLI for automating Ghidra reverse engineering tasks, designed for both direct usage and AI agent integration (like Claude Code).
+A Rust CLI for automating Ghidra reverse engineering tasks. Usable directly by hand or driven by an AI coding agent like Claude Code.
 
 ## Features
 
 - **Direct bridge architecture** - CLI connects directly to a Java bridge running inside Ghidra's JVM
 - **Auto-start bridge** - Import/analyze commands automatically start the bridge
 - **Fast queries** - Sub-second response times with Ghidra kept in memory
-- **Comprehensive analysis** - Functions, symbols, types, strings, cross-references
+- **Program analysis** - Functions, symbols, types, strings, cross-references
 - **Type system** - Create/edit structs, enums, typedefs; add/remove struct fields
 - **Function signatures** - Edit return types, calling conventions, full C signatures; retype variables
 - **Binary patching** - Modify bytes, NOP instructions, export patches
@@ -15,8 +15,9 @@ A high-performance Rust CLI for automating Ghidra reverse engineering tasks, des
 - **Search capabilities** - Find strings, bytes, functions, crypto patterns
 - **Script execution** - Run Java/Python Ghidra scripts, inline or from files
 - **Batch operations** - Execute multiple commands from a file
+- **Responsive job control** - Long analyses run on a serialized program lane while `ping`, `status`, `jobs`, and `cancel` stay live on a separate control plane
 - **Flexible output** - Human-readable, JSON, or pretty JSON formats
-- **Filtering** - Powerful expression-based filtering (e.g., `size > 100`)
+- **Filtering** - Expression-based filtering with a small DSL (e.g., `size > 100 AND name ~ 'crypt'`)
 
 ## Architecture
 
@@ -28,12 +29,9 @@ A high-performance Rust CLI for automating Ghidra reverse engineering tasks, des
 └─────────────────┘         └──────────────────────────────────────┘
 ```
 
-The CLI connects directly to a Java bridge running inside Ghidra's JVM. This provides:
-- **Consistent state** - Single Ghidra process for all operations
-- **Fast queries** - No JVM startup overhead per command
-- **Auto-start** - Bridge starts automatically when needed
-- **Per-project isolation** - Each project gets its own bridge process and port file, enabling concurrent analysis of multiple binaries
-- **Minimal dependencies** - Only Ghidra + Java required (no Python/PyGhidra)
+The CLI connects directly to a Java bridge running inside Ghidra's JVM. Ghidra loads once and stays resident, so one process holds all state: a rename or an applied type sticks for the next command instead of resetting each invocation, and queries return in-process with no per-command JVM startup. The bridge auto-starts on demand — any command brings it up, so you never launch it by hand.
+
+Each project gets its own bridge process and port file, so you can analyze several binaries at once. The only runtime dependencies are Ghidra and a JDK — no Python/PyGhidra.
 
 ## Installation
 
@@ -47,16 +45,20 @@ cargo install --path .
 
 ### Requirements
 
-- **Ghidra 10.0+** - Download from [ghidra-sre.org](https://ghidra-sre.org)
-- **Java 17+** - Required by Ghidra
+- **Ghidra 11+** - Download from [ghidra-sre.org](https://ghidra-sre.org), or run `ghidra setup` to fetch it
+- **A full JDK** - not a JRE. Ghidra compiles the bridge script at runtime, so it needs `javac` and the `jdk.compiler` module. Ghidra 12.x wants JDK 21; older releases accept JDK 17. `ghidra doctor` finds a suitable JDK and compiles the bridge as a health check.
 - **Rust 1.70+** - For building from source
 
-Set the Ghidra installation path:
+Point the CLI at your Ghidra install (skip this if you used `ghidra setup`):
 ```bash
 export GHIDRA_INSTALL_DIR=/path/to/ghidra
-# Or configure via CLI:
+# Or store it in config:
 ghidra config set ghidra_install_dir /path/to/ghidra
 ```
+
+`ghidra-cli` picks the JDK itself and passes it to Ghidra, so you don't have to
+juggle `PATH`. Override the choice with the global `--java-home` flag, the
+`java_home` config key, or `GHIDRA_CLI_JAVA_HOME`.
 
 ## Quick Start
 
@@ -64,11 +66,10 @@ ghidra config set ghidra_install_dir /path/to/ghidra
 # Check installation
 ghidra doctor
 
-# Import and analyze a binary (bridge auto-starts)
+# Import a binary. This starts the bridge and runs auto-analysis in one step.
 ghidra import ./binary --project myproject --program mybinary
-ghidra analyze --project myproject --program mybinary
 
-# Query functions (uses running bridge)
+# Query functions (uses the running bridge)
 ghidra function list
 
 # Decompile a function
@@ -84,15 +85,41 @@ ghidra x-ref to 0x401000
 ghidra graph callers main --depth 3
 ```
 
+## Global Flags
+
+These work before any subcommand, so you can set them once for a whole invocation:
+
+```bash
+ghidra --project P --program bin function list   # --project/--program are global
+```
+
+| Flag | Effect |
+|------|--------|
+| `--project <P>` | Project name or path |
+| `--program <PROG>` | Program within the project |
+| `--projects-dir <DIR>` | Where Ghidra projects live (default: a cache dir; overrides `ghidra_project_dir`) |
+| `--java-home <PATH>` | Full JDK for Ghidra to use (must be a JDK, not a JRE) |
+| `--json` | Compact JSON output |
+| `--pretty` | Pretty-printed JSON |
+| `-v` / `-vv` / `-vvv` | Log verbosity: warn / info / debug |
+| `-q` / `--quiet` | Suppress non-essential output |
+
+Ghidra 12.1+ rejects project directories that contain a dot-prefixed component
+(such as `~/.cache`), so on Linux the default falls back to
+`~/ghidra-cli-projects`. Use `--projects-dir` to put projects wherever you like.
+
 ## Commands
 
 ### Project & Program Management
 ```bash
 ghidra project create <name>           # Create project
 ghidra project list                    # List projects
-ghidra project delete <name>           # Delete project
-ghidra import <binary> --project <p>   # Import binary (auto-starts bridge)
-ghidra analyze --project <p>           # Run analysis
+ghidra project info [<name>]           # Show project info
+ghidra project delete <name>           # Delete project (removes .gpr/.rep, stops its bridge)
+ghidra import <binary> --project <p>   # Import + auto-analyze (bridge auto-starts)
+ghidra import <binary> --no-analyze    # Import only, skip analysis (still persisted)
+ghidra import <binary> --detach        # Return immediately; bridge keeps importing
+ghidra analyze --project <p>           # (Re)run analysis on an imported program
 ```
 
 ### Function Analysis
@@ -160,7 +187,9 @@ ghidra patch nop <addr> --count 5      # NOP out instructions
 ghidra patch export -o patched.bin     # Export patched binary
 ```
 
-Note: `patch nop --count` is currently parsed by the CLI, but runtime uses single-address NOP behavior.
+`patch nop --count N` NOPs N consecutive instructions starting at the address
+(default 1), walking instruction by instruction so variable-length ISAs work. If
+any address in the run has no instruction, the whole patch rolls back untouched.
 
 ### Comments
 ```bash
@@ -169,14 +198,23 @@ ghidra comment set <addr> "note" --comment-type EOL  # Set comment
 ghidra comment list                    # List all comments
 ```
 
-Note: `--comment-type` currently falls back to `EOL` due client/bridge argument key mismatch.
+`--comment-type` accepts `EOL` (default), `PRE`, `POST`, or `PLATE`.
 
 ### Scripts
 ```bash
 ghidra script list                     # List available scripts
-ghidra script run myscript.py          # Run script file
-ghidra script python "print(currentProgram)"  # Inline Python
+ghidra script run myscript.py          # Run a script file
+ghidra script run report.py -- arg1 arg2   # Pass positional args after --
+ghidra script run dump.py --expect out.csv:10   # Fail unless out.csv has >=10 rows
+ghidra script python "print(currentProgram)"   # Inline Python
+ghidra script java "println(currentProgram);"   # Inline Java
 ```
+
+`script run` resolves the path to an absolute location, forwards the args after
+`--` to the script, and captures its stdout in the response. Use `--expect
+PATH[:MIN_ROWS]` (repeatable) to make the job fail when an output artifact is
+missing, empty, or short, and `--allow-empty` to permit an expected-but-empty
+file.
 
 ### Batch Operations
 ```bash
@@ -265,7 +303,7 @@ ghidra function list --fields "name,address,size"
 
 ### Output Format Design
 
-Format detection occurs at the CLI boundary. The bridge always returns compact JSON for IPC efficiency. The CLI applies format transformation (human-readable, pretty JSON) at the output boundary based on TTY detection or explicit flags. This design maintains a stable IPC protocol with a single format decision point.
+The bridge always emits compact JSON over the socket. The CLI decides the human-facing format at its own output boundary — human-readable when attached to a TTY, compact JSON when piped, or forced with `--json`/`--pretty`/`-o`. Doing it CLI-side keeps the wire protocol one stable shape with a single place that decides formatting.
 
 ## Filtering
 
@@ -277,12 +315,35 @@ ghidra function list --filter "name ~ 'main'"
 ghidra strings list --filter "length > 20"
 ```
 
+## Environment Variables
+
+Paths and defaults:
+
+| Variable | Purpose |
+|----------|---------|
+| `GHIDRA_INSTALL_DIR` | Ghidra installation path |
+| `GHIDRA_PROJECT_DIR` | Base directory for projects |
+| `GHIDRA_CLI_JAVA_HOME` | Full JDK for Ghidra (overrides auto-detection) |
+| `GHIDRA_CLI_CONFIG` | Override the config file path |
+| `GHIDRA_DEFAULT_PROJECT` | Default `--project` for `ghidra query` |
+| `GHIDRA_DEFAULT_PROGRAM` | Default `--program` for `ghidra query` and auto-selection |
+
+Timeouts. Most default to unbounded so that a legitimately long analysis or
+decompile isn't cut off. Set them when you'd rather fail fast:
+
+| Variable | Purpose (default) |
+|----------|-------------------|
+| `GHIDRA_CLI_LAUNCH_TIMEOUT` | Cap on bridge launch readiness (180s) |
+| `GHIDRA_CLI_OP_TIMEOUT` | Cap on long `analyze`/`import` ops (unbounded) |
+| `GHIDRA_CLI_DECOMPILE_TIMEOUT` | Ghidra-side decompiler limit in seconds; `0` = unbounded (unbounded) |
+| `GHIDRA_CLI_READ_TIMEOUT` | Per-request socket read timeout; `0` = indefinite (300s) |
+| `GHIDRA_CLI_CONNECT_DEADLINE` | How long to retry connecting to a (re)starting bridge (60s) |
+| `GHIDRA_CLI_SHUTDOWN_TIMEOUT` | Grace period to drain jobs before force-kill; `0` = indefinite (300s) |
+
 ## AI Agent Integration
 
-Ghidra CLI is designed to work seamlessly with AI coding assistants like Claude Code. The structured output and comprehensive command set make it ideal for automated reverse engineering workflows.
-
-Example workflow with an AI agent:
-1. `ghidra import suspicious.exe --project analysis` + `ghidra analyze --project analysis` - Import, analyze, start bridge
+Output is structured JSON and the command set is broad, so an agent can script a full reverse-engineering pass end to end. A representative workflow:
+1. `ghidra import suspicious.exe --project analysis` - Import, auto-analyze, and start the bridge in one step
 2. `ghidra find interesting` - AI analyzes suspicious patterns
 3. `ghidra decompile <func>` - AI examines specific functions
 4. `ghidra x-ref to <addr>` - AI traces data flow

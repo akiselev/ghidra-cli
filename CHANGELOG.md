@@ -7,14 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Responsive control plane with a real job queue.** Socket handling is now split
+  from Ghidra program execution. `ping`, `status`, `bridge_info`, `jobs`, and
+  `cancel` answer immediately from thread-safe snapshots while a long
+  `analyze`/`import`/decompile holds the single Ghidra-owned program lane. Program
+  operations get job IDs and wait in a bounded FIFO (256 deep) instead of an
+  invisible socket backlog.
+- `ghidra jobs [JOB_ID]` — inspect the active job, the queue, and recent history
+  (the bridge keeps the last 100 jobs), or one job by ID.
+- `ghidra cancel [JOB_ID]` — cooperatively cancel the active job (or a specific
+  one). A job that hasn't started is dropped from the queue immediately; a running
+  job is cancelled via a per-job `TaskMonitor`.
+
+### Changed
+
+- `ghidra script run` runs a checked-in script by absolute path with real
+  positional arguments (everything after `--`) and captured stdout, returning
+  `{script, path, stdout, args}`. New `--expect PATH[:MIN_ROWS]` (repeatable) fails
+  the job when an output artifact is missing, empty, or short; `--allow-empty`
+  permits an expected-but-empty file. Scripts run on the cancellable job lane, so
+  `ghidra cancel` works on them.
+
 ### Fixed
 
+- Commands issued while the bridge is busy now wait in the queue instead of
+  failing with "bridge not responding" — a slow analysis no longer looks like a
+  dead bridge.
 - Import now treats stale empty `.gpr`/`.rep` project artifacts as uninitialized
   and uses the durable one-shot import path instead of trying to start a
   project-mode bridge that Ghidra rejects because it contains no programs.
 - Removed the inert legacy config key `timeout`. Old YAML files containing it
   still load, but the key is dropped when saved and `config set timeout` points
   to the active read, long-operation, connection, and launch timeout controls.
+- `patch nop --count N` now NOPs N consecutive instructions (was: silently
+  ignored, only the instruction at the address was patched). The client forwards
+  the count and the bridge walks instruction by instruction, so variable-length
+  ISAs work; if any address in the run has no instruction the whole patch rolls
+  back.
+- `comment set --comment-type PRE|POST|PLATE` now takes effect (was: always
+  `EOL`). The client sent the type under key `type` while the bridge read
+  `comment_type`; the client now sends `comment_type` and the bridge still
+  accepts the old key as a fallback.
 
 ## [0.2.1]
 
@@ -119,4 +154,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   likewise reports `Exists` based on those artifacts.
 
 [unreleased]: https://github.com/akiselev/ghidra-cli/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/akiselev/ghidra-cli/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/akiselev/ghidra-cli/releases/tag/v0.2.0

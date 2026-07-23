@@ -461,7 +461,7 @@ impl BridgeClient {
             Some(json!({
                 "address": address,
                 "text": text,
-                "type": comment_type,
+                "comment_type": comment_type,
             })),
         )
     }
@@ -534,8 +534,11 @@ impl BridgeClient {
         self.send_command("patch_bytes", Some(json!({"address": address, "hex": hex})))
     }
 
-    pub fn patch_nop(&self, address: &str) -> Result<serde_json::Value> {
-        self.send_command("patch_nop", Some(json!({"address": address})))
+    pub fn patch_nop(&self, address: &str, count: Option<usize>) -> Result<serde_json::Value> {
+        self.send_command(
+            "patch_nop",
+            Some(json!({"address": address, "count": count})),
+        )
     }
 
     pub fn patch_export(&self, output: &str) -> Result<serde_json::Value> {

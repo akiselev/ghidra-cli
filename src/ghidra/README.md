@@ -9,7 +9,7 @@ Manages the Java bridge process lifecycle and Ghidra installation/setup.
 | `bridge.rs` | Bridge process management: start, stop, status, liveness check |
 | `setup.rs` | Ghidra download, installation, Java version check |
 | `mod.rs` | Module root, `GhidraClient` for project/installation operations |
-| `scripts/GhidraCliBridge.java` | Java bridge server (TCP, 40+ command handlers, runs inside Ghidra JVM) |
+| `scripts/GhidraCliBridge.java` | Java bridge server (TCP, 80+ command handlers, runs inside Ghidra JVM) |
 
 ## Bridge Lifecycle
 
@@ -24,12 +24,19 @@ CLI calls ensure_bridge_running()
 start_bridge()
   |
   1. Write GhidraCliBridge.java to ~/.config/ghidra-cli/scripts/
-  2. Spawn: analyzeHeadless <project_dir> <project_name> [-import <binary> | -process <program> -noanalysis] -postScript GhidraCliBridge.java <port_file_path>
+  2. Spawn: analyzeHeadless <project_dir> <project_name> -process [<program>] -noanalysis -preScript GhidraCliBridge.java <port_file_path>
   3. Write PID file immediately from Rust (child.id())       <-- enables orphan cleanup
   4. Read stdout line by line, wait for {"status":"ready"}
   5. Java bridge: binds ServerSocket(0), writes port file, overwrites PID file
   6. Return port number to caller
 ```
+
+The bridge always launches with `-preScript -noanalysis`, so it binds its socket
+right after the project (and optional program) loads — *before* any analysis —
+and reports ready fast. Analysis is not part of launch; it runs afterwards as an
+unbounded TCP `analyze` operation. Importing a new binary is a separate,
+short-lived `analyzeHeadless -import -noanalysis` run that commits the program to
+the project before the persistent bridge opens it in `-process` mode.
 
 ### PID File Write Sequence
 
@@ -123,12 +130,17 @@ This allows multiple bridges to run simultaneously for different projects.
 
 ## Start Modes
 
+`BridgeStartMode` selects how the persistent bridge opens the project. Both use
+`-preScript -noanalysis`; neither analyzes at launch.
+
 | Mode | analyzeHeadless Args | Use Case |
 |------|---------------------|----------|
-| `Import { binary_path }` | `-import <binary_path>` | First import of a binary |
-| `Process { program_name }` | `-process <program_name> -noanalysis` | Open existing program for queries |
+| `Process { program_name }` | `-process <program_name> -noanalysis` | Open a specific existing program |
+| `Project` | `-process -noanalysis` | Open the project without loading a program (e.g. `program list`, auto-start) |
 
-Import mode auto-analyzes during headless processing. Process mode skips analysis (`-noanalysis`) since the program was already analyzed during import.
+Importing a binary is not a start mode. It happens in a separate short-lived
+`analyzeHeadless -import -noanalysis` run that commits the program to the project;
+the persistent bridge then opens it in `Process` mode and analysis runs over TCP.
 
 ## Stale File Cleanup
 

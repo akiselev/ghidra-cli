@@ -3639,6 +3639,8 @@ public class GhidraCliBridge extends GhidraScript {
         String addressStr = getArgString(args, "address");
         String text = getArgString(args, "text");
         String commentTypeStr = getArgString(args, "comment_type");
+        // Older clients sent the type under "type"; accept it as a fallback.
+        if (commentTypeStr == null) commentTypeStr = getArgString(args, "type");
         if (commentTypeStr == null) commentTypeStr = "EOL";
 
         if (addressStr == null) return errorResult("Address required");
@@ -4108,35 +4110,48 @@ public class GhidraCliBridge extends GhidraScript {
         String addressStr = getArgString(args, "address");
         if (addressStr == null) return errorResult("Address required");
 
+        int count = getArgInt(args, "count", 1);
+        if (count < 1) return errorResult("count must be >= 1");
+
         try {
             Address addr = currentProgram.getAddressFactory().getAddress(addressStr);
             if (addr == null) return errorResult("Invalid address: " + addressStr);
 
             Listing listing = currentProgram.getListing();
-            Instruction instruction = listing.getInstructionAt(addr);
-            if (instruction == null) {
-                return errorResult("No instruction at address: " + addressStr);
-            }
-
-            int instrLength = instruction.getLength();
-            String processor = currentProgram.getLanguage().getProcessor().toString();
-
-            byte nopByte;
-            if (processor.toLowerCase().contains("x86")) {
-                nopByte = (byte) 0x90;
-            } else {
-                nopByte = (byte) 0x00;
-            }
-
-            byte[] nopBytes = new byte[instrLength];
-            Arrays.fill(nopBytes, nopByte);
-
             Memory memory = currentProgram.getMemory();
-            int txId = currentProgram.startTransaction("NOP instruction");
+            String processor = currentProgram.getLanguage().getProcessor().toString();
+            byte nopByte = processor.toLowerCase().contains("x86") ? (byte) 0x90 : (byte) 0x00;
+
+            JsonArray nopped = new JsonArray();
+            int totalBytes = 0;
+            int txId = currentProgram.startTransaction("NOP instructions");
             try {
-                // Clear the existing instruction before writing NOP bytes
-                listing.clearCodeUnits(addr, addr.add(instrLength - 1), false);
-                memory.setBytes(addr, nopBytes);
+                Address cur = addr;
+                for (int i = 0; i < count; i++) {
+                    Instruction instruction = listing.getInstructionAt(cur);
+                    if (instruction == null) {
+                        // Roll back partial work so the program is left untouched.
+                        currentProgram.endTransaction(txId, false);
+                        return errorResult("No instruction at address: " + cur.toString()
+                            + " (NOP'd " + nopped.size() + " of " + count + ")");
+                    }
+
+                    int instrLength = instruction.getLength();
+                    // Capture the next instruction's address before we clear this one.
+                    Address next = cur.add(instrLength);
+
+                    byte[] nopBytes = new byte[instrLength];
+                    Arrays.fill(nopBytes, nopByte);
+                    listing.clearCodeUnits(cur, cur.add(instrLength - 1), false);
+                    memory.setBytes(cur, nopBytes);
+
+                    JsonObject entry = new JsonObject();
+                    entry.addProperty("address", cur.toString());
+                    entry.addProperty("bytes", instrLength);
+                    nopped.add(entry);
+                    totalBytes += instrLength;
+                    cur = next;
+                }
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
                 currentProgram.endTransaction(txId, false);
@@ -4146,7 +4161,9 @@ public class GhidraCliBridge extends GhidraScript {
             JsonObject result = new JsonObject();
             result.addProperty("status", "nopped");
             result.addProperty("address", addr.toString());
-            result.addProperty("bytes", instrLength);
+            result.addProperty("count", nopped.size());
+            result.addProperty("bytes", totalBytes);
+            result.add("instructions", nopped);
             return result;
         } catch (Exception e) {
             return errorResult("Failed to NOP instruction: " + e.getMessage());
