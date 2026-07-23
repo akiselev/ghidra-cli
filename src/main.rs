@@ -523,7 +523,7 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                     });
                     client.open_program(&name)?;
                     (client, name)
-                } else if project_exists(&project_path) {
+                } else if project_has_program_data(&project_path) {
                     if !cli.quiet {
                         eprintln!("Starting Ghidra bridge...");
                     }
@@ -545,9 +545,9 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                     (client, name)
                 } else {
                     if !cli.quiet {
-                        eprintln!("Creating project (importing {})...", args.binary);
+                        eprintln!("Initializing project (importing {})...", args.binary);
                     }
-                    // Brand-new project: create it with a clean, short-lived
+                    // Brand-new or stale empty project: initialize it with a clean, short-lived
                     // one-shot import that durably commits the program, then start
                     // the persistent bridge in Process mode against the committed
                     // program. This replaces the old `-import` bridge bootstrap,
@@ -1838,16 +1838,21 @@ fn handle_config_command(cmd: cli::ConfigCommands) -> anyhow::Result<()> {
             let mut config = Config::load()?;
             match key.as_str() {
                 "default_output_format" => config.default_output_format = Some(value),
-                "timeout" => {
-                    let timeout: u64 = value.parse().map_err(|_| {
-                        GhidraError::ConfigError("Invalid timeout value".to_string())
-                    })?;
-                    config.timeout = Some(timeout);
-                }
+                "timeout" => anyhow::bail!(
+                    "'timeout' has been removed because it no longer controlled bridge waits. \
+                     Use GHIDRA_CLI_READ_TIMEOUT for normal commands, GHIDRA_CLI_OP_TIMEOUT \
+                     for analyze/import, or config 'launch_timeout_secs' for bridge startup."
+                ),
                 "ghidra_install_dir" => config.ghidra_install_dir = Some(PathBuf::from(value)),
                 "ghidra_project_dir" => config.ghidra_project_dir = Some(PathBuf::from(value)),
                 "default_program" => config.default_program = Some(value),
                 "default_project" => config.default_project = Some(value),
+                "launch_timeout_secs" => {
+                    let timeout: u64 = value.parse().map_err(|_| {
+                        GhidraError::ConfigError("Invalid launch timeout value".to_string())
+                    })?;
+                    config.launch_timeout_secs = Some(timeout);
+                }
                 "default_limit" => {
                     let limit: usize = value
                         .parse()
@@ -2082,6 +2087,31 @@ fn project_exists(project_path: &Path) -> bool {
     }
 }
 
+/// Whether a project contains persisted program data and can be opened with
+/// `analyzeHeadless -process`.
+///
+/// A stale or newly-created empty project may have both `.gpr` and `.rep`
+/// artifacts but only index files under `.rep/idata`. Starting a project-mode
+/// bridge for that state fails before the bridge script can accept an import.
+/// Real program data lives in bucket subdirectories under `idata`.
+fn project_has_program_data(project_path: &Path) -> bool {
+    let (Some(name), Some(parent)) = (project_path.file_name(), project_path.parent()) else {
+        return false;
+    };
+    let name = name.to_string_lossy();
+    let gpr = parent.join(format!("{}.gpr", name));
+    let idata = parent.join(format!("{}.rep", name)).join("idata");
+
+    gpr.is_file()
+        && std::fs::read_dir(idata)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .any(|entry| entry.path().is_dir())
+            })
+            .unwrap_or(false)
+}
+
 /// Load config, applying the global `--projects-dir` override (if any) onto
 /// `ghidra_project_dir`. This keeps the precedence in [`Config::get_project_dir`]
 /// (env var > config field > default) while letting the CLI flag win in-process
@@ -2158,5 +2188,27 @@ mod tests {
         };
         let msg = format!("{:#}", describe_query_error(err));
         assert!(msg.contains("invalid --filter expression"), "got: {msg}");
+    }
+
+    #[test]
+    fn empty_project_artifacts_are_not_program_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("stale");
+        std::fs::write(temp.path().join("stale.gpr"), []).unwrap();
+        std::fs::create_dir_all(temp.path().join("stale.rep/idata")).unwrap();
+        std::fs::write(temp.path().join("stale.rep/idata/~index.dat"), []).unwrap();
+
+        assert!(project_exists(&project));
+        assert!(!project_has_program_data(&project));
+    }
+
+    #[test]
+    fn idata_bucket_marks_project_as_populated() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("populated");
+        std::fs::write(temp.path().join("populated.gpr"), []).unwrap();
+        std::fs::create_dir_all(temp.path().join("populated.rep/idata/00")).unwrap();
+
+        assert!(project_has_program_data(&project));
     }
 }

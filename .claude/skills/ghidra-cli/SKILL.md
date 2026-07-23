@@ -272,11 +272,16 @@ ghidra doctor                     # check installation
 ghidra version
 ghidra config list
 ghidra config get KEY
-ghidra config set KEY VALUE       # keys: ghidra_install_dir, ghidra_project_dir, default_program, default_project, default_output_format, timeout, default_limit
+ghidra config set KEY VALUE       # keys: ghidra_install_dir, ghidra_project_dir, default_program, default_project, default_output_format, default_limit, launch_timeout_secs
 ghidra config reset
 ghidra set-default KIND VALUE     # KIND: program, project
 ghidra setup [--version V] [--dir D] [--force]
 ```
+
+Bridge wait controls are environment variables: `GHIDRA_CLI_READ_TIMEOUT` for
+normal commands, `GHIDRA_CLI_OP_TIMEOUT` for analyze/import, and
+`GHIDRA_CLI_CONNECT_DEADLINE` for connection establishment. The legacy config
+key `timeout` is ignored when loading old files and rejected by `config set`.
 
 ## Common Query Options (QUERY_OPTS)
 

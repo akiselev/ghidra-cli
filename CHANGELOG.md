@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Import now treats stale empty `.gpr`/`.rep` project artifacts as uninitialized
+  and uses the durable one-shot import path instead of trying to start a
+  project-mode bridge that Ghidra rejects because it contains no programs.
+- Removed the inert legacy config key `timeout`. Old YAML files containing it
+  still load, but the key is dropped when saved and `config set timeout` points
+  to the active read, long-operation, connection, and launch timeout controls.
+
 ## [0.2.1]
 
 ### Fixed
@@ -107,5 +118,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   running bridge first so the project lock is released. `ghidra project info`
   likewise reports `Exists` based on those artifacts.
 
-[unreleased]: https://github.com/akiselev/ghidra-cli/compare/v0.2.0...HEAD
+[unreleased]: https://github.com/akiselev/ghidra-cli/compare/v0.2.1...HEAD
 [0.2.0]: https://github.com/akiselev/ghidra-cli/releases/tag/v0.2.0

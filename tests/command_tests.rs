@@ -69,6 +69,44 @@ fn test_config_set() {
 }
 
 #[test]
+fn test_legacy_config_timeout_is_rejected_with_replacements() {
+    require_ghidra!();
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.yaml");
+
+    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        .env("GHIDRA_CLI_CONFIG", &config_path)
+        .arg("config")
+        .arg("set")
+        .arg("timeout")
+        .arg("1800")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("GHIDRA_CLI_READ_TIMEOUT"));
+}
+
+#[test]
+fn test_config_set_launch_timeout() {
+    require_ghidra!();
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.yaml");
+
+    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        .env("GHIDRA_CLI_CONFIG", &config_path)
+        .arg("config")
+        .arg("set")
+        .arg("launch_timeout_secs")
+        .arg("240")
+        .assert()
+        .success();
+
+    let config = std::fs::read_to_string(config_path).unwrap();
+    assert!(config.contains("launch_timeout_secs: 240"), "{config}");
+}
+
+#[test]
 fn test_config_reset() {
     require_ghidra!();
 

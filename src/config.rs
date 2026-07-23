@@ -15,7 +15,6 @@ pub struct Config {
     pub default_project: Option<String>,
     pub default_output_format: Option<String>,
     pub default_limit: Option<usize>,
-    pub timeout: Option<u64>,
     /// Bounded cap (seconds) for bridge launch readiness: JVM start + OSGi
     /// compile + project open + binary load. Does NOT cover analysis, which runs
     /// as an unbounded TCP operation. Overridable via `GHIDRA_CLI_LAUNCH_TIMEOUT`.
@@ -35,7 +34,6 @@ impl Default for Config {
             default_project: None,
             default_output_format: Some("auto".to_string()),
             default_limit: Some(1000),
-            timeout: Some(300),
             launch_timeout_secs: None,
             aliases: std::collections::HashMap::new(),
         }
@@ -230,8 +228,14 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.timeout, Some(300));
         assert_eq!(config.default_limit, Some(1000));
+    }
+
+    #[test]
+    fn legacy_timeout_is_ignored_and_not_reserialized() {
+        let config: Config = serde_yaml::from_str("timeout: 1800\naliases: {}\n").unwrap();
+        let serialized = serde_yaml::to_string(&config).unwrap();
+        assert!(!serialized.contains("timeout:"), "{serialized}");
     }
 
     #[test]
