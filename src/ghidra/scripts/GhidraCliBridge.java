@@ -318,6 +318,29 @@ public class GhidraCliBridge extends GhidraScript {
             // and a mid-session save cannot. See `ghidra program save`
             // (Rust side): it gets a real flush by stopping and restarting
             // the bridge rather than trying to save in place.
+            //
+            // CRITICAL INVARIANT, learned the hard way: because that outer
+            // transaction stays open for this entire run(), every handler's
+            // `currentProgram.startTransaction()` below is a *nested*
+            // sub-transaction of it (Ghidra's DomainObjectDBTransaction just
+            // adds an entry to the one already-open transaction rather than
+            // starting an independent one). Ghidra's transaction manager
+            // tracks a single ABORTED/COMMITTED status for the whole nest:
+            // if ANY nested entry ends with `endTransaction(id, false)`, the
+            // entire group's status latches to ABORTED, and when the
+            // outermost entry (this run()'s own, closed by the harness after
+            // we return) finally closes, Ghidra rolls back *everything*
+            // since the bridge started -- not just the one failed handler.
+            // This previously caused silent, total loss of an entire
+            // session's mutations (renames, comments, new functions, all of
+            // it) whenever a single handled/expected error occurred anywhere
+            // in the session, with zero indication at save time. So: no
+            // handler below may ever call `endTransaction(txId, false)`.
+            // On a handler-level failure, still commit `true` -- at worst
+            // that leaves a harmless partial side effect (e.g. a stray
+            // auto-disassembly from an aborted create_function), which is
+            // vastly preferable to losing every other already-"successful"
+            // change made since the bridge came up.
             beginShutdown();
             try {
                 acceptor.join(5000);
@@ -1369,7 +1392,7 @@ public class GhidraCliBridge extends GhidraScript {
                 result.addProperty("address", func.getEntryPoint().toString());
                 return result;
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
         } catch (Exception e) {
@@ -1423,11 +1446,11 @@ public class GhidraCliBridge extends GhidraScript {
                     // must contain the entrypoint") rather than returning null -- run it
                     // through the same diagnosis either way instead of losing the detail to
                     // the generic catch below.
-                    currentProgram.endTransaction(txId, false);
+                    currentProgram.endTransaction(txId, true);
                     return diagnoseCreateFunctionFailure(addr, autoDisassembled, e.getMessage());
                 }
                 if (created == null) {
-                    currentProgram.endTransaction(txId, false);
+                    currentProgram.endTransaction(txId, true);
                     return diagnoseCreateFunctionFailure(addr, autoDisassembled, null);
                 }
                 currentProgram.endTransaction(txId, true);
@@ -1439,7 +1462,7 @@ public class GhidraCliBridge extends GhidraScript {
                 if (autoDisassembled) result.addProperty("auto_disassembled", true);
                 return result;
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
         } catch (Exception e) {
@@ -1539,7 +1562,7 @@ public class GhidraCliBridge extends GhidraScript {
                 fm.removeFunction(entry);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -2940,7 +2963,7 @@ public class GhidraCliBridge extends GhidraScript {
                 symbolTable.createLabel(addr, name, SourceType.USER_DEFINED);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -2979,7 +3002,7 @@ public class GhidraCliBridge extends GhidraScript {
                 }
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3020,7 +3043,7 @@ public class GhidraCliBridge extends GhidraScript {
                 }
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3167,7 +3190,7 @@ public class GhidraCliBridge extends GhidraScript {
                 dtm.addDataType(newStruct, null);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3210,10 +3233,10 @@ public class GhidraCliBridge extends GhidraScript {
                 listing.createData(addr, dataType);
                 currentProgram.endTransaction(txId, true);
             } catch (ghidra.program.model.util.CodeUnitInsertionException e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 return typeApplyConflictError(addr, typeName, e);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3299,7 +3322,7 @@ public class GhidraCliBridge extends GhidraScript {
                     return errorResult("Failed to remove type: " + typeName + " (may be in use or built-in)");
                 }
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3329,7 +3352,7 @@ public class GhidraCliBridge extends GhidraScript {
                 dataType.setName(newName);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3371,7 +3394,7 @@ public class GhidraCliBridge extends GhidraScript {
                 dtm.addDataType(enumDt, null);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3403,7 +3426,7 @@ public class GhidraCliBridge extends GhidraScript {
                 dtm.addDataType(td, null);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3447,7 +3470,7 @@ public class GhidraCliBridge extends GhidraScript {
                 }
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3491,7 +3514,7 @@ public class GhidraCliBridge extends GhidraScript {
                 struct.delete(ordinal);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3535,7 +3558,7 @@ public class GhidraCliBridge extends GhidraScript {
                 cmd.applyTo(currentProgram);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3575,7 +3598,7 @@ public class GhidraCliBridge extends GhidraScript {
                 func.setReturnType(returnType, SourceType.USER_DEFINED);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3609,7 +3632,7 @@ public class GhidraCliBridge extends GhidraScript {
                 func.setCallingConvention(convention);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3642,7 +3665,7 @@ public class GhidraCliBridge extends GhidraScript {
                 func.setNoReturn(value);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3673,7 +3696,7 @@ public class GhidraCliBridge extends GhidraScript {
                 func.addTag(tagName);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3704,7 +3727,7 @@ public class GhidraCliBridge extends GhidraScript {
                 func.removeTag(tagName);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3805,7 +3828,7 @@ public class GhidraCliBridge extends GhidraScript {
                     HighFunctionDBUtil.updateDBVariable(targetSym, targetSym.getName(), newType, SourceType.USER_DEFINED);
                     currentProgram.endTransaction(txId, true);
                 } catch (Exception e) {
-                    currentProgram.endTransaction(txId, false);
+                    currentProgram.endTransaction(txId, true);
                     throw e;
                 }
 
@@ -3963,7 +3986,7 @@ public class GhidraCliBridge extends GhidraScript {
                 listing.setComment(addr, commentType, text);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -3996,7 +4019,7 @@ public class GhidraCliBridge extends GhidraScript {
                 listing.setComment(addr, CodeUnit.PLATE_COMMENT, null);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -4391,7 +4414,7 @@ public class GhidraCliBridge extends GhidraScript {
                 memory.setBytes(addr, patchData);
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -4432,7 +4455,7 @@ public class GhidraCliBridge extends GhidraScript {
                     Instruction instruction = listing.getInstructionAt(cur);
                     if (instruction == null) {
                         // Roll back partial work so the program is left untouched.
-                        currentProgram.endTransaction(txId, false);
+                        currentProgram.endTransaction(txId, true);
                         return errorResult("No instruction at address: " + cur.toString()
                             + " (NOP'd " + nopped.size() + " of " + count + ")");
                     }
@@ -4455,7 +4478,7 @@ public class GhidraCliBridge extends GhidraScript {
                 }
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -4620,7 +4643,7 @@ public class GhidraCliBridge extends GhidraScript {
                 }
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
 
@@ -4705,7 +4728,7 @@ public class GhidraCliBridge extends GhidraScript {
                 }
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
-                currentProgram.endTransaction(txId, false);
+                currentProgram.endTransaction(txId, true);
                 throw e;
             }
             return result;
