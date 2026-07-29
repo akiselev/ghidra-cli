@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   throws (diagnoses no-instruction vs. inside-existing-function vs.
   mid-code-unit causes), and `type apply` "Conflicting data exists" (the
   conflicting unit's kind/type/range). Printed as JSON with `-vv`/`--json`.
+- `ghidra program save` — flushes pending changes (rename/comment/patch/
+  type/symbol/tag ops, etc.) to disk so the Ghidra GUI or a fresh bridge can
+  see them. The bridge cannot save in place while running (Ghidra's headless
+  script-execution harness holds a transaction open for its whole lifetime),
+  so this stops and immediately restarts the bridge against the same
+  program. `ghidra stop` also persists (without restarting); `program close`
+  no longer attempts an in-place save it can't perform — a response `note`
+  now says so explicitly instead of silently discarding the intent.
 
 - **Responsive control plane with a real job queue.** Socket handling is now split
   from Ghidra program execution. `ping`, `status`, `bridge_info`, `jobs`, and

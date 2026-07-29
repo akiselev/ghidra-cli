@@ -312,6 +312,16 @@ pub enum ProgramCommands {
     Info(ProgramTargetArgs),
     /// Export program
     Export(ExportArgs),
+    /// Flush pending changes to disk so the Ghidra GUI (or a fresh bridge)
+    /// can see them. The bridge cannot save in place while it keeps running
+    /// — Ghidra's headless script-execution harness holds its own
+    /// transaction open for the bridge's whole lifetime, so this stops and
+    /// immediately restarts the bridge (a few seconds of downtime) rather
+    /// than failing outright. Every write command — rename, comment, patch,
+    /// type/symbol/tag ops — stays in the bridge's memory, invisible to the
+    /// GUI and lost if the bridge dies uncleanly, until either this or
+    /// `ghidra stop` runs.
+    Save(ProgramTargetArgs),
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]

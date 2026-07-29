@@ -126,6 +126,10 @@ fn run_command(cli: Cli) -> anyhow::Result<()> {
         Commands::Config(cmd) => handle_config_command(cmd.clone()),
         Commands::SetDefault(args) => handle_set_default(args.clone()),
         Commands::Project(args) => handle_project_command(args.command.clone()),
+        // Saving means stopping and restarting the bridge, not a single
+        // request/response against an already-running one, so it's handled
+        // before the generic bridge dispatch below.
+        Commands::Program(cli::ProgramCommands::Save(_)) => handle_program_save(cli),
         // Commands requiring bridge
         _ if requires_bridge(&cli.command) => run_with_bridge(cli),
         _ => {
@@ -278,6 +282,7 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
             cli::ProgramCommands::Delete(args) => args.project.clone(),
             cli::ProgramCommands::Info(args) => args.project.clone(),
             cli::ProgramCommands::Export(args) => args.project.clone(),
+            cli::ProgramCommands::Save(args) => args.project.clone(),
         },
         Commands::Diff(cmd) => match cmd {
             cli::DiffCommands::Programs(args) => args.project.clone(),
@@ -401,6 +406,7 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
             cli::ProgramCommands::Delete(args) => args.program.clone(),
             cli::ProgramCommands::Info(args) => args.program.clone(),
             cli::ProgramCommands::Export(args) => args.program.clone(),
+            cli::ProgramCommands::Save(args) => args.program.clone(),
         },
         Commands::Batch(args) => args.program.clone(),
         Commands::Rename(args) => args.program.clone(),
@@ -1133,6 +1139,13 @@ fn execute_via_bridge(
                 ProgramCommands::Export(args) => {
                     client.program_export(&args.format, args.output.as_deref())
                 }
+                // ProgramCommands::Save is intercepted in `run_command` before
+                // reaching here: saving means stopping and restarting the
+                // bridge (see `handle_program_save`), not a single request to
+                // an already-running one.
+                ProgramCommands::Save(_) => unreachable!(
+                    "program save is handled by handle_program_save before run_with_bridge"
+                ),
             }
         }
         Commands::Symbol(cmd) => {
@@ -1462,6 +1475,62 @@ fn handle_bridge_stop(
         println!("No bridge running for project: {}", project_path.display());
     }
 
+    Ok(())
+}
+
+/// `ghidra program save`: flush pending changes to disk.
+///
+/// The bridge cannot save in place while it keeps running: Ghidra's headless
+/// script-execution harness holds its own transaction open for the whole
+/// life of the postScript (confirmed empirically -- `currentProgram.save()`
+/// always fails with "Unable to lock due to active transaction", even with
+/// zero pending edits), so nothing short of the process actually exiting
+/// commits to disk. A clean `ghidra stop` already does that; this wraps
+/// exactly that stop with an immediate restart against the same program, so
+/// a "save" reads as a few seconds of downtime rather than losing the
+/// session. Every write command (rename, comment, patch, type/symbol/tag
+/// ops) is only visible to the Ghidra GUI, or a fresh bridge, after this
+/// (or `ghidra stop`) has run.
+fn handle_program_save(cli: Cli) -> anyhow::Result<()> {
+    let Commands::Program(cli::ProgramCommands::Save(args)) = &cli.command else {
+        unreachable!("handle_program_save dispatched for a non-Save Program command");
+    };
+    let project = args.project.clone().or_else(|| cli.project.clone());
+    let mut program = args.program.clone().or_else(|| cli.program.clone());
+    let projects_dir = cli.projects_dir.clone();
+
+    let config = load_config(&projects_dir)?;
+    let project_path = resolve_project_path(&project, &config)?;
+
+    let port = match bridge::is_bridge_running(&project_path) {
+        Some(port) => port,
+        None => {
+            println!(
+                "No bridge running for project: {} — nothing pending to save.",
+                project_path.display()
+            );
+            return Ok(());
+        }
+    };
+
+    // Reopen the same program on restart even if the caller didn't pass
+    // --program, by asking the (still-running, for a moment longer) bridge
+    // what it currently has open.
+    if program.is_none() {
+        let client = BridgeClient::new(port);
+        if let Ok(info) = client.bridge_info() {
+            program = info
+                .get("current_program")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+
+    println!("Saving: stopping the bridge to flush pending changes to disk...");
+    handle_bridge_stop(project.clone(), &projects_dir)?;
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    handle_bridge_start(project, program, &projects_dir)?;
+    println!("Saved (bridge restarted).");
     Ok(())
 }
 
