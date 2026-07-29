@@ -1515,22 +1515,72 @@ fn handle_program_save(cli: Cli) -> anyhow::Result<()> {
 
     // Reopen the same program on restart even if the caller didn't pass
     // --program, by asking the (still-running, for a moment longer) bridge
-    // what it currently has open.
-    if program.is_none() {
+    // what it currently has open. While we're connected, also snapshot a
+    // cheap invariant (function count) so we can prove the save actually
+    // took, rather than trusting the restart to have worked.
+    let mut expected_function_count: Option<i64> = None;
+    {
         let client = BridgeClient::new(port);
-        if let Ok(info) = client.bridge_info() {
-            program = info
-                .get("current_program")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+        if program.is_none() {
+            if let Ok(info) = client.bridge_info() {
+                program = info
+                    .get("current_program")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+        }
+        if let Ok(info) = client.program_info() {
+            expected_function_count = info.get("function_count").and_then(|v| v.as_i64());
         }
     }
 
     println!("Saving: stopping the bridge to flush pending changes to disk...");
     handle_bridge_stop(project.clone(), &projects_dir)?;
     std::thread::sleep(std::time::Duration::from_secs(1));
-    handle_bridge_start(project, program, &projects_dir)?;
-    println!("Saved (bridge restarted).");
+    handle_bridge_start(project.clone(), program, &projects_dir)?;
+
+    // Verify the restart actually reflects what was pending, instead of
+    // trusting a clean restart to mean a clean save. A mismatch here means
+    // the underlying Ghidra transaction was rolled back on shutdown (e.g. a
+    // handled error earlier in the session aborted a nested sub-transaction,
+    // which silently discards the whole session's changes) -- fail loudly
+    // rather than printing "Saved" over a reverted program.
+    if let Some(expected) = expected_function_count {
+        let new_port = bridge::is_bridge_running(&project_path);
+        let actual = new_port.and_then(|p| {
+            BridgeClient::new(p)
+                .program_info()
+                .ok()
+                .and_then(|info| info.get("function_count").and_then(|v| v.as_i64()))
+        });
+
+        match actual {
+            Some(actual) if actual == expected => {
+                println!("Saved (bridge restarted, function count verified: {}).", actual);
+            }
+            Some(actual) => {
+                anyhow::bail!(
+                    "Save verification FAILED: function count before save was {}, but is {} \
+                     after restart. The bridge restarted cleanly but Ghidra rolled back pending \
+                     changes on shutdown -- this save did NOT persist your edits. Re-check state \
+                     with `ghidra function list --count` and `ghidra program save` again; if this \
+                     persists, checkpoint in smaller batches.",
+                    expected,
+                    actual
+                );
+            }
+            None => {
+                anyhow::bail!(
+                    "Save verification FAILED: could not query the restarted bridge to confirm \
+                     the save took (expected function count was {}). Check `ghidra status` before \
+                     trusting this save.",
+                    expected
+                );
+            }
+        }
+    } else {
+        println!("Saved (bridge restarted).");
+    }
     Ok(())
 }
 
