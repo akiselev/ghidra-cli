@@ -305,6 +305,19 @@ public class GhidraCliBridge extends GhidraScript {
             // Communications remain responsive while Ghidra access stays serialized.
             runProgramJobs();
         } finally {
+            // No explicit currentProgram.save() here: it always fails with
+            // "Unable to lock due to active transaction" for as long as this
+            // postScript keeps running (Ghidra's headless script-execution
+            // harness holds its own outer transaction open for the whole
+            // life of the script -- confirmed empirically, not something we
+            // can end from in here). Persistence instead happens once run()
+            // returns and control passes back to that harness: its own
+            // per-program completion (import/-process's normal "save and
+            // release" step) is what actually flushes pending changes to
+            // disk, which is why a clean `ghidra stop` persists everything
+            // and a mid-session save cannot. See `ghidra program save`
+            // (Rust side): it gets a real flush by stopping and restarting
+            // the bridge rather than trying to save in place.
             beginShutdown();
             try {
                 acceptor.join(5000);
@@ -2284,6 +2297,15 @@ public class GhidraCliBridge extends GhidraScript {
 
         String programName = currentProgram.getName();
 
+        // No save attempt here: currentProgram.save() always fails with
+        // "Unable to lock due to active transaction" while this postScript is
+        // running (see the comment in run()'s finally block) -- confirmed
+        // empirically, including with zero pending edits, so it is not a race
+        // to work around, it is a hard constraint of the execution model.
+        // Pending changes remain in memory and are only flushed to disk when
+        // the bridge process itself exits; use `ghidra program save` (stops
+        // and restarts the bridge) or `ghidra stop` to persist them.
+
         // In headless mode, we release the program
         try {
             Project project = state.getProject();
@@ -2299,6 +2321,7 @@ public class GhidraCliBridge extends GhidraScript {
         JsonObject result = new JsonObject();
         result.addProperty("status", "closed");
         result.addProperty("program", programName);
+        result.addProperty("note", "not saved to disk -- run `ghidra program save` or `ghidra stop` to persist pending changes");
         return result;
     }
 

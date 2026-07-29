@@ -104,7 +104,10 @@ ghidra program close [--project P]
 ghidra program delete --program PROG [--project P]
 ghidra program info [--project P]
 ghidra program export FORMAT [--project P] [-o OUTPUT]   # FORMAT: json, xml, c/cpp, binary/bin, gzf, ascii/asm, hex, html
+ghidra program save [--program PROG] [--project P]
 ```
+
+**Persistence gotcha**: while the bridge is running, every write command (rename, comment, patch, type/symbol/tag ops, `function create`, etc.) only commits an in-memory Ghidra transaction — it is *not* written to the project's `.rep` folder on disk. The bridge auto-saves after `analyze` completes and when `program open` switches to a different program, but nothing else. This means the Ghidra GUI (which reads straight from disk) won't see pending CLI changes, and — more importantly — `program close` does **not** persist them either; only the bridge process actually exiting does (Ghidra's headless script-execution harness holds an outer transaction open for the bridge's whole lifetime, so an in-place save always fails with "Unable to lock due to active transaction", confirmed empirically). `ghidra program save` gets a real flush by stopping and immediately restarting the bridge against the same program (a few seconds of downtime); `ghidra stop` does the same without restarting. Run one of the two before opening the project in the GUI, or before relying on changes surviving a bridge crash.
 
 ### Function Operations
 
