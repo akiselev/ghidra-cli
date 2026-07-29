@@ -34,6 +34,7 @@ import ghidra.program.model.address.AddressFactory;
 import ghidra.program.model.data.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
 import ghidra.util.task.TaskMonitor;
@@ -664,7 +665,10 @@ public class GhidraCliBridge extends GhidraScript {
             }
 
             if (result.has("error")) {
-                return new HandleResult(errorResponse(result.get("error").getAsString()), false);
+                JsonObject detail = (result.has("detail") && result.get("detail").isJsonObject())
+                    ? result.getAsJsonObject("detail") : null;
+                return new HandleResult(
+                    errorResponse(result.get("error").getAsString(), detail), false);
             }
 
             return new HandleResult(successResponse(result), false);
@@ -725,6 +729,10 @@ public class GhidraCliBridge extends GhidraScript {
             case "function_set_signature": return handleFunctionSetSignature(args);
             case "function_set_return_type": return handleFunctionSetReturnType(args);
             case "function_set_calling_convention": return handleFunctionSetCallingConvention(args);
+            case "function_set_noreturn": return handleFunctionSetNoReturn(args);
+            case "function_tag_add":    return handleFunctionTagAdd(args);
+            case "function_tag_remove": return handleFunctionTagRemove(args);
+            case "function_tag_list":   return handleFunctionTagList(args);
             case "set_var_type":    return handleSetVarType(args);
             // Comment commands
             case "comment_list":    return handleCommentList(args);
@@ -745,6 +753,8 @@ public class GhidraCliBridge extends GhidraScript {
             case "patch_export":    return handlePatchExport(args);
             // Other commands
             case "disasm":          return handleDisasm(args);
+            case "disasm_at":       return handleDisasmAt(args);
+            case "clear_range":     return handleClearRange(args);
             case "stats":           return handleStats();
             // Script commands
             case "script_run":      return handleScriptRun(args);
@@ -769,9 +779,21 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private JsonObject errorResponse(String message) {
+        return errorResponse(message, null);
+    }
+
+    /**
+     * Error response carrying structured detail (e.g. a conflicting code
+     * unit's type/range, or a containing function's name/entry/size) alongside
+     * the message, so callers can act on it without a follow-up round trip.
+     */
+    private JsonObject errorResponse(String message, JsonObject detail) {
         JsonObject resp = new JsonObject();
         resp.addProperty("status", "error");
         resp.addProperty("message", message);
+        if (detail != null) {
+            resp.add("detail", detail);
+        }
         return resp;
     }
 
@@ -1145,6 +1167,7 @@ public class GhidraCliBridge extends GhidraScript {
 
         int limit = getArgInt(args, "limit", 0);
         String nameFilter = getArgString(args, "filter");
+        String tagFilter = getArgString(args, "tag");
 
         JsonArray functions = new JsonArray();
         FunctionManager fm = currentProgram.getFunctionManager();
@@ -1160,35 +1183,11 @@ public class GhidraCliBridge extends GhidraScript {
             if (nameFilter != null && !name.toLowerCase().contains(nameFilter.toLowerCase())) {
                 continue;
             }
-
-            JsonObject funcData = new JsonObject();
-            funcData.addProperty("name", name);
-            funcData.addProperty("address", func.getEntryPoint().toString());
-            funcData.addProperty("size", func.getBody().getNumAddresses());
-            funcData.addProperty("entry_point", func.getEntryPoint().toString());
-
-            String sig = null;
-            try {
-                sig = func.getPrototypeString(false, false);
-            } catch (Exception e) {
-                // ignore
-            }
-            if (sig != null) {
-                funcData.addProperty("signature", sig);
-            } else {
-                funcData.add("signature", JsonNull.INSTANCE);
+            if (tagFilter != null && !functionHasTag(func, tagFilter)) {
+                continue;
             }
 
-            funcData.addProperty("calling_convention", func.getCallingConventionName());
-
-            String comment = func.getComment();
-            if (comment != null) {
-                funcData.addProperty("comment", comment);
-            } else {
-                funcData.add("comment", JsonNull.INSTANCE);
-            }
-
-            functions.add(funcData);
+            functions.add(functionToJson(func));
             count++;
         }
 
@@ -1196,6 +1195,13 @@ public class GhidraCliBridge extends GhidraScript {
         result.add("functions", functions);
         result.addProperty("count", functions.size());
         return result;
+    }
+
+    private boolean functionHasTag(Function func, String tagName) {
+        for (FunctionTag tag : func.getTags()) {
+            if (tag.getName().equals(tagName)) return true;
+        }
+        return false;
     }
 
     private JsonObject functionToJson(Function func) {
@@ -1218,6 +1224,13 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         funcData.addProperty("calling_convention", func.getCallingConventionName());
+        funcData.addProperty("no_return", func.hasNoReturn());
+
+        JsonArray tags = new JsonArray();
+        for (FunctionTag tag : func.getTags()) {
+            tags.add(new JsonPrimitive(tag.getName()));
+        }
+        funcData.add("tags", tags);
 
         String comment = func.getComment();
         if (comment != null) {
@@ -1367,20 +1380,42 @@ public class GhidraCliBridge extends GhidraScript {
             }
 
             FunctionManager fm = currentProgram.getFunctionManager();
-            if (fm.getFunctionContaining(addr) != null) {
-                return errorResult("Function already exists at " + addr.toString());
+            Function owner = fm.getFunctionContaining(addr);
+            if (owner != null) {
+                return functionAlreadyExistsError(addr, owner);
             }
 
             String functionName = (requestedName == null || requestedName.isEmpty())
                 ? ("FUN_" + addr.toString().replace(":", ""))
                 : requestedName;
 
+            Listing listing = currentProgram.getListing();
+            boolean autoDisassembled = false;
+
             int txId = currentProgram.startTransaction("Create function");
             try {
-                Function created = fm.createFunction(functionName, addr, null, SourceType.USER_DEFINED);
+                // The most common reason createFunction rejects an address: no
+                // instruction has been disassembled there yet (static auto-analysis
+                // never reached it, e.g. a computed-jump table target). Disassemble
+                // first rather than making the caller do it via a separate command.
+                if (listing.getInstructionAt(addr) == null) {
+                    autoDisassembled = disassemble(addr);
+                }
+
+                Function created;
+                try {
+                    created = fm.createFunction(functionName, addr, null, SourceType.USER_DEFINED);
+                } catch (Exception e) {
+                    // createFunction rejects some addresses by throwing (e.g. "Function body
+                    // must contain the entrypoint") rather than returning null -- run it
+                    // through the same diagnosis either way instead of losing the detail to
+                    // the generic catch below.
+                    currentProgram.endTransaction(txId, false);
+                    return diagnoseCreateFunctionFailure(addr, autoDisassembled, e.getMessage());
+                }
                 if (created == null) {
                     currentProgram.endTransaction(txId, false);
-                    return errorResult("Failed to create function at " + addr.toString());
+                    return diagnoseCreateFunctionFailure(addr, autoDisassembled, null);
                 }
                 currentProgram.endTransaction(txId, true);
 
@@ -1388,6 +1423,7 @@ public class GhidraCliBridge extends GhidraScript {
                 result.addProperty("status", "created");
                 result.addProperty("name", created.getName());
                 result.addProperty("address", created.getEntryPoint().toString());
+                if (autoDisassembled) result.addProperty("auto_disassembled", true);
                 return result;
             } catch (Exception e) {
                 currentProgram.endTransaction(txId, false);
@@ -1396,6 +1432,76 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to create function: " + e.getMessage());
         }
+    }
+
+    /** Structured "already claimed" error: who owns the address, so callers can decide without a follow-up lookup. */
+    private JsonObject functionAlreadyExistsError(Address addr, Function owner) {
+        JsonObject detail = new JsonObject();
+        detail.addProperty("name", owner.getName());
+        detail.addProperty("entry_point", owner.getEntryPoint().toString());
+        detail.addProperty("size", owner.getBody().getNumAddresses());
+        JsonObject err = errorResult("Function already exists at " + addr.toString()
+            + ": address is inside " + owner.getName() + "@" + owner.getEntryPoint()
+            + " (size " + owner.getBody().getNumAddresses() + " bytes)");
+        err.add("detail", detail);
+        return err;
+    }
+
+    /**
+     * fm.createFunction returning null carries no reason from Ghidra itself.
+     * Check the likely causes ourselves (no instruction landed, address already
+     * inside another function's body from a shared-code tail jump, boundary not
+     * on a code unit start) so the error distinguishes them instead of
+     * collapsing to one generic message.
+     */
+    private JsonObject diagnoseCreateFunctionFailure(Address addr, boolean autoDisassembled, String thrownMessage) {
+        Listing listing = currentProgram.getListing();
+        List<String> reasons = new ArrayList<>();
+        JsonObject detail = new JsonObject();
+        detail.addProperty("address", addr.toString());
+        detail.addProperty("auto_disassembled_attempted", autoDisassembled);
+        if (thrownMessage != null) {
+            detail.addProperty("ghidra_exception", thrownMessage);
+        }
+
+        boolean hasInstruction = listing.getInstructionAt(addr) != null;
+        detail.addProperty("has_instruction_at_entry", hasInstruction);
+        if (!hasInstruction) {
+            reasons.add("no instruction landed at entry point even after a disassemble attempt "
+                + "(address may be data, mid-instruction, or in an unmapped memory block)");
+        }
+
+        Function owner = currentProgram.getFunctionManager().getFunctionContaining(addr);
+        if (owner != null) {
+            detail.addProperty("containing_function", owner.getName());
+            detail.addProperty("containing_function_entry", owner.getEntryPoint().toString());
+            detail.addProperty("containing_function_size", owner.getBody().getNumAddresses());
+            reasons.add("address is already inside existing function " + owner.getName()
+                + "@" + owner.getEntryPoint() + " (likely shared code reached by a tail jump, "
+                + "not a call) -- consider `symbol create` for a label instead of a new function");
+        }
+
+        CodeUnit cu = listing.getCodeUnitContaining(addr);
+        if (cu != null) {
+            detail.addProperty("code_unit_range", cu.getMinAddress() + "-" + cu.getMaxAddress());
+            detail.addProperty("code_unit_is_instruction", cu instanceof Instruction);
+            if (!cu.getMinAddress().equals(addr)) {
+                reasons.add("address " + addr + " is mid-code-unit, not the start of "
+                    + cu.getMinAddress() + "-" + cu.getMaxAddress());
+            }
+        }
+
+        if (reasons.isEmpty()) {
+            reasons.add(thrownMessage != null
+                ? "Ghidra rejected the entry point (" + thrownMessage + ") with no other diagnosable cause found"
+                : "Ghidra's FunctionManager.createFunction returned null with no further detail "
+                    + "from the API; entry point may not sit on a valid code unit boundary");
+        }
+
+        JsonObject err = errorResult("Failed to create function at " + addr.toString() + ": "
+            + String.join("; ", reasons));
+        err.add("detail", detail);
+        return err;
     }
 
     private JsonObject handleDeleteFunction(JsonObject args) {
@@ -3056,6 +3162,7 @@ public class GhidraCliBridge extends GhidraScript {
 
         String addressStr = getArgString(args, "address");
         String typeName = getArgString(args, "type_name");
+        boolean force = getArgBool(args, "force", false);
         if (addressStr == null || typeName == null) {
             return errorResult("Address and type_name required");
         }
@@ -3069,11 +3176,19 @@ public class GhidraCliBridge extends GhidraScript {
                 return errorResult("Type not found: " + typeName);
             }
 
+            Listing listing = currentProgram.getListing();
             int txId = currentProgram.startTransaction("Apply type");
             try {
-                Listing listing = currentProgram.getListing();
+                if (force) {
+                    int len = dataType.getLength();
+                    Address clearEnd = len > 0 ? addr.add(len - 1) : addr;
+                    listing.clearCodeUnits(addr, clearEnd, false);
+                }
                 listing.createData(addr, dataType);
                 currentProgram.endTransaction(txId, true);
+            } catch (ghidra.program.model.util.CodeUnitInsertionException e) {
+                currentProgram.endTransaction(txId, false);
+                return typeApplyConflictError(addr, typeName, e);
             } catch (Exception e) {
                 currentProgram.endTransaction(txId, false);
                 throw e;
@@ -3083,10 +3198,42 @@ public class GhidraCliBridge extends GhidraScript {
             result.addProperty("status", "applied");
             result.addProperty("address", addressStr);
             result.addProperty("type", typeName);
+            if (force) result.addProperty("cleared_conflicting", true);
             return result;
         } catch (Exception e) {
             return errorResult("Failed to apply type: " + e.getMessage());
         }
+    }
+
+    /** Surface the conflicting code unit's own type/length/range instead of just "Conflicting data exists". */
+    private JsonObject typeApplyConflictError(Address addr, String typeName, Exception cause) {
+        Listing listing = currentProgram.getListing();
+        CodeUnit cu = listing.getCodeUnitContaining(addr);
+
+        JsonObject detail = new JsonObject();
+        String description = "unknown";
+        if (cu != null) {
+            detail.addProperty("conflicting_start", cu.getMinAddress().toString());
+            detail.addProperty("conflicting_end", cu.getMaxAddress().toString());
+            detail.addProperty("conflicting_length", cu.getLength());
+            if (cu instanceof Instruction) {
+                detail.addProperty("conflicting_kind", "instruction");
+                detail.addProperty("conflicting_mnemonic", ((Instruction) cu).getMnemonicString());
+                description = "an instruction (" + ((Instruction) cu).getMnemonicString() + ")";
+            } else if (cu instanceof Data) {
+                Data d = (Data) cu;
+                detail.addProperty("conflicting_kind", "data");
+                detail.addProperty("conflicting_type", d.getDataType().getName());
+                detail.addProperty("conflicting_defined", d.isDefined());
+                description = (d.isDefined() ? "defined data of type " + d.getDataType().getName()
+                    : "undefined data") + " spanning " + cu.getMinAddress() + "-" + cu.getMaxAddress();
+            }
+        }
+
+        JsonObject err = errorResult("Conflicting data exists at " + addr + " for type " + typeName
+            + ": conflicts with " + description + ". Use --force to clear the conflicting range first.");
+        err.add("detail", detail);
+        return err;
     }
 
     private DataType resolveDataType(String name) {
@@ -3454,6 +3601,137 @@ public class GhidraCliBridge extends GhidraScript {
             return result;
         } catch (Exception e) {
             return errorResult("Failed to set calling convention: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleFunctionSetNoReturn(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+        String target = getArgString(args, "target");
+        boolean value = getArgBool(args, "value", true);
+        if (target == null || target.isEmpty()) return errorResult("target required");
+
+        try {
+            Function func = findFunctionByNameOrAddress(target);
+            if (func == null) return errorResult(buildFunctionTargetHint(target));
+
+            int txId = currentProgram.startTransaction("Set no-return");
+            try {
+                func.setNoReturn(value);
+                currentProgram.endTransaction(txId, true);
+            } catch (Exception e) {
+                currentProgram.endTransaction(txId, false);
+                throw e;
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("status", "noreturn_set");
+            result.addProperty("function", func.getName());
+            result.addProperty("address", func.getEntryPoint().toString());
+            result.addProperty("no_return", func.hasNoReturn());
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to set no-return: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleFunctionTagAdd(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+        String target = getArgString(args, "target");
+        String tagName = getArgString(args, "tag_name");
+        if (target == null || target.isEmpty()) return errorResult("target required");
+        if (tagName == null || tagName.isEmpty()) return errorResult("tag_name required");
+
+        try {
+            Function func = findFunctionByNameOrAddress(target);
+            if (func == null) return errorResult(buildFunctionTargetHint(target));
+
+            int txId = currentProgram.startTransaction("Add function tag");
+            try {
+                func.addTag(tagName);
+                currentProgram.endTransaction(txId, true);
+            } catch (Exception e) {
+                currentProgram.endTransaction(txId, false);
+                throw e;
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("status", "tag_added");
+            result.addProperty("function", func.getName());
+            result.addProperty("address", func.getEntryPoint().toString());
+            result.addProperty("tag", tagName);
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to add tag: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleFunctionTagRemove(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+        String target = getArgString(args, "target");
+        String tagName = getArgString(args, "tag_name");
+        if (target == null || target.isEmpty()) return errorResult("target required");
+        if (tagName == null || tagName.isEmpty()) return errorResult("tag_name required");
+
+        try {
+            Function func = findFunctionByNameOrAddress(target);
+            if (func == null) return errorResult(buildFunctionTargetHint(target));
+
+            int txId = currentProgram.startTransaction("Remove function tag");
+            try {
+                func.removeTag(tagName);
+                currentProgram.endTransaction(txId, true);
+            } catch (Exception e) {
+                currentProgram.endTransaction(txId, false);
+                throw e;
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("status", "tag_removed");
+            result.addProperty("function", func.getName());
+            result.addProperty("address", func.getEntryPoint().toString());
+            result.addProperty("tag", tagName);
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to remove tag: " + e.getMessage());
+        }
+    }
+
+    /** Tags on one function (target given), or every tag definition in the program (no target). */
+    private JsonObject handleFunctionTagList(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+        String target = getArgString(args, "target");
+
+        try {
+            JsonObject result = new JsonObject();
+            if (target != null && !target.isEmpty()) {
+                Function func = findFunctionByNameOrAddress(target);
+                if (func == null) return errorResult(buildFunctionTargetHint(target));
+
+                JsonArray tags = new JsonArray();
+                for (FunctionTag tag : func.getTags()) {
+                    JsonObject t = new JsonObject();
+                    t.addProperty("name", tag.getName());
+                    t.addProperty("comment", tag.getComment());
+                    tags.add(t);
+                }
+                result.addProperty("function", func.getName());
+                result.addProperty("address", func.getEntryPoint().toString());
+                result.add("tags", tags);
+            } else {
+                JsonArray tags = new JsonArray();
+                FunctionTagManager tagManager = currentProgram.getFunctionManager().getFunctionTagManager();
+                for (FunctionTag tag : tagManager.getAllFunctionTags()) {
+                    JsonObject t = new JsonObject();
+                    t.addProperty("name", tag.getName());
+                    t.addProperty("comment", tag.getComment());
+                    t.addProperty("use_count", tagManager.getUseCount(tag));
+                    tags.add(t);
+                }
+                result.add("tags", tags);
+            }
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to list tags: " + e.getMessage());
         }
     }
 
@@ -4254,27 +4532,7 @@ public class GhidraCliBridge extends GhidraScript {
             Instruction current = instruction;
 
             for (int i = 0; i < count && current != null; i++) {
-                Address instrAddr = current.getAddress();
-                byte[] byteArray = current.getBytes();
-                StringBuilder bytesHex = new StringBuilder();
-                for (byte b : byteArray) {
-                    bytesHex.append(String.format("%02x", b & 0xff));
-                }
-
-                String mnemonic = current.getMnemonicString();
-                JsonArray operands = new JsonArray();
-                int numOperands = current.getNumOperands();
-                for (int j = 0; j < numOperands; j++) {
-                    operands.add(new JsonPrimitive(current.getDefaultOperandRepresentation(j)));
-                }
-
-                JsonObject instrData = new JsonObject();
-                instrData.addProperty("address", instrAddr.toString());
-                instrData.addProperty("bytes", bytesHex.toString());
-                instrData.addProperty("mnemonic", mnemonic);
-                instrData.add("operands", operands);
-                results.add(instrData);
-
+                results.add(instructionToJson(current));
                 current = current.getNext();
             }
 
@@ -4284,6 +4542,152 @@ public class GhidraCliBridge extends GhidraScript {
             return result;
         } catch (Exception e) {
             return errorResult("Failed to disassemble: " + e.getMessage());
+        }
+    }
+
+    private JsonObject instructionToJson(Instruction instr) throws MemoryAccessException {
+        byte[] byteArray = instr.getBytes();
+        StringBuilder bytesHex = new StringBuilder();
+        for (byte b : byteArray) {
+            bytesHex.append(String.format("%02x", b & 0xff));
+        }
+
+        JsonArray operands = new JsonArray();
+        int numOperands = instr.getNumOperands();
+        for (int j = 0; j < numOperands; j++) {
+            operands.add(new JsonPrimitive(instr.getDefaultOperandRepresentation(j)));
+        }
+
+        JsonObject instrData = new JsonObject();
+        instrData.addProperty("address", instr.getAddress().toString());
+        instrData.addProperty("bytes", bytesHex.toString());
+        instrData.addProperty("mnemonic", instr.getMnemonicString());
+        instrData.add("operands", operands);
+        return instrData;
+    }
+
+    /**
+     * Disassemble at ADDRESS if no instruction is there yet (auto-analysis
+     * often never reaches computed-jump targets / inline-table resume
+     * addresses), then report whether an instruction actually landed there --
+     * disassemble() can return false, or even true while the target still has
+     * no instruction, with no exception either way.
+     */
+    private JsonObject handleDisasmAt(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+
+        String addressStr = getArgString(args, "address");
+        int count = getArgInt(args, "count", 1);
+        if (addressStr == null || addressStr.isEmpty()) {
+            return errorResult("Address required");
+        }
+
+        try {
+            Address addr = resolveAddress(addressStr);
+            if (addr == null) return errorResult("Invalid address: " + addressStr);
+
+            Listing listing = currentProgram.getListing();
+            boolean alreadyPresent = listing.getInstructionAt(addr) != null;
+            boolean ok = alreadyPresent;
+
+            int txId = currentProgram.startTransaction("Disassemble at address");
+            try {
+                if (!alreadyPresent) {
+                    ok = disassemble(addr);
+                }
+                currentProgram.endTransaction(txId, true);
+            } catch (Exception e) {
+                currentProgram.endTransaction(txId, false);
+                throw e;
+            }
+
+            boolean landed = listing.getInstructionAt(addr) != null;
+
+            JsonObject result = new JsonObject();
+            result.addProperty("address", addr.toString());
+            result.addProperty("already_disassembled", alreadyPresent);
+            result.addProperty("ok", ok);
+            result.addProperty("landed", landed);
+            result.addProperty("status", landed ? "disassembled" : "failed");
+
+            if (landed) {
+                JsonArray instrs = new JsonArray();
+                Instruction current = listing.getInstructionAt(addr);
+                for (int i = 0; i < count && current != null; i++) {
+                    instrs.add(instructionToJson(current));
+                    current = current.getNext();
+                }
+                result.add("instructions", instrs);
+            } else {
+                Function owner = currentProgram.getFunctionManager().getFunctionContaining(addr);
+                if (owner != null) {
+                    result.addProperty("hint", "Address falls inside existing function "
+                        + owner.getName() + "@" + owner.getEntryPoint()
+                        + "; stale/overlapping instructions may be blocking disassembly. Try `ghidra clear` first.");
+                }
+            }
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to disassemble at " + addressStr + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Clear all code units overlapping [start, end] (retroactively undoing
+     * auto-analysis that linearly disassembled through inline data), optionally
+     * re-disassembling at a precise address in the same call.
+     */
+    private JsonObject handleClearRange(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+
+        String startStr = getArgString(args, "start");
+        String endStr = getArgString(args, "end");
+        String disasmAtStr = getArgString(args, "disasm_at");
+        if (startStr == null || endStr == null) {
+            return errorResult("start and end addresses required");
+        }
+
+        try {
+            Address start = resolveAddress(startStr);
+            if (start == null) return errorResult("Invalid start address: " + startStr);
+            Address end = resolveAddress(endStr);
+            if (end == null) return errorResult("Invalid end address: " + endStr);
+
+            Address disasmAt = null;
+            if (disasmAtStr != null && !disasmAtStr.isEmpty()) {
+                disasmAt = resolveAddress(disasmAtStr);
+                if (disasmAt == null) return errorResult("Invalid disasm_at address: " + disasmAtStr);
+            }
+
+            JsonObject result = new JsonObject();
+            int txId = currentProgram.startTransaction("Clear code units");
+            try {
+                clearListing(start, end);
+                result.addProperty("status", "cleared");
+                result.addProperty("start", start.toString());
+                result.addProperty("end", end.toString());
+
+                if (disasmAt != null) {
+                    boolean ok = disassemble(disasmAt);
+                    boolean landed = currentProgram.getListing().getInstructionAt(disasmAt) != null;
+                    result.addProperty("disasm_at", disasmAt.toString());
+                    result.addProperty("ok", ok);
+                    result.addProperty("landed", landed);
+                    result.addProperty("status", (ok && landed) ? "cleared_and_disassembled" : "cleared_disasm_incomplete");
+                    if (!landed) {
+                        result.addProperty("hint", "clearEnd may need to extend further past disasm_at: "
+                            + "disassemble() can silently land no instruction if the new instruction's "
+                            + "tail bytes would still overlap a stale code unit outside the cleared range.");
+                    }
+                }
+                currentProgram.endTransaction(txId, true);
+            } catch (Exception e) {
+                currentProgram.endTransaction(txId, false);
+                throw e;
+            }
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to clear range: " + e.getMessage());
         }
     }
 
@@ -4359,13 +4763,41 @@ public class GhidraCliBridge extends GhidraScript {
 
     private JsonObject handleScriptRun(JsonObject args) {
         String scriptPath = getArgString(args, "path");
-        if (scriptPath == null) return errorResult("Script path required");
+        String inlineSource = getArgString(args, "source");
+        if ((scriptPath == null || scriptPath.isEmpty()) && (inlineSource == null || inlineSource.isEmpty())) {
+            return errorResult("Script path or inline source required");
+        }
 
-        // Resolve to an absolute path so the script is found regardless of the
-        // working directory the bridge JVM inherited. This removes the RE-repo
-        // workaround of copying scripts into a global scripts directory.
-        File scriptFile = new File(scriptPath).getAbsoluteFile();
-        if (!scriptFile.exists()) return errorResult("Script not found: " + scriptFile.getPath());
+        File scriptFile;
+        File tempDir = null;
+        if (inlineSource != null && !inlineSource.isEmpty()) {
+            // Stdin-sourced one-offs (`ghidra script run -`): stage the source into a
+            // temp file and run it through the exact same compile/execute path as a
+            // file on disk, rather than eval'ing it directly -- this is what keeps
+            // inline snippets going through Ghidra's normal script bundle/compile gate
+            // instead of adding a second, less-sandboxed execution path.
+            Matcher classMatch = Pattern.compile("public\\s+class\\s+(\\w+)").matcher(inlineSource);
+            if (!classMatch.find()) {
+                return errorResult("Inline script source must define `public class <Name> extends GhidraScript`");
+            }
+            String className = classMatch.group(1);
+            try {
+                tempDir = java.nio.file.Files.createTempDirectory("ghidra-cli-stdin-script").toFile();
+                scriptFile = new File(tempDir, className + ".java");
+                try (FileWriter fw = new FileWriter(scriptFile)) {
+                    fw.write(inlineSource);
+                }
+            } catch (IOException e) {
+                return errorResult("Failed to stage inline script: " + e.getMessage());
+            }
+        } else {
+            // Resolve to an absolute path so the script is found regardless of the
+            // working directory the bridge JVM inherited. This removes the RE-repo
+            // workaround of copying scripts into a global scripts directory.
+            scriptFile = new File(scriptPath).getAbsoluteFile();
+            if (!scriptFile.exists()) return errorResult("Script not found: " + scriptFile.getPath());
+        }
+        final File cleanupTempDir = tempDir;
 
         String[] scriptArgs = getArgStringArray(args, "args");
         ResourceFile source = new ResourceFile(scriptFile);
@@ -4438,6 +4870,11 @@ public class GhidraCliBridge extends GhidraScript {
             JsonObject err = errorResult("Script threw: " + e.getMessage());
             err.addProperty("stdout", buffer.toString());
             return err;
+        } finally {
+            if (cleanupTempDir != null) {
+                scriptFile.delete();
+                cleanupTempDir.delete();
+            }
         }
     }
 
@@ -4573,11 +5010,18 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private JsonObject handleScriptJava(JsonObject args) {
-        return errorResult("Inline Java execution not supported in bridge mode");
+        return errorResult("Inline Java execution (`script java`) is disabled by design: every script, "
+            + "including one-offs, is required to go through Ghidra's normal script bundle/compile gate "
+            + "(GhidraScriptProvider.getScriptInstance) rather than a second, less-sandboxed eval path. "
+            + "For a throwaway snippet without a checked-in file, use `ghidra script run -` and pipe the "
+            + "Java source on stdin -- it is staged to a temp file and compiled through the same path.");
     }
 
     private JsonObject handleScriptPython(JsonObject args) {
-        return errorResult("Python execution not available (Java bridge replaces Python bridge)");
+        return errorResult("Python execution is not available: the Java bridge replaces the old Python "
+            + "bridge.py entirely, and there is no embedded Python interpreter in this process. Port the "
+            + "logic to a Java GhidraScript and use `ghidra script run PATH`, or `ghidra script run -` "
+            + "for a one-off piped via stdin.");
     }
 
     private JsonObject handleScriptList() {

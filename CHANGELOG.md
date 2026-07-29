@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ghidra disasm-at ADDRESS [--count N]` — disassemble at an address,
+  disassembling first if no instruction is there yet, and report whether an
+  instruction actually landed there (`ok`/`landed`), since `disassemble()` can
+  report success with nothing landing at the target.
+- `ghidra function create ADDRESS [NAME]` now auto-disassembles at the target
+  first if no instruction exists there, instead of failing outright.
+- `ghidra clear START:END [--to-data] [--disasm-at ADDR]` — clear code units
+  overlapping a range (undoes auto-analysis that mis-disassembled through
+  inline data), optionally re-disassembling at a precise address in the same
+  call.
+- `ghidra function set-noreturn TARGET [--value true|false]` — mark a function
+  as never returning to its call site. `no_return` and `tags` are now included
+  in `function get`/`function list` output.
+- `ghidra function tag add/remove/list TARGET TAG_NAME` and
+  `ghidra function list --tag TAG_NAME` — native function tagging
+  (Ghidra's `FunctionTagManager`/`Function.addTag`), replacing the
+  `[subsys:name]` PLATE-comment convention some projects used as a workaround.
+- `ghidra script run -` reads Java source from stdin for one-off scripts
+  (staged to a temp file and compiled through the same path as a file on
+  disk), so a throwaway snippet no longer needs a checked-in file.
+  `ghidra doctor` now documents why `script python`/`script java` (inline
+  eval) stay disabled.
+- `ghidra type apply ADDRESS TYPE --force` (alias `--clear-conflicting`)
+  clears a conflicting data unit first instead of failing on it.
+- `ghidra comment set ADDRESS --stdin` / `--text-file PATH` read comment text
+  outside the shell argument, avoiding silent corruption from shell
+  metacharacter expansion (e.g. backticks) in free-form prose.
+- Structured error detail for three previously-opaque failures — `function
+  create` on an address already owned by another function (owner
+  name/entry/size), `function create` when `createFunction` returns `null` or
+  throws (diagnoses no-instruction vs. inside-existing-function vs.
+  mid-code-unit causes), and `type apply` "Conflicting data exists" (the
+  conflicting unit's kind/type/range). Printed as JSON with `-vv`/`--json`.
+
 - **Responsive control plane with a real job queue.** Socket handling is now split
   from Ghidra program execution. `ping`, `status`, `bridge_info`, `jobs`, and
   `cancel` answer immediately from thread-safe snapshots while a long

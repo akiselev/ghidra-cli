@@ -60,6 +60,11 @@ fn main() {
         .with(stdout_layer)
         .init();
 
+    // Captured before `cli` is moved into whichever arm handles it below;
+    // needed after the match to decide how verbosely to print error detail.
+    let verbose = cli.verbose;
+    let json_requested = cli.json;
+
     let result = match &cli.command {
         Commands::Setup(_) => {
             // Setup needs async for downloading
@@ -81,6 +86,18 @@ fn main() {
 
     if let Err(e) = result {
         eprintln!("Error: {}", e);
+        // Bridge errors that carry structured detail (e.g. the containing
+        // function's name/entry/size on "function already exists", or the
+        // conflicting data unit's type/range on a `type apply` conflict) print
+        // it as JSON so callers can act on it without a follow-up round trip.
+        // Gated to -vv+/--json to keep the common-case error terse.
+        if let Some(bce) = e.downcast_ref::<ipc::protocol::BridgeCommandError>() {
+            if verbose >= 2 || json_requested {
+                if let Ok(pretty) = serde_json::to_string_pretty(&bce.detail) {
+                    eprintln!("Detail: {}", pretty);
+                }
+            }
+        }
         std::process::exit(1);
     }
 }
@@ -141,6 +158,8 @@ fn requires_bridge(command: &Commands) -> bool {
             | Commands::Patch(_)
             | Commands::Script(_)
             | Commands::Disasm(_)
+            | Commands::DisasmAt(_)
+            | Commands::Clear(_)
             | Commands::Batch(_)
             | Commands::Stats(_)
             | Commands::Program(_)
@@ -157,7 +176,7 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
         Commands::Summary(args) => args.options.project.clone(),
         Commands::Decompile(args) => args.options.project.clone(),
         Commands::Function(cmd) => match cmd {
-            cli::FunctionCommands::List(opts) => opts.project.clone(),
+            cli::FunctionCommands::List(args) => args.options.project.clone(),
             cli::FunctionCommands::Decompile(args) => args.options.project.clone(),
             cli::FunctionCommands::Get(args) => args.options.project.clone(),
             cli::FunctionCommands::Disasm(args) => args.options.project.clone(),
@@ -170,6 +189,12 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
             cli::FunctionCommands::SetReturnType(args) => args.project.clone(),
             cli::FunctionCommands::SetCallingConvention(args) => args.project.clone(),
             cli::FunctionCommands::SetVarType(args) => args.project.clone(),
+            cli::FunctionCommands::SetNoReturn(args) => args.project.clone(),
+            cli::FunctionCommands::Tag(cmd) => match cmd {
+                cli::FunctionTagCommands::Add(args) => args.project.clone(),
+                cli::FunctionTagCommands::Remove(args) => args.project.clone(),
+                cli::FunctionTagCommands::List(args) => args.options.project.clone(),
+            },
         },
         Commands::Strings(cmd) => match cmd {
             cli::StringsCommands::List(opts) => opts.project.clone(),
@@ -194,6 +219,8 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
         },
         Commands::Stats(args) => args.options.project.clone(),
         Commands::Disasm(args) => args.options.project.clone(),
+        Commands::DisasmAt(args) => args.project.clone(),
+        Commands::Clear(args) => args.project.clone(),
         Commands::Find(cmd) => match cmd {
             cli::FindCommands::String(args) => args.options.project.clone(),
             cli::FindCommands::Bytes(args) => args.options.project.clone(),
@@ -272,7 +299,7 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
         Commands::Summary(args) => args.options.program.clone(),
         Commands::Decompile(args) => args.options.program.clone(),
         Commands::Function(cmd) => match cmd {
-            cli::FunctionCommands::List(opts) => opts.program.clone(),
+            cli::FunctionCommands::List(args) => args.options.program.clone(),
             cli::FunctionCommands::Decompile(args) => args.options.program.clone(),
             cli::FunctionCommands::Get(args) => args.options.program.clone(),
             cli::FunctionCommands::Disasm(args) => args.options.program.clone(),
@@ -285,6 +312,12 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
             cli::FunctionCommands::SetReturnType(args) => args.program.clone(),
             cli::FunctionCommands::SetCallingConvention(args) => args.program.clone(),
             cli::FunctionCommands::SetVarType(args) => args.program.clone(),
+            cli::FunctionCommands::SetNoReturn(args) => args.program.clone(),
+            cli::FunctionCommands::Tag(cmd) => match cmd {
+                cli::FunctionTagCommands::Add(args) => args.program.clone(),
+                cli::FunctionTagCommands::Remove(args) => args.program.clone(),
+                cli::FunctionTagCommands::List(args) => args.options.program.clone(),
+            },
         },
         Commands::Strings(cmd) => match cmd {
             cli::StringsCommands::List(opts) => opts.program.clone(),
@@ -309,6 +342,8 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
         },
         Commands::Stats(args) => args.options.program.clone(),
         Commands::Disasm(args) => args.options.program.clone(),
+        Commands::DisasmAt(args) => args.program.clone(),
+        Commands::Clear(args) => args.program.clone(),
         Commands::Find(cmd) => match cmd {
             cli::FindCommands::String(args) => args.options.program.clone(),
             cli::FindCommands::Bytes(args) => args.options.program.clone(),
@@ -393,13 +428,16 @@ fn extract_query_options(command: &Commands) -> Option<QueryOptions> {
         Commands::Disasm(args) => Some(args.options.clone()),
         Commands::Stats(args) => Some(args.options.clone()),
         Commands::Function(cmd) => match cmd {
-            cli::FunctionCommands::List(opts) => Some(opts.clone()),
+            cli::FunctionCommands::List(args) => Some(args.options.clone()),
             cli::FunctionCommands::Get(args) => Some(args.options.clone()),
             cli::FunctionCommands::Decompile(args) => Some(args.options.clone()),
             cli::FunctionCommands::Disasm(args) => Some(args.options.clone()),
             cli::FunctionCommands::Calls(args) => Some(args.options.clone()),
             cli::FunctionCommands::XRefs(args) => Some(args.options.clone()),
             cli::FunctionCommands::Delete(args) => Some(args.options.clone()),
+            cli::FunctionCommands::Tag(cli::FunctionTagCommands::List(args)) => {
+                Some(args.options.clone())
+            }
             _ => None,
         },
         Commands::Strings(cmd) => match cmd {
@@ -786,6 +824,27 @@ fn parse_expect_spec(spec: &str) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
+/// Resolve `comment set`'s text from `--stdin`, `--text-file`, or the TEXT
+/// positional (in that priority order; clap already rejects combining them).
+/// Reading from stdin/a file bypasses the shell entirely, so callers building
+/// comment text programmatically never risk the metacharacter-expansion
+/// corruption a shell argument is exposed to (e.g. backticks silently running
+/// as command substitution before ghidra-cli ever sees the string).
+fn resolve_comment_text(args: &cli::CommentSetArgs) -> anyhow::Result<String> {
+    if args.stdin {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+        Ok(buf)
+    } else if let Some(path) = &args.text_file {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read --text-file {}: {}", path.display(), e))
+    } else {
+        args.text
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("TEXT argument required (or use --stdin / --text-file)"))
+    }
+}
+
 /// The bridge's list handlers only support a literal substring match on the
 /// primary name field, not the full filter DSL implemented client-side in
 /// `query::Filter`. When a full filter expression, sort, or count is requested,
@@ -874,7 +933,8 @@ fn execute_via_bridge(
         Commands::Function(cmd) => {
             use cli::FunctionCommands;
             match cmd {
-                FunctionCommands::List(opts) => {
+                FunctionCommands::List(args) => {
+                    let opts = &args.options;
                     let (lim, filt) = bridge_list_params(
                         opts.limit,
                         opts.filter.clone(),
@@ -883,7 +943,7 @@ fn execute_via_bridge(
                         opts.offset,
                         default_limit,
                     );
-                    client.list_functions(lim, filt)
+                    client.list_functions_with_tag(lim, filt, args.tag.as_deref())
                 }
                 FunctionCommands::Decompile(args) => client.decompile(
                     args.resolved_target().to_string(),
@@ -948,6 +1008,23 @@ fn execute_via_bridge(
                         "type_name": args.type_name,
                     })),
                 ),
+                FunctionCommands::SetNoReturn(args) => {
+                    client.function_set_noreturn(args.resolved_target(), args.value)
+                }
+                FunctionCommands::Tag(cmd) => {
+                    use cli::FunctionTagCommands;
+                    match cmd {
+                        FunctionTagCommands::Add(args) => {
+                            client.function_tag_add(&args.target, &args.tag_name)
+                        }
+                        FunctionTagCommands::Remove(args) => {
+                            client.function_tag_remove(&args.target, &args.tag_name)
+                        }
+                        FunctionTagCommands::List(args) => {
+                            client.function_tag_list(args.target.as_deref())
+                        }
+                    }
+                }
             }
         }
         Commands::Strings(cmd) => {
@@ -1096,7 +1173,9 @@ fn execute_via_bridge(
                 }
                 TypeCommands::Get(args) => client.type_get(&args.name),
                 TypeCommands::Create(args) => client.type_create(&args.definition),
-                TypeCommands::Apply(args) => client.type_apply(&args.address, &args.type_name),
+                TypeCommands::Apply(args) => {
+                    client.type_apply_force(&args.address, &args.type_name, args.force)
+                }
                 TypeCommands::Delete(args) => {
                     client.send_command("type_delete", Some(json!({"name": args.name})))
                 }
@@ -1154,7 +1233,8 @@ fn execute_via_bridge(
                 }
                 CommentCommands::Get(args) => client.comment_get(&args.address),
                 CommentCommands::Set(args) => {
-                    client.comment_set(&args.address, &args.text, args.comment_type.as_deref())
+                    let text = resolve_comment_text(args)?;
+                    client.comment_set(&args.address, &text, args.comment_type.as_deref())
                 }
                 CommentCommands::Delete(args) => client.comment_delete(&args.address),
             }
@@ -1204,16 +1284,26 @@ fn execute_via_bridge(
             use cli::ScriptCommands;
             match cmd {
                 ScriptCommands::Run(args) => {
-                    // Canonicalize client-side so the bridge receives an absolute
-                    // path independent of the working directory its JVM inherited.
-                    // Fall back to the raw path if the file is missing; the bridge
-                    // then reports a clear "Script not found".
-                    let path = std::fs::canonicalize(&args.script_path)
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| args.script_path.clone());
                     let expect: Vec<serde_json::Value> =
                         args.expect.iter().map(|s| parse_expect_spec(s)).collect();
-                    client.script_run(&path, &args.args, &expect, args.allow_empty)
+                    if args.script_path == "-" {
+                        // Read a one-off script's Java source from stdin so a
+                        // throwaway snippet doesn't need a checked-in file; the
+                        // bridge stages it to a temp file and runs it through the
+                        // same compile/execute path as `script run PATH`.
+                        let mut source = String::new();
+                        std::io::Read::read_to_string(&mut std::io::stdin(), &mut source)?;
+                        client.script_run_source(&source, &args.args, &expect, args.allow_empty)
+                    } else {
+                        // Canonicalize client-side so the bridge receives an absolute
+                        // path independent of the working directory its JVM inherited.
+                        // Fall back to the raw path if the file is missing; the bridge
+                        // then reports a clear "Script not found".
+                        let path = std::fs::canonicalize(&args.script_path)
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| args.script_path.clone());
+                        client.script_run(&path, &args.args, &expect, args.allow_empty)
+                    }
                 }
                 ScriptCommands::Python(args) => client.script_python(&args.code),
                 ScriptCommands::Java(args) => client.script_java(&args.code),
@@ -1221,6 +1311,16 @@ fn execute_via_bridge(
             }
         }
         Commands::Disasm(args) => client.disasm(args.resolved_target(), args.num_instructions),
+        Commands::DisasmAt(args) => client.disasm_at(&args.address, args.count),
+        Commands::Clear(args) => {
+            let (start, end) = args.range.split_once(':').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid range '{}': expected START:END, e.g. 0bf3:0bfa",
+                    args.range
+                )
+            })?;
+            client.clear_range(start, end, args.disasm_at.as_deref())
+        }
         Commands::Batch(args) => {
             // Read batch file and execute each command locally
             let content = std::fs::read_to_string(&args.script_file)
@@ -1806,6 +1906,15 @@ fn handle_doctor(projects_dir: &Option<PathBuf>) -> anyhow::Result<()> {
             println!("  Error: {}", e);
         }
     }
+
+    println!("\nScript execution modes:");
+    println!("  `ghidra script run PATH`  — compiles & runs a file on disk");
+    println!("  `ghidra script run -`     — reads Java source from stdin for one-offs;");
+    println!("                              staged to a temp file, same compile/execute path as PATH");
+    println!("  `ghidra script python/java <code>` — disabled by design, not a bug: every script,");
+    println!("                              including one-offs, is required to go through Ghidra's");
+    println!("                              normal script bundle/compile gate rather than a second,");
+    println!("                              less-sandboxed eval path. Use `script run -` instead.");
 
     println!("\nDone!");
     Ok(())

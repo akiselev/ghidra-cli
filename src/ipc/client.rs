@@ -11,7 +11,7 @@ use anyhow::Result;
 use serde_json::json;
 use tracing::debug;
 
-use super::protocol::{BridgeRequest, BridgeResponse};
+use super::protocol::{BridgeCommandError, BridgeRequest, BridgeResponse};
 
 /// Default socket read timeout for short, interactive commands, in seconds.
 ///
@@ -230,7 +230,14 @@ impl BridgeClient {
                 let msg = response
                     .message
                     .unwrap_or_else(|| "Unknown error".to_string());
-                anyhow::bail!("{}", msg)
+                match response.detail {
+                    Some(detail) if !detail.is_null() => Err(BridgeCommandError {
+                        message: msg,
+                        detail,
+                    }
+                    .into()),
+                    _ => anyhow::bail!("{}", msg),
+                }
             }
             "shutdown" => Ok(json!({"status": "shutdown"})),
             _ => Ok(response.data.unwrap_or(json!({}))),
@@ -280,9 +287,19 @@ impl BridgeClient {
         limit: Option<usize>,
         filter: Option<String>,
     ) -> Result<serde_json::Value> {
+        self.list_functions_with_tag(limit, filter, None)
+    }
+
+    /// List functions, optionally restricted to those carrying `tag`.
+    pub fn list_functions_with_tag(
+        &self,
+        limit: Option<usize>,
+        filter: Option<String>,
+        tag: Option<&str>,
+    ) -> Result<serde_json::Value> {
         self.send_command(
             "list_functions",
-            Some(json!({"limit": limit, "filter": filter})),
+            Some(json!({"limit": limit, "filter": filter, "tag": tag})),
         )
     }
 
@@ -428,10 +445,17 @@ impl BridgeClient {
         self.send_command("type_create", Some(json!({"definition": definition})))
     }
 
-    pub fn type_apply(&self, address: &str, type_name: &str) -> Result<serde_json::Value> {
+    /// Apply a type at an address. With `force`, clears any conflicting data
+    /// unit first instead of failing on it.
+    pub fn type_apply_force(
+        &self,
+        address: &str,
+        type_name: &str,
+        force: bool,
+    ) -> Result<serde_json::Value> {
         self.send_command(
             "type_apply",
-            Some(json!({"address": address, "type_name": type_name})),
+            Some(json!({"address": address, "type_name": type_name, "force": force})),
         )
     }
 
@@ -556,6 +580,54 @@ impl BridgeClient {
         )
     }
 
+    /// Disassemble at `address`, disassembling first if no instruction is
+    /// there yet. Returns `ok`/`landed` booleans plus the resulting
+    /// instructions (up to `count`).
+    pub fn disasm_at(&self, address: &str, count: Option<usize>) -> Result<serde_json::Value> {
+        self.send_command("disasm_at", Some(json!({"address": address, "count": count})))
+    }
+
+    /// Clear all code units overlapping `[start, end]`, optionally
+    /// re-disassembling at `disasm_at` in the same call.
+    pub fn clear_range(
+        &self,
+        start: &str,
+        end: &str,
+        disasm_at: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        self.send_command(
+            "clear_range",
+            Some(json!({"start": start, "end": end, "disasm_at": disasm_at})),
+        )
+    }
+
+    pub fn function_set_noreturn(&self, target: &str, value: bool) -> Result<serde_json::Value> {
+        self.send_command(
+            "function_set_noreturn",
+            Some(json!({"target": target, "value": value})),
+        )
+    }
+
+    pub fn function_tag_add(&self, target: &str, tag_name: &str) -> Result<serde_json::Value> {
+        self.send_command(
+            "function_tag_add",
+            Some(json!({"target": target, "tag_name": tag_name})),
+        )
+    }
+
+    pub fn function_tag_remove(&self, target: &str, tag_name: &str) -> Result<serde_json::Value> {
+        self.send_command(
+            "function_tag_remove",
+            Some(json!({"target": target, "tag_name": tag_name})),
+        )
+    }
+
+    /// Tags on one function, or every tag definition in the program if
+    /// `target` is `None`.
+    pub fn function_tag_list(&self, target: Option<&str>) -> Result<serde_json::Value> {
+        self.send_command("function_tag_list", Some(json!({"target": target})))
+    }
+
     pub fn stats(&self) -> Result<serde_json::Value> {
         self.send_command("stats", None)
     }
@@ -567,7 +639,30 @@ impl BridgeClient {
         expect: &[serde_json::Value],
         allow_empty: bool,
     ) -> Result<serde_json::Value> {
-        let mut payload = json!({"path": script_path, "args": args});
+        let payload = json!({"path": script_path, "args": args});
+        self.script_run_payload(payload, expect, allow_empty)
+    }
+
+    /// Run a script whose Java source was read client-side (e.g. from stdin)
+    /// instead of loaded from a path on disk. The bridge compiles it the same
+    /// way as `script_run`, just staged from a temp file server-side.
+    pub fn script_run_source(
+        &self,
+        source: &str,
+        args: &[String],
+        expect: &[serde_json::Value],
+        allow_empty: bool,
+    ) -> Result<serde_json::Value> {
+        let payload = json!({"source": source, "args": args});
+        self.script_run_payload(payload, expect, allow_empty)
+    }
+
+    fn script_run_payload(
+        &self,
+        mut payload: serde_json::Value,
+        expect: &[serde_json::Value],
+        allow_empty: bool,
+    ) -> Result<serde_json::Value> {
         if !expect.is_empty() {
             payload["expect"] = serde_json::Value::Array(expect.to_vec());
             payload["allow_empty"] = json!(allow_empty);
