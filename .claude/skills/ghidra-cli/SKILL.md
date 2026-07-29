@@ -122,14 +122,29 @@ ghidra function set-signature TARGET --signature "int foo(int x, char *y)" [--pr
 ghidra function set-return-type TARGET --type TYPE [--project P] [--program PROG]
 ghidra function set-calling-convention TARGET --convention CC [--project P] [--program PROG]
 ghidra function set-var-type TARGET --var VARNAME --type TYPE [--project P] [--program PROG]
+ghidra function set-noreturn TARGET [--value true|false] [--project P] [--program PROG]
+ghidra function tag add TARGET TAG_NAME [--project P] [--program PROG]
+ghidra function tag remove TARGET TAG_NAME [--project P] [--program PROG]
+ghidra function tag list [TARGET] [QUERY_OPTS]   # tags on one function, or every tag definition
+ghidra function list --tag TAG_NAME [QUERY_OPTS] # filter by tag
 ```
+
+`function create` auto-disassembles at ADDRESS first if no instruction is there yet — no need to call `disasm-at` first in the common case. `function get`/`function list` output includes `no_return` and `tags` fields.
+
+If `function create` fails, the error carries structured detail (visible with `-vv` or `--json`): an "already exists" error includes the containing function's `name`/`entry_point`/`size`; a `createFunction` rejection includes `has_instruction_at_entry`, `containing_function`, `code_unit_range`, and (if Ghidra threw rather than returned null) `ghidra_exception`.
 
 ### Top-level Shortcuts
 
 ```bash
 ghidra decompile TARGET [--with-vars] [--with-params] [QUERY_OPTS]   # aliases: decomp, dec
 ghidra disasm TARGET [-n COUNT] [QUERY_OPTS]   # TARGET = name or 0xADDRESS; aliases: disassemble, dis
+ghidra disasm-at ADDRESS [--count N] [--project P] [--program PROG]
+ghidra clear START:END [--to-data] [--disasm-at ADDR] [--project P] [--program PROG]
 ```
+
+`disasm-at` disassembles at ADDRESS if nothing is there yet (the common case for computed-jump targets static analysis never reached) and reports `ok`/`landed` booleans plus the resulting instructions — check `landed`, not just `ok`: `disassemble()` can report success with no instruction actually at the target.
+
+`clear` wraps `clearCodeUnits` for stale/wrong instructions (e.g. auto-analysis linearly disassembled through inline data): `clear START:END --to-data` clears and leaves the range as undefined data; `clear START:END --disasm-at ADDR` clears then immediately re-disassembles at a precise address in one call, reporting `ok`/`landed` the same way as `disasm-at`.
 
 `--with-vars` includes local variable details (name, type, storage) in the response.
 `--with-params` includes parameter details (name, type, storage) in the response.
@@ -177,7 +192,7 @@ ghidra x-ref list TARGET [QUERY_OPTS]   # refs both to and from the target
 ghidra type list [QUERY_OPTS]               # alias: types  (includes "kind" field: struct/union/enum/typedef/pointer/array/other)
 ghidra type get NAME [QUERY_OPTS]           # shows struct fields, enum members, typedef base type, kind
 ghidra type create DEFINITION [--project P] [--program PROG]        # create empty struct
-ghidra type apply ADDRESS TYPE_NAME [--project P] [--program PROG]
+ghidra type apply ADDRESS TYPE_NAME [--force] [--project P] [--program PROG]  # --force/--clear-conflicting clears a conflicting data unit first
 ghidra type delete NAME [--project P] [--program PROG]              # alias: rm
 ghidra type rename OLD NEW [--project P] [--program PROG]           # alias: mv
 ghidra type create-enum NAME --values "A=0,B=1,C=2" [--size 4] [--project P] [--program PROG]
@@ -186,16 +201,22 @@ ghidra type add-field STRUCT_NAME --name FIELD --type TYPE [--offset N] [--size 
 ghidra type del-field STRUCT_NAME --name FIELD [--project P] [--program PROG]
 ```
 
+A `type apply` "Conflicting data exists" error carries structured detail (`-vv`/`--json`): the conflicting unit's kind (instruction/data), type name, and address range. Pass `--force` to clear it and retry in one call instead of a manual `clear` first.
+
 ### Comment Operations
 
 ```bash
 ghidra comment list [QUERY_OPTS]            # alias: comments
 ghidra comment get ADDRESS [QUERY_OPTS]
 ghidra comment set ADDRESS TEXT [--comment-type TYPE] [--project P] [--program PROG]
+ghidra comment set ADDRESS --stdin [--comment-type TYPE] [--project P] [--program PROG]         # read text from stdin
+ghidra comment set ADDRESS --text-file PATH [--comment-type TYPE] [--project P] [--program PROG] # read text from a file
 ghidra comment delete ADDRESS [QUERY_OPTS]
 ```
 
 `--comment-type` takes `EOL` (default), `PRE`, `POST`, or `PLATE`.
+
+Prefer `--stdin`/`--text-file` over a TEXT shell argument for anything programmatically generated: a shell argument is subject to metacharacter expansion (backticks, `$…`) *before* ghidra-cli ever sees the string, which can silently corrupt the comment while `comment set` still reports success. `--stdin`/`--text-file` bypass the shell entirely.
 
 ### Search / Find
 
@@ -247,12 +268,15 @@ ghidra patch export -o OUTPUT [--project P] [--program PROG]
 
 ```bash
 ghidra script run PATH [--expect PATH[:MIN_ROWS]]... [--allow-empty] [--project P] [--program PROG] [-- ARGS...]
-ghidra script python CODE [--project P] [--program PROG]
-ghidra script java CODE [--project P] [--program PROG]
+ghidra script run - [-- ARGS...] < script.java   # read Java source from stdin for a one-off
+ghidra script python CODE [--project P] [--program PROG]   # disabled by design; use `script run -`
+ghidra script java CODE [--project P] [--program PROG]     # disabled by design; use `script run -`
 ghidra script list
 ```
 
 `script run` resolves PATH to an absolute location, forwards the args after `--` to the script as real positional arguments, and captures stdout in the response (`{script, path, stdout, args}`). `--expect PATH[:MIN_ROWS]` (repeatable) fails the job if that artifact is missing, empty, or below MIN_ROWS; `--allow-empty` lets an expected artifact exist while empty. Scripts run on the cancellable job lane, so `ghidra cancel` works on them.
+
+`script run -` reads a `public class <Name> extends GhidraScript { ... }` body from stdin for a throwaway one-off that doesn't warrant a checked-in file — it's staged to a temp file server-side and compiled through the exact same path as `script run PATH`. `script python`/`script java` (true inline eval) stay disabled on purpose (see `ghidra doctor`): every script is required to go through Ghidra's normal compile gate rather than a second, less-sandboxed eval path.
 
 ### Batch
 

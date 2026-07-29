@@ -106,6 +106,15 @@ pub enum Commands {
     #[command(alias = "disassemble", alias = "dis")]
     Disasm(DisasmArgs),
 
+    /// Disassemble at an address, disassembling first if nothing is there yet
+    /// (the common case for computed-jump targets auto-analysis never reached)
+    #[command(alias = "disassemble-at")]
+    DisasmAt(DisasmAtArgs),
+
+    /// Clear code units in a range (undoes auto-analysis that mis-disassembled
+    /// through inline data), optionally re-disassembling at a precise address
+    Clear(ClearArgs),
+
     /// Diff operations
     #[command(subcommand)]
     Diff(DiffCommands),
@@ -330,7 +339,7 @@ pub struct ExportArgs {
 pub enum FunctionCommands {
     /// List all functions
     #[command(alias = "ls")]
-    List(QueryOptions),
+    List(FunctionListArgs),
     /// Get function details
     #[command(alias = "show", alias = "detail")]
     Get(FunctionGetArgs),
@@ -359,6 +368,78 @@ pub enum FunctionCommands {
     SetCallingConvention(SetCallingConventionArgs),
     /// Set variable type in a function
     SetVarType(SetVarTypeArgs),
+    /// Mark a function as never returning to its call site (fixes bogus
+    /// decompiled fallthrough tails at every call site in one shot)
+    #[command(name = "set-noreturn")]
+    SetNoReturn(SetNoReturnArgs),
+    /// Function tag operations (subsystem/module grouping)
+    #[command(subcommand)]
+    Tag(FunctionTagCommands),
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct FunctionListArgs {
+    /// Only include functions carrying this tag
+    #[arg(long)]
+    pub tag: Option<String>,
+    #[command(flatten)]
+    pub options: QueryOptions,
+}
+
+#[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
+pub enum FunctionTagCommands {
+    /// Add a tag to a function
+    Add(FunctionTagArgs),
+    /// Remove a tag from a function
+    Remove(FunctionTagArgs),
+    /// List tags on a function, or every tag definition in the program
+    List(FunctionTagListArgs),
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct FunctionTagArgs {
+    /// Function target (name | 0xaddr | FUN_<hex>)
+    pub target: String,
+    /// Tag name
+    pub tag_name: String,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct FunctionTagListArgs {
+    /// Function target; omit to list every tag definition in the program
+    pub target: Option<String>,
+    #[command(flatten)]
+    pub options: QueryOptions,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct SetNoReturnArgs {
+    /// Function target (name | 0xaddr | FUN_<hex>)
+    #[arg(value_name = "TARGET", required_unless_present = "target")]
+    pub positional_target: Option<String>,
+    /// Function target (name | 0xaddr | FUN_<hex>)
+    #[arg(long = "target", value_name = "TARGET")]
+    pub target: Option<String>,
+    /// Set to false to clear a previously-set no-return flag
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub value: bool,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+impl SetNoReturnArgs {
+    pub fn resolved_target(&self) -> &str {
+        self.target
+            .as_deref()
+            .or(self.positional_target.as_deref())
+            .expect("clap should ensure target is provided")
+    }
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -700,6 +781,9 @@ pub struct CreateTypeArgs {
 pub struct ApplyTypeArgs {
     pub address: String,
     pub type_name: String,
+    /// Clear any conflicting data unit first instead of failing on it
+    #[arg(long, alias = "clear-conflicting")]
+    pub force: bool,
     #[arg(long)]
     pub program: Option<String>,
     #[arg(long)]
@@ -814,9 +898,19 @@ pub struct CommentGetArgs {
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct CommentSetArgs {
     pub address: String,
-    pub text: String,
+    /// Comment text. Omit when using --stdin or --text-file: a shell argument
+    /// is subject to shell metacharacter expansion (e.g. backticks) before
+    /// ghidra-cli ever sees it, which can silently corrupt free-form prose.
+    #[arg(required_unless_present_any = ["stdin", "text_file"])]
+    pub text: Option<String>,
     #[arg(long)]
     pub comment_type: Option<String>,
+    /// Read comment text from stdin instead of the TEXT argument
+    #[arg(long, conflicts_with_all = ["text", "text_file"])]
+    pub stdin: bool,
+    /// Read comment text from a file instead of the TEXT argument
+    #[arg(long, conflicts_with = "text")]
+    pub text_file: Option<std::path::PathBuf>,
     #[arg(long)]
     pub program: Option<String>,
     #[arg(long)]
@@ -982,6 +1076,35 @@ impl DisasmArgs {
     }
 }
 
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct DisasmAtArgs {
+    /// Address to disassemble at
+    pub address: String,
+    /// Number of instructions to report back once disassembled
+    #[arg(long = "count", short = 'n')]
+    pub count: Option<usize>,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct ClearArgs {
+    /// Address range to clear, as START:END (e.g. 0bf3:0bfa)
+    pub range: String,
+    /// Clear only, leaving the range as undefined data (no redisassembly)
+    #[arg(long, conflicts_with = "disasm_at")]
+    pub to_data: bool,
+    /// Re-disassemble at this address immediately after clearing
+    #[arg(long)]
+    pub disasm_at: Option<String>,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
 #[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
 pub enum DiffCommands {
     /// Compare two programs
@@ -1067,11 +1190,15 @@ pub struct PatchExportArgs {
 
 #[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
 pub enum ScriptCommands {
-    /// Run a script file
+    /// Run a script file (pass "-" to read Java source from stdin instead of a path)
     Run(ScriptRunArgs),
-    /// Execute inline Python code
+    /// Disabled by design: use `script run -` (stdin) for a Python-authored
+    /// one-off ported to Java, or `script run PATH` for a checked-in file.
+    /// See `ghidra doctor` for why inline eval isn't offered as a shortcut.
     Python(ScriptInlineArgs),
-    /// Execute inline Java code
+    /// Disabled by design: use `script run -` to pipe Java source on stdin
+    /// instead -- it goes through the same compile/execute path as a file on
+    /// disk rather than a second, less-sandboxed eval path. See `ghidra doctor`.
     Java(ScriptInlineArgs),
     /// List available scripts
     List,
@@ -1079,6 +1206,7 @@ pub enum ScriptCommands {
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct ScriptRunArgs {
+    /// Path to a script file, or "-" to read Java source from stdin
     pub script_path: String,
     #[arg(long)]
     pub program: Option<String>,

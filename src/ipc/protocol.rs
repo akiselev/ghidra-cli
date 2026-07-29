@@ -20,7 +20,32 @@ pub struct BridgeResponse<T = serde_json::Value> {
     pub data: Option<T>,
     #[serde(default)]
     pub message: Option<String>,
+    /// Structured detail attached to an error response (e.g. the containing
+    /// function's name/entry/size on a "function already exists" error, or the
+    /// conflicting data unit's type/range on a "type apply" conflict). Absent
+    /// on success responses and on errors that carry only a message.
+    #[serde(default)]
+    pub detail: Option<serde_json::Value>,
 }
+
+/// An error surfaced by the bridge that carries structured detail alongside its
+/// message (e.g. the containing function's name/entry/size for a "function
+/// already exists" error). `Display` prints just the message, matching plain
+/// bridge errors, so existing `anyhow`-based error handling is unaffected;
+/// callers that want the structured detail can `downcast_ref` for it.
+#[derive(Debug)]
+pub struct BridgeCommandError {
+    pub message: String,
+    pub detail: serde_json::Value,
+}
+
+impl std::fmt::Display for BridgeCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for BridgeCommandError {}
 
 #[cfg(test)]
 mod tests {
