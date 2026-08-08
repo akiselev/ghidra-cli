@@ -568,15 +568,13 @@ fn dispatch_tool(
                         .unwrap_or_else(|_| path_owned.clone());
                     match client.script_run(&canon_path, &script_args, &expect, allow_empty) {
                         Ok(data) => {
-                            let artifacts = data.get("artifacts").cloned();
                             let ns = compute_next_steps("script_run", Some(&path_owned));
-                            let env = make_envelope(
+                            let env = envelope_with_script_artifacts(
                                 "script_run",
                                 data,
                                 Some(&proj_name),
                                 default_program.as_deref(),
                                 ns,
-                                artifacts,
                             );
                             wrap_envelope_as_content(env, id)
                         }
@@ -1277,32 +1275,13 @@ pub fn build_summarize_report(client: &BridgeClient, focus: &str) -> anyhow::Res
     let focus = focus.to_lowercase();
     let want_all = focus == "all" || focus.is_empty();
     let mut sections = Map::new();
-    let mut findings = Vec::new();
 
     if want_all || focus.contains("entry") || focus.contains("import") {
         if let Ok(info) = client.program_info() {
-            sections.insert("program".into(), info.clone());
-            if let Some(name) = info.get("name").or(info.get("program")).cloned() {
-                findings.push(json!({
-                    "kind": "program",
-                    "summary": format!("program {}", name),
-                    "confidence": 1.0
-                }));
-            }
+            sections.insert("program".into(), info);
         }
         if let Ok(imps) = client.list_imports() {
-            sections.insert("imports".into(), imps.clone());
-            let count = imps
-                .get("imports")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len())
-                .or_else(|| imps.get("count").and_then(|c| c.as_u64()).map(|n| n as usize))
-                .unwrap_or(0);
-            findings.push(json!({
-                "kind": "imports",
-                "summary": format!("{} imports", count),
-                "confidence": 0.9
-            }));
+            sections.insert("imports".into(), imps);
         }
         if let Ok(exps) = client.list_exports() {
             sections.insert("exports".into(), exps);
@@ -1311,29 +1290,13 @@ pub fn build_summarize_report(client: &BridgeClient, focus: &str) -> anyhow::Res
 
     if want_all || focus.contains("crypto") {
         if let Ok(crypto) = client.find_crypto() {
-            let count = crypto
-                .get("matches")
-                .or(crypto.get("results"))
-                .and_then(|v| v.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
-            findings.push(json!({
-                "kind": "crypto",
-                "summary": format!("{} crypto-related hits", count),
-                "confidence": if count > 0 { 0.75 } else { 0.4 }
-            }));
             sections.insert("crypto".into(), crypto);
         }
     }
 
     if want_all || focus.contains("string") {
         if let Ok(interesting) = client.find_interesting() {
-            sections.insert("interesting".into(), interesting.clone());
-            findings.push(json!({
-                "kind": "interesting",
-                "summary": "interesting locations scanned",
-                "confidence": 0.6
-            }));
+            sections.insert("interesting".into(), interesting);
         }
         if let Ok(strings) = client.list_strings(Some(20), None) {
             sections.insert("top_strings".into(), strings);
@@ -1349,12 +1312,88 @@ pub fn build_summarize_report(client: &BridgeClient, focus: &str) -> anyhow::Res
         }
     }
 
-    Ok(json!({
+    Ok(assemble_summarize_report(&focus, sections))
+}
+
+/// Pure assembly of summarize report + confidence-tagged findings (unit-testable).
+pub fn assemble_summarize_report(focus: &str, sections: Map<String, Value>) -> Value {
+    let mut findings = Vec::new();
+
+    if let Some(info) = sections.get("program") {
+        if let Some(name) = info.get("name").or(info.get("program")).and_then(|v| v.as_str()) {
+            findings.push(json!({
+                "kind": "program",
+                "summary": format!("program {}", name),
+                "confidence": 1.0
+            }));
+        }
+    }
+    if let Some(imps) = sections.get("imports") {
+        let count = imps
+            .get("imports")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .or_else(|| imps.get("count").and_then(|c| c.as_u64()).map(|n| n as usize))
+            .unwrap_or(0);
+        findings.push(json!({
+            "kind": "imports",
+            "summary": format!("{} imports", count),
+            "confidence": 0.9
+        }));
+    }
+    if let Some(crypto) = sections.get("crypto") {
+        let count = crypto
+            .get("matches")
+            .or(crypto.get("results"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        findings.push(json!({
+            "kind": "crypto",
+            "summary": format!("{} crypto-related hits", count),
+            "confidence": if count > 0 { 0.75 } else { 0.4 }
+        }));
+    }
+    if sections.contains_key("interesting") {
+        findings.push(json!({
+            "kind": "interesting",
+            "summary": "interesting locations scanned",
+            "confidence": 0.6
+        }));
+    }
+    if let Some(funcs) = sections.get("top_functions") {
+        let count = funcs
+            .get("functions")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        if count > 0 {
+            findings.push(json!({
+                "kind": "functions",
+                "summary": format!("{} sample functions", count),
+                "confidence": 0.7
+            }));
+        }
+    }
+
+    json!({
         "focus": focus,
         "sections": Value::Object(sections),
         "findings": findings,
         "confidence_note": "Scores are heuristic tags for agent prioritization, not formal proofs."
-    }))
+    })
+}
+
+/// Promote script_run data.artifacts into the envelope artifacts[] slot.
+pub fn envelope_with_script_artifacts(
+    command: &str,
+    data: Value,
+    project: Option<&str>,
+    program: Option<&str>,
+    next_steps: Vec<String>,
+) -> Value {
+    let artifacts = data.get("artifacts").cloned();
+    make_envelope(command, data, project, program, next_steps, artifacts)
 }
 
 fn get_bridge_client(
@@ -2336,6 +2375,127 @@ mod tests {
                 || joined.to_lowercase().contains("artifact")
                 || joined.to_lowercase().contains("job")
         );
+    }
+
+    #[test]
+    fn script_run_expect_elevates_artifacts_onto_envelope() {
+        // Simulate bridge data after validateArtifacts: artifacts with path + sha256.
+        let data = json!({
+            "script": "export.py",
+            "stdout": "ok",
+            "artifacts": [
+                {
+                    "path": "/tmp/out.csv",
+                    "sha256": "abc123def456",
+                    "rows": 3,
+                    "binary_sha256": "deadbeef",
+                    "exists": true
+                }
+            ]
+        });
+        let env = envelope_with_script_artifacts(
+            "script_run",
+            data.clone(),
+            Some("proj"),
+            Some("prog"),
+            vec!["review artifacts".into()],
+        );
+        assert_eq!(env["status"], "success");
+        assert_eq!(env["command"], "script_run");
+        let arts = env["artifacts"].as_array().expect("artifacts array");
+        assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0]["path"], "/tmp/out.csv");
+        assert_eq!(arts[0]["sha256"], "abc123def456");
+        assert!(arts[0].get("binary_sha256").is_some() || arts[0].get("rows").is_some());
+        // Provenance keys always present
+        assert!(env["provenance"]["tool_version"].is_string());
+        assert!(env["provenance"]["timestamp"].is_string());
+        assert_eq!(env["provenance"]["project"], "proj");
+        // data still carries the same artifacts for nested consumers
+        assert_eq!(env["data"]["artifacts"][0]["path"], "/tmp/out.csv");
+    }
+
+    #[test]
+    fn assemble_summarize_report_tags_confidence() {
+        let mut sections = Map::new();
+        sections.insert(
+            "program".into(),
+            json!({"name": "sample_binary", "language": "x86"}),
+        );
+        sections.insert(
+            "imports".into(),
+            json!({"imports": [{"name": "printf"}, {"name": "malloc"}], "count": 2}),
+        );
+        sections.insert(
+            "crypto".into(),
+            json!({"matches": [{"const": "AES"}], "results": [{"const": "AES"}]}),
+        );
+        sections.insert("interesting".into(), json!({"hits": []}));
+        sections.insert(
+            "top_functions".into(),
+            json!({"functions": [{"name": "main"}, {"name": "foo"}]}),
+        );
+        let report = assemble_summarize_report("all", sections);
+        assert_eq!(report["focus"], "all");
+        let findings = report["findings"].as_array().expect("findings");
+        assert!(!findings.is_empty());
+        let kinds: Vec<_> = findings
+            .iter()
+            .filter_map(|f| f.get("kind").and_then(|k| k.as_str()))
+            .collect();
+        assert!(kinds.contains(&"program"));
+        assert!(kinds.contains(&"imports"));
+        assert!(kinds.contains(&"crypto"));
+        for f in findings {
+            let conf = f["confidence"].as_f64().expect("confidence number");
+            assert!((0.0..=1.0).contains(&conf), "confidence out of range: {}", conf);
+        }
+        // crypto with hits should be higher confidence than empty
+        let crypto = findings.iter().find(|f| f["kind"] == "crypto").unwrap();
+        assert!(crypto["confidence"].as_f64().unwrap() >= 0.75);
+    }
+
+    #[test]
+    fn tools_list_includes_summarize_pcode_transaction() {
+        let names = tool_names_owned();
+        for t in [
+            "summarize",
+            "pcode",
+            "transaction_begin",
+            "transaction_commit",
+            "transaction_abort",
+            "diff_programs",
+            "diff_functions",
+        ] {
+            assert!(names.iter().any(|n| n == t), "missing tool {}", t);
+        }
+    }
+
+    #[test]
+    fn transaction_and_pcode_without_bridge_return_recovery_envelope() {
+        for (name, args) in [
+            ("pcode", json!({"target": "main"})),
+            ("transaction_begin", json!({"name": "t1"})),
+            ("transaction_commit", json!({})),
+            ("transaction_abort", json!({})),
+            ("summarize", json!({"focus": "crypto"})),
+        ] {
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            });
+            let mut cached: Option<(String, BridgeClient)> = None;
+            let resp = handle_request(&req, &mut cached, None, None, None);
+            let text = resp["result"]["content"][0]["text"].as_str().expect("text");
+            let env: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(env["status"], "error", "tool {}", name);
+            assert_eq!(env["command"], name);
+            let rec = env["recovery_suggestions"].as_array().unwrap();
+            assert!(!rec.is_empty(), "recovery empty for {}", name);
+            assert!(env["provenance"]["tool_version"].is_string());
+        }
     }
 
     fn tool_names() -> Vec<&'static str> {

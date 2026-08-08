@@ -181,6 +181,16 @@ Mutations: `patch_bytes`, `patch_nop`, `patch_export`, `create_function`, `renam
 
 Analysis helpers: `summarize`, `diff_programs`, `diff_functions`, `pcode`, `batch`
 
+### Diff programs (headless match)
+
+`diff_programs` loads **both** programs from the project, compares function name sets, and returns:
+
+- `matched_functions` / `only_in_program1` / `only_in_program2` (capped, with counts)
+- dual-side summaries under `program1` / `program2` and `dual_provenance`
+- `method: function_name_set_match`
+
+This is not interactive Ghidra Version Tracking. For decompile-level deltas use `diff_functions`.
+
 ### Decompile extra context (guaranteed)
 
 `decompile` always includes:

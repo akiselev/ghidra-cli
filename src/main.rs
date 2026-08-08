@@ -1140,7 +1140,7 @@ fn execute_via_bridge(
         Commands::Summarize(args) => mcp::build_summarize_report(&client, &args.focus),
         Commands::Pcode(args) => {
             let mut payload = json!({"target": args.target});
-            if let Some(l) = args.limit {
+            if let Some(l) = args.max_ops {
                 payload["limit"] = json!(l);
             }
             client.send_command("pcode", Some(payload))

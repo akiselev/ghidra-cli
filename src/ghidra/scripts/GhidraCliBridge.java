@@ -3951,49 +3951,166 @@ public class GhidraCliBridge extends GhidraScript {
 
     // --- Diff Handlers ---
 
+    /**
+     * Headless dual-program match/delta: open both programs from the project,
+     * compare function name sets, and return dual-side provenance + match report.
+     * Does not replace interactive Version Tracking; it is the durable match surface.
+     */
     private JsonObject handleDiffPrograms(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        String prog1Name = getArgString(args, "program1");
+        String prog2Name = getArgString(args, "program2");
+        if (prog1Name == null || prog1Name.isEmpty() || prog2Name == null || prog2Name.isEmpty()) {
+            return errorResult("program1 and program2 required");
+        }
+        if (prog1Name.equals(prog2Name)) {
+            return errorResult("program1 and program2 must be different programs");
+        }
 
-        String prog1 = getArgString(args, "program1");
-        String prog2 = getArgString(args, "program2");
-        if (prog1 == null) prog1 = "";
-        if (prog2 == null) prog2 = "";
+        Project project = state == null ? null : state.getProject();
+        if (project == null) return errorResult("No project open");
 
+        Program p1 = null;
+        Program p2 = null;
+        Object consumer = this;
         try {
-            FunctionManager fm = currentProgram.getFunctionManager();
-            Memory memory = currentProgram.getMemory();
-            SymbolTable symbolTable = currentProgram.getSymbolTable();
+            p1 = openProgramByName(prog1Name, consumer);
+            p2 = openProgramByName(prog2Name, consumer);
+            if (p1 == null) return errorResult("Program not found: " + prog1Name);
+            if (p2 == null) return errorResult("Program not found: " + prog2Name);
 
-            JsonObject prog1Stats = new JsonObject();
-            prog1Stats.addProperty("name", prog1);
-            prog1Stats.addProperty("function_count", fm.getFunctionCount());
-            prog1Stats.addProperty("memory_size", memory.getSize());
-            prog1Stats.addProperty("symbol_count", symbolTable.getNumSymbols());
+            java.util.LinkedHashSet<String> names1 = functionNameSet(p1);
+            java.util.LinkedHashSet<String> names2 = functionNameSet(p2);
 
-            JsonArray memBlocks = new JsonArray();
-            for (MemoryBlock block : memory.getBlocks()) {
-                JsonObject blockObj = new JsonObject();
-                blockObj.addProperty("name", block.getName());
-                blockObj.addProperty("start", block.getStart().toString());
-                blockObj.addProperty("end", block.getEnd().toString());
-                blockObj.addProperty("size", block.getSize());
-                memBlocks.add(blockObj);
+            JsonArray matched = new JsonArray();
+            JsonArray only1 = new JsonArray();
+            JsonArray only2 = new JsonArray();
+            for (String n : names1) {
+                if (names2.contains(n)) matched.add(n);
+                else only1.add(n);
             }
-            prog1Stats.add("memory_blocks", memBlocks);
+            for (String n : names2) {
+                if (!names1.contains(n)) only2.add(n);
+            }
 
-            JsonObject prog2Stats = new JsonObject();
-            prog2Stats.addProperty("name", prog2);
-            prog2Stats.addProperty("note", "Comparison requires loading second program");
+            // Cap large lists so agents get a usable delta, not a multi-MB dump.
+            final int CAP = 200;
+            JsonArray matchedOut = takeFirst(matched, CAP);
+            JsonArray only1Out = takeFirst(only1, CAP);
+            JsonArray only2Out = takeFirst(only2, CAP);
+
+            JsonObject side1 = programSideSummary(p1, prog1Name);
+            JsonObject side2 = programSideSummary(p2, prog2Name);
 
             JsonObject result = new JsonObject();
-            result.add("program1", prog1Stats);
-            result.add("program2", prog2Stats);
-            result.addProperty("status", "partial");
-            result.addProperty("message", "Single program stats returned (multi-program comparison not implemented)");
+            result.addProperty("status", "success");
+            result.add("program1", side1);
+            result.add("program2", side2);
+            result.addProperty("matched_count", matched.size());
+            result.addProperty("only_in_program1_count", only1.size());
+            result.addProperty("only_in_program2_count", only2.size());
+            result.add("matched_functions", matchedOut);
+            result.add("only_in_program1", only1Out);
+            result.add("only_in_program2", only2Out);
+            result.addProperty("truncated",
+                matched.size() > CAP || only1.size() > CAP || only2.size() > CAP);
+            result.addProperty("method", "function_name_set_match");
+            result.addProperty(
+                "note",
+                "Headless name-set match. Use diff_functions for decompile-level deltas; "
+                    + "full interactive Version Tracking is not exposed."
+            );
+            // Dual-side provenance for agent envelopes
+            JsonObject provenance = new JsonObject();
+            provenance.add("program1", side1.deepCopy());
+            provenance.add("program2", side2.deepCopy());
+            result.add("dual_provenance", provenance);
             return result;
         } catch (Exception e) {
             return errorResult("Failed to diff programs: " + e.getMessage());
+        } finally {
+            releaseProgramQuietly(p1, consumer);
+            releaseProgramQuietly(p2, consumer);
         }
+    }
+
+    private Program openProgramByName(String programName, Object consumer) throws Exception {
+        Project project = state.getProject();
+        if (project == null) return null;
+        ProjectData projectData = project.getProjectData();
+        DomainFolder rootFolder = projectData.getRootFolder();
+        DomainFile domainFile = null;
+        for (DomainFile f : rootFolder.getFiles()) {
+            if (f.getName().equals(programName)) {
+                domainFile = f;
+                break;
+            }
+        }
+        if (domainFile == null) {
+            String path = programName.startsWith("/") ? programName : "/" + programName;
+            domainFile = projectData.getFile(path);
+        }
+        if (domainFile == null) return null;
+        // Reuse current program instance if it is already the requested one.
+        if (currentProgram != null && currentProgram.getName().equals(programName)) {
+            return currentProgram;
+        }
+        DomainObject domObj = domainFile.getDomainObject(consumer, true, false, monitor);
+        if (domObj instanceof Program) {
+            return (Program) domObj;
+        }
+        if (domObj != null) {
+            try { domObj.release(consumer); } catch (Exception ignored) {}
+        }
+        return null;
+    }
+
+    private java.util.LinkedHashSet<String> functionNameSet(Program program) {
+        java.util.LinkedHashSet<String> names = new java.util.LinkedHashSet<>();
+        FunctionManager fm = program.getFunctionManager();
+        FunctionIterator it = fm.getFunctions(true);
+        while (it.hasNext()) {
+            Function f = it.next();
+            if (f != null && f.getName() != null) names.add(f.getName());
+        }
+        return names;
+    }
+
+    private JsonObject programSideSummary(Program program, String requestedName) {
+        JsonObject side = new JsonObject();
+        side.addProperty("name", program.getName());
+        side.addProperty("requested_name", requestedName);
+        side.addProperty("function_count", program.getFunctionManager().getFunctionCount());
+        side.addProperty("memory_size", program.getMemory().getSize());
+        side.addProperty("symbol_count", program.getSymbolTable().getNumSymbols());
+        try {
+            String path = program.getExecutablePath();
+            if (path != null) side.addProperty("executable_path", path);
+        } catch (Exception ignored) {}
+        try {
+            String fmt = program.getExecutableFormat();
+            if (fmt != null) side.addProperty("executable_format", fmt);
+        } catch (Exception ignored) {}
+        try {
+            String lang = program.getLanguage() != null ? program.getLanguage().toString() : null;
+            if (lang != null) side.addProperty("language", lang);
+        } catch (Exception ignored) {}
+        return side;
+    }
+
+    private JsonArray takeFirst(JsonArray src, int cap) {
+        JsonArray out = new JsonArray();
+        int n = Math.min(src.size(), cap);
+        for (int i = 0; i < n; i++) out.add(src.get(i));
+        return out;
+    }
+
+    private void releaseProgramQuietly(Program program, Object consumer) {
+        if (program == null) return;
+        // Never release the session currentProgram from a temporary open.
+        if (program == currentProgram) return;
+        try {
+            program.release(consumer);
+        } catch (Exception ignored) {}
     }
 
     private JsonObject handleDiffFunctions(JsonObject args) {

@@ -1187,9 +1187,9 @@ pub struct SummarizeArgs {
 pub struct PcodeArgs {
     /// Function name or address
     pub target: String,
-    /// Max p-code ops to return
-    #[arg(long)]
-    pub limit: Option<usize>,
+    /// Max p-code ops to return (avoids clash with QueryOptions --limit)
+    #[arg(long = "max-ops")]
+    pub max_ops: Option<usize>,
     #[command(flatten)]
     pub options: QueryOptions,
 }

@@ -327,6 +327,131 @@ fn test_mcp_mutation_durability_comment() {
     drop(harness);
 }
 
+/// Live: summarize findings with confidence, pcode ops, transaction begin/abort.
+#[test]
+#[serial]
+fn test_mcp_summarize_pcode_transaction() {
+    require_ghidra!();
+
+    ensure_test_project(TEST_PROJECT, TEST_PROGRAM);
+
+    let Some(harness) = try_start_daemon() else {
+        return;
+    };
+
+    let ghidra_bin = assert_cmd::cargo::cargo_bin!("ghidra");
+    let run_mcp_call = |tool: &str, args: serde_json::Value| -> serde_json::Value {
+        let mut child = std::process::Command::new(&ghidra_bin)
+            .args(["--project", TEST_PROJECT, "mcp", "stdio"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn mcp");
+        let mut stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let send = |stdin: &mut dyn std::io::Write, v: &serde_json::Value| {
+            writeln!(stdin, "{}", serde_json::to_string(v).unwrap()).unwrap();
+            stdin.flush().unwrap();
+        };
+        let mut line = String::new();
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+        );
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
+        );
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        drop(stdin);
+        let _ = child.wait();
+        let rpc: serde_json::Value = serde_json::from_str(line.trim()).expect("rpc");
+        let text = rpc["result"]["content"][0]["text"].as_str().expect("text");
+        serde_json::from_str(text).expect("envelope")
+    };
+
+    // summarize: structured sections + confidence-tagged findings
+    let sum = run_mcp_call("summarize", json!({"focus": "all"}));
+    assert_eq!(sum["status"], "success", "summarize failed: {}", sum);
+    let findings = sum["data"]["findings"]
+        .as_array()
+        .expect("findings array");
+    assert!(!findings.is_empty(), "expected at least one finding");
+    for f in findings {
+        let conf = f["confidence"].as_f64().expect("confidence");
+        assert!((0.0..=1.0).contains(&conf));
+        assert!(f.get("kind").and_then(|k| k.as_str()).is_some());
+    }
+
+    // pick a function for pcode
+    let fl = run_mcp_call("function_list", json!({"limit": 5}));
+    assert_eq!(fl["status"], "success");
+    let target = fl["data"]
+        .get("functions")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|f| {
+            f.get("name")
+                .and_then(|n| n.as_str())
+                .or_else(|| f.get("address").and_then(|a| a.as_str()))
+        })
+        .unwrap_or("main")
+        .to_string();
+
+    let pc = run_mcp_call("pcode", json!({"target": target, "limit": 20}));
+    assert_eq!(pc["status"], "success", "pcode failed: {}", pc);
+    let data = &pc["data"];
+    // ops array present (may be empty on decompile failure paths; assert field exists)
+    assert!(
+        data.get("ops").is_some() || data.get("count").is_some(),
+        "pcode missing ops/count: {}",
+        pc
+    );
+    if let Some(ops) = data.get("ops").and_then(|v| v.as_array()) {
+        if let Some(first) = ops.first() {
+            assert!(
+                first.get("mnemonic").is_some() || first.get("opcode").is_some(),
+                "pcode op missing mnemonic: {}",
+                first
+            );
+        }
+    }
+
+    // transaction begin → abort (undo boundary)
+    let begin = run_mcp_call("transaction_begin", json!({"name": "mcp-test-tx"}));
+    assert_eq!(begin["status"], "success", "transaction_begin failed: {}", begin);
+    assert!(
+        begin["data"].get("transaction_id").is_some()
+            || begin["data"].get("status").and_then(|s| s.as_str()) == Some("open"),
+        "begin payload: {}",
+        begin
+    );
+    let abort = run_mcp_call("transaction_abort", json!({}));
+    assert_eq!(abort["status"], "success", "transaction_abort failed: {}", abort);
+
+    // CLI path for pcode --max-ops (regression for clap limit clash)
+    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        .args([
+            "--project",
+            TEST_PROJECT,
+            "--json",
+            "--envelope",
+            "pcode",
+            &target,
+            "--max-ops",
+            "10",
+        ])
+        .assert()
+        .success();
+
+    drop(harness);
+}
+
 #[test]
 #[serial]
 fn test_mcp_http_launch_and_tools() {
