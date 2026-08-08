@@ -243,12 +243,12 @@ Request streamable progress with either:
 - query: `POST /mcp?stream=1`
 - header: `Accept: text/event-stream`
 
-The response is `text/event-stream` with:
+The response is `text/event-stream` **without** `Content-Length` so frames flush while work runs:
 
-1. One or more `event: progress` frames (`percent`, `message`, `kind: mcp_progress`)
+1. One or more `event: progress` frames (`percent`, `message`, `kind: mcp_progress`) flushed before/during dispatch
 2. A final `event: result` frame carrying the **same JSON-RPC body** as non-stream mode (stable tool envelope inside `content[].text`)
 
-Non-stream `POST /mcp` is unchanged (single JSON response).
+Non-stream `POST /mcp` is unchanged (single JSON response). CORS is not enabled by default (no `Access-Control-Allow-Origin: *`); use a local agent, not browser pages, against the mutative HTTP surface.
 
 ## Match / transfer / explain
 

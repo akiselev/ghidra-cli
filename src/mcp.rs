@@ -184,11 +184,11 @@ pub fn tool_definitions() -> Value {
         tool("patch_export", "Export patched binary (mutation).", json!({"output": {"type": "string"}})),
         tool("create_function", "Create a function at address (mutation).", json!({"address": {"type": "string"}, "name": {"type": "string"}})),
         tool("rename_function", "Rename a function (mutation). Args: old_name/target + new_name/name.", json!({"old_name": {"type": "string"}, "new_name": {"type": "string"}, "target": {"type": "string"}, "name": {"type": "string"}})),
-        tool("delete_function", "Delete a function (mutation).", json!({"target": {"type": "string"}})),
+        tool("delete_function", "Delete a function (mutation). Wire: address (alias: target).", json!({"address": {"type": "string"}, "target": {"type": "string"}})),
         tool("function_set_signature", "Set function signature (mutation).", json!({"target": {"type": "string"}, "signature": {"type": "string"}})),
-        tool("function_set_return_type", "Set function return type (mutation).", json!({"target": {"type": "string"}, "type": {"type": "string"}})),
+        tool("function_set_return_type", "Set function return type (mutation). Wire: return_type (alias: type).", json!({"target": {"type": "string"}, "return_type": {"type": "string"}, "type": {"type": "string"}})),
         tool("function_set_calling_convention", "Set function calling convention (mutation).", json!({"target": {"type": "string"}, "convention": {"type": "string"}})),
-        tool("set_var_type", "Set variable type in a function (mutation).", json!({"function": {"type": "string"}, "variable": {"type": "string"}, "type": {"type": "string"}})),
+        tool("set_var_type", "Set variable type in a function (mutation). Wire: var_name, type_name.", json!({"function": {"type": "string"}, "var_name": {"type": "string"}, "type_name": {"type": "string"}, "variable": {"type": "string"}, "type": {"type": "string"}})),
         tool("symbol_create", "Create a symbol (mutation).", json!({"address": {"type": "string"}, "name": {"type": "string"}})),
         tool("symbol_delete", "Delete a symbol (mutation).", json!({"name": {"type": "string"}})),
         tool("symbol_rename", "Rename a symbol (mutation).", json!({"old_name": {"type": "string"}, "new_name": {"type": "string"}})),
@@ -198,10 +198,10 @@ pub fn tool_definitions() -> Value {
         tool("type_apply", "Apply a type at address (mutation).", json!({"address": {"type": "string"}, "type_name": {"type": "string"}})),
         tool("type_delete", "Delete a data type (mutation).", json!({"name": {"type": "string"}})),
         tool("type_rename", "Rename a data type (mutation).", json!({"old_name": {"type": "string"}, "new_name": {"type": "string"}})),
-        tool("type_create_enum", "Create an enum type (mutation).", json!({"name": {"type": "string"}, "values": {"type": "object"}})),
-        tool("type_typedef", "Create a typedef (mutation).", json!({"name": {"type": "string"}, "base": {"type": "string"}})),
-        tool("type_add_field", "Add a field to a structure (mutation).", json!({"struct": {"type": "string"}, "name": {"type": "string"}, "type": {"type": "string"}, "offset": {"type": "integer"}})),
-        tool("type_del_field", "Delete a field from a structure (mutation).", json!({"struct": {"type": "string"}, "name": {"type": "string"}})),
+        tool("type_create_enum", "Create an enum type (mutation). values is KEY=VALUE pairs, comma-separated.", json!({"name": {"type": "string"}, "values": {"type": "string"}, "size": {"type": "integer"}})),
+        tool("type_typedef", "Create a typedef (mutation). Wire: base_type (alias: base).", json!({"name": {"type": "string"}, "base_type": {"type": "string"}, "base": {"type": "string"}})),
+        tool("type_add_field", "Add a field to a structure (mutation).", json!({"type_name": {"type": "string"}, "field_name": {"type": "string"}, "field_type": {"type": "string"}, "offset": {"type": "integer"}, "struct": {"type": "string"}, "name": {"type": "string"}, "type": {"type": "string"}})),
+        tool("type_del_field", "Delete a field from a structure (mutation).", json!({"type_name": {"type": "string"}, "field_name": {"type": "string"}, "struct": {"type": "string"}, "name": {"type": "string"}})),
         tool("batch", "Execute an array of {name, arguments} tool calls; returns per-command status.", json!({"commands": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "arguments": {"type": "object"}}}}})),
         // Diff / triage / deeper primitives (items 3–5)
         tool("diff_programs", "Diff two programs in the project (match/delta report).", json!({"program1": {"type": "string"}, "program2": {"type": "string"}})),
@@ -796,14 +796,24 @@ fn dispatch_tool(
             )
         }
         "delete_function" => {
-            let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            let target = args
+                .get("address")
+                .or_else(|| args.get("target"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if target.is_empty() {
-                return tool_error(id, "delete_function", "target required", recovery_for("delete_function", "target required"));
+                return tool_error(
+                    id,
+                    "delete_function",
+                    "address (or target) required",
+                    recovery_for("delete_function", "address required"),
+                );
             }
             let t = target.to_string();
             bridge_tool(
                 id, "delete_function", cached_client, default_project, default_program, projects_dir, true,
-                move |client| client.send_command("delete_function", Some(json!({"target": t}))),
+                // Bridge reads "address" (name-or-address string).
+                move |client| client.send_command("delete_function", Some(json!({"address": t}))),
                 Some(target),
             )
         }
@@ -823,15 +833,29 @@ fn dispatch_tool(
         }
         "function_set_return_type" => {
             let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
-            let ty = args.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let ty = args
+                .get("return_type")
+                .or_else(|| args.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if target.is_empty() || ty.is_empty() {
-                return tool_error(id, "function_set_return_type", "target and type required", recovery_for("function_set_return_type", "missing fields"));
+                return tool_error(
+                    id,
+                    "function_set_return_type",
+                    "target and return_type (or type) required",
+                    recovery_for("function_set_return_type", "missing fields"),
+                );
             }
             let t = target.to_string();
             let ty = ty.to_string();
             bridge_tool(
                 id, "function_set_return_type", cached_client, default_project, default_program, projects_dir, true,
-                move |client| client.send_command("function_set_return_type", Some(json!({"target": t, "type": ty}))),
+                move |client| {
+                    client.send_command(
+                        "function_set_return_type",
+                        Some(json!({"target": t, "return_type": ty})),
+                    )
+                },
                 Some(target),
             )
         }
@@ -851,12 +875,29 @@ fn dispatch_tool(
         }
         "set_var_type" => {
             let function = args.get("function").and_then(|v| v.as_str()).unwrap_or("");
-            let variable = args.get("variable").and_then(|v| v.as_str()).unwrap_or("");
-            let ty = args.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let variable = args
+                .get("var_name")
+                .or_else(|| args.get("variable"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let ty = args
+                .get("type_name")
+                .or_else(|| args.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if function.is_empty() || variable.is_empty() || ty.is_empty() {
-                return tool_error(id, "set_var_type", "function, variable, and type required", recovery_for("set_var_type", "missing fields"));
+                return tool_error(
+                    id,
+                    "set_var_type",
+                    "function, var_name (or variable), and type_name (or type) required",
+                    recovery_for("set_var_type", "missing fields"),
+                );
             }
-            let payload = json!({"function": function, "variable": variable, "type": ty});
+            let payload = json!({
+                "function": function,
+                "var_name": variable,
+                "type_name": ty
+            });
             bridge_tool(
                 id, "set_var_type", cached_client, default_project, default_program, projects_dir, true,
                 move |client| client.send_command("set_var_type", Some(payload)),
@@ -958,8 +999,15 @@ fn dispatch_tool(
             )
         }
         "type_delete" | "type_rename" | "type_create_enum" | "type_typedef" | "type_add_field" | "type_del_field" => {
-            // Forward full args to bridge (same wire names as CLI).
-            let payload = args.clone();
+            let payload = normalize_type_mutation_args(name, args);
+            if let Some(err) = payload.get("__error").and_then(|e| e.as_str()) {
+                return tool_error(
+                    id,
+                    name,
+                    err,
+                    recovery_for(name, err),
+                );
+            }
             let cmd = name.to_string();
             bridge_tool(
                 id, name, cached_client, default_project, default_program, projects_dir, true,
@@ -1598,15 +1646,26 @@ fn dispatch_tool(
                 obj.insert("tool".into(), json!("summarize"));
                 obj.insert("arguments".into(), json!({"focus": focus}));
             }
-            dispatch_tool(
+            let resp = dispatch_tool(
                 "programs_foreach",
                 &args2,
-                id,
+                id.clone(),
                 cached_client,
                 default_project,
                 default_program,
                 projects_dir,
-            )
+            );
+            // Preserve tool identity in the envelope for agents/tests.
+            if let Some(text) = resp
+                .pointer("/result/content/0/text")
+                .and_then(|t| t.as_str())
+            {
+                if let Ok(mut env) = serde_json::from_str::<Value>(text) {
+                    env["command"] = json!("firmware_summarize");
+                    return wrap_envelope_as_content(env, id);
+                }
+            }
+            resp
         }
 
         "transaction_begin" => {
@@ -1640,6 +1699,107 @@ fn dispatch_tool(
 // ---------------------------------------------------------------------------
 // Bridge helpers
 // ---------------------------------------------------------------------------
+
+/// Map MCP-friendly type mutation args onto bridge wire keys.
+fn normalize_type_mutation_args(command: &str, args: &Value) -> Value {
+    let mut out = args.clone();
+    let obj = match out.as_object_mut() {
+        Some(o) => o,
+        None => {
+            return json!({"__error": "arguments must be an object"});
+        }
+    };
+    match command {
+        "type_add_field" => {
+            if !obj.contains_key("type_name") {
+                if let Some(v) = obj.get("struct").cloned() {
+                    obj.insert("type_name".into(), v);
+                }
+            }
+            if !obj.contains_key("field_name") {
+                if let Some(v) = obj.get("name").cloned() {
+                    obj.insert("field_name".into(), v);
+                }
+            }
+            if !obj.contains_key("field_type") {
+                if let Some(v) = obj.get("type").cloned() {
+                    obj.insert("field_type".into(), v);
+                }
+            }
+            let missing = ["type_name", "field_name", "field_type"]
+                .iter()
+                .any(|k| obj.get(*k).and_then(|v| v.as_str()).unwrap_or("").is_empty());
+            if missing {
+                return json!({"__error": "type_name, field_name, and field_type required"});
+            }
+        }
+        "type_del_field" => {
+            if !obj.contains_key("type_name") {
+                if let Some(v) = obj.get("struct").cloned() {
+                    obj.insert("type_name".into(), v);
+                }
+            }
+            if !obj.contains_key("field_name") {
+                if let Some(v) = obj.get("name").cloned() {
+                    obj.insert("field_name".into(), v);
+                }
+            }
+            let missing = ["type_name", "field_name"]
+                .iter()
+                .any(|k| obj.get(*k).and_then(|v| v.as_str()).unwrap_or("").is_empty());
+            if missing {
+                return json!({"__error": "type_name and field_name required"});
+            }
+        }
+        "type_typedef" => {
+            if !obj.contains_key("base_type") {
+                if let Some(v) = obj.get("base").cloned() {
+                    obj.insert("base_type".into(), v);
+                }
+            }
+            let missing = ["name", "base_type"]
+                .iter()
+                .any(|k| obj.get(*k).and_then(|v| v.as_str()).unwrap_or("").is_empty());
+            if missing {
+                return json!({"__error": "name and base_type required"});
+            }
+        }
+        "type_create_enum" => {
+            // Bridge wants values as "KEY=1,KEY2=2" string. Accept object maps too.
+            if let Some(Value::Object(map)) = obj.get("values").cloned() {
+                let pairs: Vec<String> = map
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        let n = if let Some(i) = v.as_i64() {
+                            i.to_string()
+                        } else if let Some(s) = v.as_str() {
+                            s.to_string()
+                        } else {
+                            return None;
+                        };
+                        Some(format!("{}={}", k, n))
+                    })
+                    .collect();
+                obj.insert("values".into(), json!(pairs.join(",")));
+            }
+            let missing = ["name", "values"]
+                .iter()
+                .any(|k| {
+                    match obj.get(*k) {
+                        Some(Value::String(s)) => s.is_empty(),
+                        Some(_) => false,
+                        None => true,
+                    }
+                });
+            if missing {
+                return json!({"__error": "name and values required (string KEY=VALUE,... or object)"});
+            }
+        }
+        "type_delete" | "type_rename" => {}
+        _ => {}
+    }
+    out
+}
 
 fn require_str_then<F>(id: Option<Value>, command: &str, args: &Value, field: &str, f: F) -> Value
 where
@@ -2450,11 +2610,10 @@ fn handle_http_connection(
                         "error": {"code": -32700, "message": format!("Parse error: {}", e)}
                     });
                     if stream_mode {
-                        let sse = build_streamed_tool_response(
-                            &err,
-                            &[(100, "parse_error")],
-                        );
-                        write_sse_response(&mut stream, &sse)?;
+                        write_sse_headers(&mut stream)?;
+                        let sse = build_streamed_tool_response(&err, &[(100, "parse_error")]);
+                        stream.write_all(sse.as_bytes())?;
+                        stream.flush()?;
                     } else {
                         let bytes = serde_json::to_vec(&err)?;
                         write_http_response(&mut stream, 200, "application/json", &bytes)?;
@@ -2463,22 +2622,29 @@ fn handle_http_connection(
                 }
             };
 
-            // Long-job path: emit progress frames (and optional job_status poll),
-            // then the same JSON-RPC result envelope as non-stream mode.
+            // Long-job path: flush progress frames *before* and *after* work so
+            // clients see interim SSE while the tool runs (true streaming, not
+            // a post-hoc buffer). Final frame is the same JSON-RPC body as non-stream.
             if stream_mode {
+                use crate::extras::{sse_progress_frame, sse_result_frame};
                 let method_name = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
                 let tool_name = req
                     .pointer("/params/name")
                     .and_then(|n| n.as_str())
                     .unwrap_or("");
-                let mut steps: Vec<(u8, String)> = vec![
-                    (5, "accepted".into()),
-                    (15, format!("dispatch:{}", method_name)),
-                ];
+                write_sse_headers(&mut stream)?;
+                stream.write_all(sse_progress_frame(None, 5, "accepted").as_bytes())?;
+                stream.flush()?;
+                stream.write_all(
+                    sse_progress_frame(None, 15, &format!("dispatch:{}", method_name)).as_bytes(),
+                )?;
+                stream.flush()?;
                 if method_name == "tools/call" {
-                    steps.push((25, format!("tool:{}", tool_name)));
+                    stream.write_all(
+                        sse_progress_frame(None, 25, &format!("tool:{}", tool_name)).as_bytes(),
+                    )?;
+                    stream.flush()?;
                 }
-                // Best-effort job queue snapshot for multi-second work.
                 if let Ok((client, _)) = get_bridge_client(
                     cached_client,
                     default_project.clone(),
@@ -2491,14 +2657,21 @@ fn handle_http_connection(
                             .and_then(|j| j.get("progress_message").or(j.get("command")))
                             .and_then(|m| m.as_str())
                             .unwrap_or("bridge_idle_or_busy");
-                        steps.push((40, format!("bridge:{}", msg)));
+                        stream.write_all(
+                            sse_progress_frame(None, 40, &format!("bridge:{}", msg)).as_bytes(),
+                        )?;
                     } else {
-                        steps.push((40, "bridge_connected".into()));
+                        stream.write_all(sse_progress_frame(None, 40, "bridge_connected").as_bytes())?;
                     }
+                    stream.flush()?;
                 } else {
-                    steps.push((40, "no_bridge_local_handler".into()));
+                    stream.write_all(
+                        sse_progress_frame(None, 40, "no_bridge_local_handler").as_bytes(),
+                    )?;
+                    stream.flush()?;
                 }
-                steps.push((60, "executing".into()));
+                stream.write_all(sse_progress_frame(None, 60, "executing").as_bytes())?;
+                stream.flush()?;
 
                 let resp = handle_request(
                     &req,
@@ -2507,12 +2680,12 @@ fn handle_http_connection(
                     default_program,
                     projects_dir,
                 );
-                steps.push((90, "finalizing".into()));
-                steps.push((100, "complete".into()));
-                let step_refs: Vec<(u8, &str)> =
-                    steps.iter().map(|(p, m)| (*p, m.as_str())).collect();
-                let sse = build_streamed_tool_response(&resp, &step_refs);
-                write_sse_response(&mut stream, &sse)?;
+                stream.write_all(sse_progress_frame(None, 90, "finalizing").as_bytes())?;
+                stream.flush()?;
+                stream.write_all(sse_progress_frame(None, 100, "complete").as_bytes())?;
+                stream.flush()?;
+                stream.write_all(sse_result_frame(&resp).as_bytes())?;
+                stream.flush()?;
             } else {
                 let resp = handle_request(
                     &req,
@@ -2555,8 +2728,9 @@ fn write_http_response(
         404 => "Not Found",
         _ => "Error",
     };
+    // No CORS * — non-browser agents do not need it; browser CSRF risk on mutations.
     let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
         reason,
         content_type,
@@ -2568,14 +2742,10 @@ fn write_http_response(
     Ok(())
 }
 
-/// SSE response for long-job progress + final JSON-RPC result.
-fn write_sse_response(stream: &mut TcpStream, sse_body: &str) -> anyhow::Result<()> {
-    let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n",
-        sse_body.len()
-    );
+/// Start an SSE response without Content-Length so frames can flush mid-request.
+fn write_sse_headers(stream: &mut TcpStream) -> anyhow::Result<()> {
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     stream.write_all(header.as_bytes())?;
-    stream.write_all(sse_body.as_bytes())?;
     stream.flush()?;
     Ok(())
 }
@@ -3169,18 +3339,23 @@ mod tests {
         let mut reader = BufReader::new(stream);
         reader.read_to_string(&mut resp).ok();
         assert!(resp.contains("text/event-stream"), "resp={}", resp);
+        // No Content-Length on true streaming path
+        assert!(
+            !resp.to_ascii_lowercase().contains("content-length:"),
+            "streaming SSE should not set Content-Length; resp headers={}",
+            resp.lines().take(8).collect::<Vec<_>>().join(" | ")
+        );
+        assert!(!resp.contains("Access-Control-Allow-Origin: *"), "CORS * removed");
         assert!(resp.contains("event: progress"), "resp={}", resp);
         assert!(resp.contains("event: result"), "resp={}", resp);
         assert!(resp.contains("mcp_progress") || resp.contains("percent"), "resp={}", resp);
         assert!(resp.contains("pong") || resp.contains("success"), "resp={}", resp);
-        // Final envelope keys present in result payload
         assert!(
             resp.contains("provenance") || resp.contains("tool_version") || resp.contains("next_steps"),
             "resp={}",
             resp
         );
 
-        // Also exercise pure framing helper used by the server path
         let framed = build_streamed_tool_response(
             &json!({"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"status\":\"success\",\"provenance\":{}}"}]}}),
             &[(10, "queued"), (100, "done")],
@@ -3190,6 +3365,76 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         let _ = thr.join();
         let _ = std::fs::remove_file(port_file);
+    }
+
+    #[test]
+    fn mutation_wire_keys_match_bridge_contract() {
+        // Offline: normalize payloads the handlers would send.
+        let del = json!({"address": "0x1000"});
+        assert_eq!(del["address"], "0x1000");
+        let ret = json!({"target": "main", "return_type": "int"});
+        assert!(ret.get("return_type").is_some());
+        let var = json!({"function": "main", "var_name": "x", "type_name": "int"});
+        assert!(var.get("var_name").is_some() && var.get("type_name").is_some());
+
+        let add = normalize_type_mutation_args(
+            "type_add_field",
+            &json!({"struct": "S", "name": "f", "type": "int", "offset": 0}),
+        );
+        assert_eq!(add["type_name"], "S");
+        assert_eq!(add["field_name"], "f");
+        assert_eq!(add["field_type"], "int");
+
+        let td = normalize_type_mutation_args(
+            "type_typedef",
+            &json!({"name": "MyInt", "base": "int"}),
+        );
+        assert_eq!(td["base_type"], "int");
+
+        let en = normalize_type_mutation_args(
+            "type_create_enum",
+            &json!({"name": "E", "values": {"A": 1, "B": 2}}),
+        );
+        let vs = en["values"].as_str().unwrap();
+        assert!(vs.contains("A=1") && vs.contains("B=2"));
+
+        // Schema lists wire names
+        let defs = tool_definitions();
+        let find = |n: &str| {
+            defs.as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == n)
+                .unwrap()
+                .clone()
+        };
+        let props = |n: &str| find(n)["inputSchema"]["properties"].clone();
+        assert!(props("delete_function").get("address").is_some());
+        assert!(props("function_set_return_type").get("return_type").is_some());
+        assert!(props("set_var_type").get("var_name").is_some());
+        assert!(props("type_add_field").get("type_name").is_some());
+        assert!(props("type_typedef").get("base_type").is_some());
+    }
+
+    #[test]
+    fn firmware_summarize_preserves_command_name_offline() {
+        // Without bridge, programs empty -> error, but if we only check rewrite path
+        // with empty programs list after foreach-style empty, still returns error.
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "firmware_summarize",
+                "arguments": {"programs": [], "focus": "imports"}
+            }
+        });
+        let mut cached: Option<(String, BridgeClient)> = None;
+        let resp = handle_request(&req, &mut cached, None, None, None);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let env: Value = serde_json::from_str(text).unwrap();
+        // Either error (no programs) with command firmware_summarize, or success rewritten.
+        assert_eq!(env["command"], "firmware_summarize", "env={}", env);
     }
 
     #[test]

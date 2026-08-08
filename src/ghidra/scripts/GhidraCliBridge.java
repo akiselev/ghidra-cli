@@ -1218,6 +1218,21 @@ public class GhidraCliBridge extends GhidraScript {
         funcData.addProperty("size", func.getBody().getNumAddresses());
         funcData.addProperty("entry_point", func.getEntryPoint().toString());
 
+        // Parent namespace (empty string when global) for MCP decompile enrichment.
+        try {
+            Namespace ns = func.getParentNamespace();
+            if (ns != null && ns.getName() != null) {
+                funcData.addProperty("namespace", ns.getName());
+                funcData.addProperty("parent_namespace", ns.getName(true));
+            } else {
+                funcData.addProperty("namespace", "");
+                funcData.addProperty("parent_namespace", "");
+            }
+        } catch (Exception e) {
+            funcData.addProperty("namespace", "");
+            funcData.addProperty("parent_namespace", "");
+        }
+
         String sig = null;
         try {
             sig = func.getPrototypeString(false, false);
@@ -1414,7 +1429,9 @@ public class GhidraCliBridge extends GhidraScript {
     private JsonObject handleDeleteFunction(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
 
+        // Accept address (CLI) or target (MCP alias).
         String target = getArgString(args, "address");
+        if (target == null || target.isEmpty()) target = getArgString(args, "target");
         if (target == null || target.isEmpty()) {
             return errorResult("Function target required");
         }
@@ -2156,6 +2173,17 @@ public class GhidraCliBridge extends GhidraScript {
 
             // Release current program if one is open
             if (currentProgram != null) {
+                // Explicit multi-mutation transaction is program-scoped; abort on switch
+                // so commit/abort cannot target a stale id on the new program.
+                if (explicitTransactionId >= 0) {
+                    try {
+                        currentProgram.endTransaction(explicitTransactionId, false);
+                    } catch (Exception e) {
+                        // best effort
+                    }
+                    explicitTransactionId = -1;
+                    explicitTransactionName = null;
+                }
                 try {
                     currentProgram.save("Auto-save before switch", mon);
                 } catch (Exception e) {
@@ -2177,6 +2205,9 @@ public class GhidraCliBridge extends GhidraScript {
             JsonObject result = new JsonObject();
             result.addProperty("status", "success");
             result.addProperty("program", currentProgram.getName());
+            if (explicitTransactionId < 0) {
+                result.addProperty("transaction_cleared", true);
+            }
             return result;
 
         } catch (Exception e) {
@@ -3233,6 +3264,7 @@ public class GhidraCliBridge extends GhidraScript {
         if (currentProgram == null) return errorResult("No program loaded");
         String name = getArgString(args, "name");
         String baseTypeName = getArgString(args, "base_type");
+        if (baseTypeName == null) baseTypeName = getArgString(args, "base"); // MCP alias
         if (name == null || baseTypeName == null) return errorResult("name and base_type required");
 
         try {
@@ -3264,8 +3296,11 @@ public class GhidraCliBridge extends GhidraScript {
     private JsonObject handleTypeAddField(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
         String typeName = getArgString(args, "type_name");
+        if (typeName == null) typeName = getArgString(args, "struct"); // MCP alias
         String fieldName = getArgString(args, "field_name");
+        if (fieldName == null) fieldName = getArgString(args, "name");
         String fieldTypeName = getArgString(args, "field_type");
+        if (fieldTypeName == null) fieldTypeName = getArgString(args, "type");
         if (typeName == null || fieldName == null || fieldTypeName == null)
             return errorResult("type_name, field_name, and field_type required");
 
@@ -3308,7 +3343,9 @@ public class GhidraCliBridge extends GhidraScript {
     private JsonObject handleTypeDelField(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
         String typeName = getArgString(args, "type_name");
+        if (typeName == null) typeName = getArgString(args, "struct");
         String fieldName = getArgString(args, "field_name");
+        if (fieldName == null) fieldName = getArgString(args, "name");
         if (typeName == null || fieldName == null)
             return errorResult("type_name and field_name required");
 
@@ -3402,6 +3439,7 @@ public class GhidraCliBridge extends GhidraScript {
         if (currentProgram == null) return errorResult("No program loaded");
         String target = getArgString(args, "target");
         String returnTypeName = getArgString(args, "return_type");
+        if (returnTypeName == null) returnTypeName = getArgString(args, "type"); // MCP alias
         if (target == null || returnTypeName == null)
             return errorResult("target and return_type required");
 
@@ -3474,7 +3512,9 @@ public class GhidraCliBridge extends GhidraScript {
         if (currentProgram == null) return errorResult("No program loaded");
         String funcTarget = getArgString(args, "function");
         String varName = getArgString(args, "var_name");
+        if (varName == null) varName = getArgString(args, "variable"); // MCP alias
         String typeName = getArgString(args, "type_name");
+        if (typeName == null) typeName = getArgString(args, "type"); // MCP alias
         if (funcTarget == null || funcTarget.isEmpty()) return errorResult("Function target required");
         if (varName == null || varName.isEmpty()) return errorResult("Variable name required (--var)");
         if (typeName == null || typeName.isEmpty()) return errorResult("Type name required (--type)");
