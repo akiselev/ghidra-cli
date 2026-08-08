@@ -52,8 +52,14 @@ pub fn ensure_test_project(project: &str, program: &str) {
         // NOT at <projects_dir>/<project_name>/<project_name>.gpr
         // because start_bridge passes (project_path.parent(), project_path.file_name())
         // to analyzeHeadless.
-        let projects_dir = ghidra_cli::config::Config::default_project_dir()
-            .expect("Could not determine default project dir");
+        // Match CLI resolution (env GHIDRA_PROJECT_DIR, config, then default).
+        // Using default_project_dir() alone diverges from `ghidra import` when
+        // config points at a different directory (e.g. a legacy ~/.ghidra-projects).
+        let projects_dir = ghidra_cli::config::Config::load()
+            .ok()
+            .and_then(|c| c.get_project_dir().ok())
+            .or_else(|| ghidra_cli::config::Config::default_project_dir().ok())
+            .expect("Could not determine project dir");
         let gpr_file = projects_dir.join(format!("{}.gpr", project));
         let rep_dir = projects_dir.join(format!("{}.rep", project));
 
@@ -115,9 +121,12 @@ pub fn ensure_test_project(project: &str, program: &str) {
         // so output()/wait_with_output() blocks forever. Using null avoids this.
         eprintln!("Step 1: Importing binary {:?} ...", binary);
         let ghidra_bin = assert_cmd::cargo::cargo_bin!("ghidra");
+        let projects_dir_str = projects_dir.to_string_lossy().into_owned();
         let import_status = run_cli_with_timeout(
             ghidra_bin,
             &[
+                "--projects-dir",
+                &projects_dir_str,
                 "import",
                 binary.to_str().unwrap(),
                 "--project",
@@ -144,6 +153,8 @@ pub fn ensure_test_project(project: &str, program: &str) {
         let analyze_status = run_cli_with_timeout(
             ghidra_bin,
             &[
+                "--projects-dir",
+                &projects_dir_str,
                 "analyze",
                 "--project",
                 project,
@@ -179,7 +190,13 @@ pub fn ensure_test_project(project: &str, program: &str) {
         eprintln!("Step 3: Stopping bridge to flush project to disk...");
         let stop_status = run_cli_with_timeout(
             ghidra_bin,
-            &["stop", "--project", project],
+            &[
+                "--projects-dir",
+                &projects_dir_str,
+                "stop",
+                "--project",
+                project,
+            ],
             Duration::from_secs(120),
         );
         match stop_status {
@@ -212,10 +229,13 @@ impl DaemonTestHarness {
     pub fn new(project: &str, program: &str) -> Result<Self> {
         let data_dir = get_unique_data_dir();
 
-        // Resolve the project path (must match the CLI's default via get_project_dir)
-        let project_path = ghidra_cli::config::Config::default_project_dir()
-            .context("Could not determine default project dir")?
-            .join(project);
+        // Resolve the project path the same way ensure_test_project / CLI do.
+        let projects_dir = ghidra_cli::config::Config::load()
+            .ok()
+            .and_then(|c| c.get_project_dir().ok())
+            .or_else(|| ghidra_cli::config::Config::default_project_dir().ok())
+            .context("Could not determine project dir")?;
+        let project_path = projects_dir.join(project);
 
         // Load config to find Ghidra installation
         let config = ghidra_cli::config::Config::load().context("Failed to load config")?;
