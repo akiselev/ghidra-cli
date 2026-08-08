@@ -129,6 +129,7 @@ fn connect_with_retry(addr: &std::net::SocketAddr) -> Result<TcpStream> {
 }
 
 /// Client for communicating with the Ghidra Java bridge.
+#[derive(Clone, Copy)]
 pub struct BridgeClient {
     port: u16,
 }
