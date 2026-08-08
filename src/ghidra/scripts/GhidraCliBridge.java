@@ -110,6 +110,11 @@ public class GhidraCliBridge extends GhidraScript {
     private volatile String projectNameSnapshot;
     private volatile int programCountSnapshot;
 
+    // Explicit user-visible transaction for multi-mutation undo (item 5).
+    // -1 means no open explicit transaction.
+    private volatile int explicitTransactionId = -1;
+    private volatile String explicitTransactionName;
+
     private static final Pattern NAMED_HEX_ADDRESS_PATTERN =
         Pattern.compile("(?i)^(?:FUN|SUB|LAB|DAT)_([0-9a-f]+)$");
 
@@ -739,6 +744,9 @@ public class GhidraCliBridge extends GhidraScript {
             // Diff commands
             case "diff_programs":   return handleDiffPrograms(args);
             case "diff_functions":  return handleDiffFunctions(args);
+            case "transfer_analysis": return handleTransferAnalysis(args);
+            case "structure_recover": return handleStructureRecover(args);
+            case "data_flow":       return handleDataFlow(args);
             // Patch commands
             case "patch_bytes":     return handlePatchBytes(args);
             case "patch_nop":       return handlePatchNop(args);
@@ -755,6 +763,11 @@ public class GhidraCliBridge extends GhidraScript {
             case "batch":           return handleBatch(args);
             // Memory read
             case "read_memory":     return handleReadMemory(args);
+            // Deeper primitives (item 5)
+            case "pcode":           return handlePcode(args);
+            case "transaction_begin": return handleTransactionBegin(args);
+            case "transaction_commit": return handleTransactionCommit();
+            case "transaction_abort": return handleTransactionAbort();
             default:                return null;
         }
     }
@@ -1205,6 +1218,21 @@ public class GhidraCliBridge extends GhidraScript {
         funcData.addProperty("size", func.getBody().getNumAddresses());
         funcData.addProperty("entry_point", func.getEntryPoint().toString());
 
+        // Parent namespace (empty string when global) for MCP decompile enrichment.
+        try {
+            Namespace ns = func.getParentNamespace();
+            if (ns != null && ns.getName() != null) {
+                funcData.addProperty("namespace", ns.getName());
+                funcData.addProperty("parent_namespace", ns.getName(true));
+            } else {
+                funcData.addProperty("namespace", "");
+                funcData.addProperty("parent_namespace", "");
+            }
+        } catch (Exception e) {
+            funcData.addProperty("namespace", "");
+            funcData.addProperty("parent_namespace", "");
+        }
+
         String sig = null;
         try {
             sig = func.getPrototypeString(false, false);
@@ -1401,7 +1429,9 @@ public class GhidraCliBridge extends GhidraScript {
     private JsonObject handleDeleteFunction(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
 
+        // Accept address (CLI) or target (MCP alias).
         String target = getArgString(args, "address");
+        if (target == null || target.isEmpty()) target = getArgString(args, "target");
         if (target == null || target.isEmpty()) {
             return errorResult("Function target required");
         }
@@ -2143,6 +2173,17 @@ public class GhidraCliBridge extends GhidraScript {
 
             // Release current program if one is open
             if (currentProgram != null) {
+                // Explicit multi-mutation transaction is program-scoped; abort on switch
+                // so commit/abort cannot target a stale id on the new program.
+                if (explicitTransactionId >= 0) {
+                    try {
+                        currentProgram.endTransaction(explicitTransactionId, false);
+                    } catch (Exception e) {
+                        // best effort
+                    }
+                    explicitTransactionId = -1;
+                    explicitTransactionName = null;
+                }
                 try {
                     currentProgram.save("Auto-save before switch", mon);
                 } catch (Exception e) {
@@ -2164,6 +2205,9 @@ public class GhidraCliBridge extends GhidraScript {
             JsonObject result = new JsonObject();
             result.addProperty("status", "success");
             result.addProperty("program", currentProgram.getName());
+            if (explicitTransactionId < 0) {
+                result.addProperty("transaction_cleared", true);
+            }
             return result;
 
         } catch (Exception e) {
@@ -3220,6 +3264,7 @@ public class GhidraCliBridge extends GhidraScript {
         if (currentProgram == null) return errorResult("No program loaded");
         String name = getArgString(args, "name");
         String baseTypeName = getArgString(args, "base_type");
+        if (baseTypeName == null) baseTypeName = getArgString(args, "base"); // MCP alias
         if (name == null || baseTypeName == null) return errorResult("name and base_type required");
 
         try {
@@ -3251,8 +3296,11 @@ public class GhidraCliBridge extends GhidraScript {
     private JsonObject handleTypeAddField(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
         String typeName = getArgString(args, "type_name");
+        if (typeName == null) typeName = getArgString(args, "struct"); // MCP alias
         String fieldName = getArgString(args, "field_name");
+        if (fieldName == null) fieldName = getArgString(args, "name");
         String fieldTypeName = getArgString(args, "field_type");
+        if (fieldTypeName == null) fieldTypeName = getArgString(args, "type");
         if (typeName == null || fieldName == null || fieldTypeName == null)
             return errorResult("type_name, field_name, and field_type required");
 
@@ -3295,7 +3343,9 @@ public class GhidraCliBridge extends GhidraScript {
     private JsonObject handleTypeDelField(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
         String typeName = getArgString(args, "type_name");
+        if (typeName == null) typeName = getArgString(args, "struct");
         String fieldName = getArgString(args, "field_name");
+        if (fieldName == null) fieldName = getArgString(args, "name");
         if (typeName == null || fieldName == null)
             return errorResult("type_name and field_name required");
 
@@ -3389,6 +3439,7 @@ public class GhidraCliBridge extends GhidraScript {
         if (currentProgram == null) return errorResult("No program loaded");
         String target = getArgString(args, "target");
         String returnTypeName = getArgString(args, "return_type");
+        if (returnTypeName == null) returnTypeName = getArgString(args, "type"); // MCP alias
         if (target == null || returnTypeName == null)
             return errorResult("target and return_type required");
 
@@ -3461,7 +3512,9 @@ public class GhidraCliBridge extends GhidraScript {
         if (currentProgram == null) return errorResult("No program loaded");
         String funcTarget = getArgString(args, "function");
         String varName = getArgString(args, "var_name");
+        if (varName == null) varName = getArgString(args, "variable"); // MCP alias
         String typeName = getArgString(args, "type_name");
+        if (typeName == null) typeName = getArgString(args, "type"); // MCP alias
         if (funcTarget == null || funcTarget.isEmpty()) return errorResult("Function target required");
         if (varName == null || varName.isEmpty()) return errorResult("Variable name required (--var)");
         if (typeName == null || typeName.isEmpty()) return errorResult("Type name required (--type)");
@@ -3941,49 +3994,493 @@ public class GhidraCliBridge extends GhidraScript {
 
     // --- Diff Handlers ---
 
+    /**
+     * Headless dual-program match/delta: open both programs from the project,
+     * compare function name sets, and return dual-side provenance + match report.
+     * Does not replace interactive Version Tracking; it is the durable match surface.
+     */
     private JsonObject handleDiffPrograms(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        String prog1Name = getArgString(args, "program1");
+        String prog2Name = getArgString(args, "program2");
+        if (prog1Name == null || prog1Name.isEmpty() || prog2Name == null || prog2Name.isEmpty()) {
+            return errorResult("program1 and program2 required");
+        }
+        if (prog1Name.equals(prog2Name)) {
+            return errorResult("program1 and program2 must be different programs");
+        }
 
-        String prog1 = getArgString(args, "program1");
-        String prog2 = getArgString(args, "program2");
-        if (prog1 == null) prog1 = "";
-        if (prog2 == null) prog2 = "";
+        Project project = state == null ? null : state.getProject();
+        if (project == null) return errorResult("No project open");
 
+        Program p1 = null;
+        Program p2 = null;
+        Object consumer = this;
         try {
-            FunctionManager fm = currentProgram.getFunctionManager();
-            Memory memory = currentProgram.getMemory();
-            SymbolTable symbolTable = currentProgram.getSymbolTable();
+            p1 = openProgramByName(prog1Name, consumer);
+            p2 = openProgramByName(prog2Name, consumer);
+            if (p1 == null) return errorResult("Program not found: " + prog1Name);
+            if (p2 == null) return errorResult("Program not found: " + prog2Name);
 
-            JsonObject prog1Stats = new JsonObject();
-            prog1Stats.addProperty("name", prog1);
-            prog1Stats.addProperty("function_count", fm.getFunctionCount());
-            prog1Stats.addProperty("memory_size", memory.getSize());
-            prog1Stats.addProperty("symbol_count", symbolTable.getNumSymbols());
+            java.util.LinkedHashSet<String> names1 = functionNameSet(p1);
+            java.util.LinkedHashSet<String> names2 = functionNameSet(p2);
 
-            JsonArray memBlocks = new JsonArray();
-            for (MemoryBlock block : memory.getBlocks()) {
-                JsonObject blockObj = new JsonObject();
-                blockObj.addProperty("name", block.getName());
-                blockObj.addProperty("start", block.getStart().toString());
-                blockObj.addProperty("end", block.getEnd().toString());
-                blockObj.addProperty("size", block.getSize());
-                memBlocks.add(blockObj);
+            JsonArray matched = new JsonArray();
+            JsonArray only1 = new JsonArray();
+            JsonArray only2 = new JsonArray();
+            for (String n : names1) {
+                if (names2.contains(n)) matched.add(n);
+                else only1.add(n);
             }
-            prog1Stats.add("memory_blocks", memBlocks);
+            for (String n : names2) {
+                if (!names1.contains(n)) only2.add(n);
+            }
 
-            JsonObject prog2Stats = new JsonObject();
-            prog2Stats.addProperty("name", prog2);
-            prog2Stats.addProperty("note", "Comparison requires loading second program");
+            // Cap large lists so agents get a usable delta, not a multi-MB dump.
+            final int CAP = 200;
+            JsonArray matchedOut = takeFirst(matched, CAP);
+            JsonArray only1Out = takeFirst(only1, CAP);
+            JsonArray only2Out = takeFirst(only2, CAP);
+
+            JsonObject side1 = programSideSummary(p1, prog1Name);
+            JsonObject side2 = programSideSummary(p2, prog2Name);
 
             JsonObject result = new JsonObject();
-            result.add("program1", prog1Stats);
-            result.add("program2", prog2Stats);
-            result.addProperty("status", "partial");
-            result.addProperty("message", "Single program stats returned (multi-program comparison not implemented)");
+            result.addProperty("status", "success");
+            result.add("program1", side1);
+            result.add("program2", side2);
+            result.addProperty("matched_count", matched.size());
+            result.addProperty("only_in_program1_count", only1.size());
+            result.addProperty("only_in_program2_count", only2.size());
+            result.add("matched_functions", matchedOut);
+            result.add("only_in_program1", only1Out);
+            result.add("only_in_program2", only2Out);
+            result.addProperty("truncated",
+                matched.size() > CAP || only1.size() > CAP || only2.size() > CAP);
+            result.addProperty("method", "function_name_set_match");
+            result.addProperty(
+                "note",
+                "Headless name-set match. Use diff_functions for decompile-level deltas; "
+                    + "full interactive Version Tracking is not exposed."
+            );
+            // Dual-side provenance for agent envelopes
+            JsonObject provenance = new JsonObject();
+            provenance.add("program1", side1.deepCopy());
+            provenance.add("program2", side2.deepCopy());
+            result.add("dual_provenance", provenance);
             return result;
         } catch (Exception e) {
             return errorResult("Failed to diff programs: " + e.getMessage());
+        } finally {
+            releaseProgramQuietly(p1, consumer);
+            releaseProgramQuietly(p2, consumer);
         }
+    }
+
+    private Program openProgramByName(String programName, Object consumer) throws Exception {
+        Project project = state.getProject();
+        if (project == null) return null;
+        ProjectData projectData = project.getProjectData();
+        DomainFolder rootFolder = projectData.getRootFolder();
+        DomainFile domainFile = null;
+        for (DomainFile f : rootFolder.getFiles()) {
+            if (f.getName().equals(programName)) {
+                domainFile = f;
+                break;
+            }
+        }
+        if (domainFile == null) {
+            String path = programName.startsWith("/") ? programName : "/" + programName;
+            domainFile = projectData.getFile(path);
+        }
+        if (domainFile == null) return null;
+        // Reuse current program instance if it is already the requested one.
+        if (currentProgram != null && currentProgram.getName().equals(programName)) {
+            return currentProgram;
+        }
+        DomainObject domObj = domainFile.getDomainObject(consumer, true, false, monitor);
+        if (domObj instanceof Program) {
+            return (Program) domObj;
+        }
+        if (domObj != null) {
+            try { domObj.release(consumer); } catch (Exception ignored) {}
+        }
+        return null;
+    }
+
+    private java.util.LinkedHashSet<String> functionNameSet(Program program) {
+        java.util.LinkedHashSet<String> names = new java.util.LinkedHashSet<>();
+        FunctionManager fm = program.getFunctionManager();
+        FunctionIterator it = fm.getFunctions(true);
+        while (it.hasNext()) {
+            Function f = it.next();
+            if (f != null && f.getName() != null) names.add(f.getName());
+        }
+        return names;
+    }
+
+    private JsonObject programSideSummary(Program program, String requestedName) {
+        JsonObject side = new JsonObject();
+        String domainName = program.getName();
+        try {
+            if (program.getDomainFile() != null && program.getDomainFile().getName() != null) {
+                domainName = program.getDomainFile().getName();
+            }
+        } catch (Exception ignored) {}
+        side.addProperty("name", domainName);
+        side.addProperty("requested_name", requestedName);
+        side.addProperty("function_count", program.getFunctionManager().getFunctionCount());
+        side.addProperty("memory_size", program.getMemory().getSize());
+        side.addProperty("symbol_count", program.getSymbolTable().getNumSymbols());
+        try {
+            String path = program.getExecutablePath();
+            if (path != null) side.addProperty("executable_path", path);
+        } catch (Exception ignored) {}
+        try {
+            String fmt = program.getExecutableFormat();
+            if (fmt != null) side.addProperty("executable_format", fmt);
+        } catch (Exception ignored) {}
+        try {
+            String lang = program.getLanguage() != null ? program.getLanguage().toString() : null;
+            if (lang != null) side.addProperty("language", lang);
+        } catch (Exception ignored) {}
+        return side;
+    }
+
+    private JsonArray takeFirst(JsonArray src, int cap) {
+        JsonArray out = new JsonArray();
+        int n = Math.min(src.size(), cap);
+        for (int i = 0; i < n; i++) out.add(src.get(i));
+        return out;
+    }
+
+    private void releaseProgramQuietly(Program program, Object consumer) {
+        if (program == null) return;
+        // Never release the session currentProgram from a temporary open.
+        if (program == currentProgram) return;
+        try {
+            program.release(consumer);
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * Transfer labels and/or EOL comments from program1 matched functions onto
+     * program2 (matched by function name). Mutations apply only to program2.
+     */
+    private JsonObject handleTransferAnalysis(JsonObject args) {
+        String prog1Name = getArgString(args, "program1");
+        String prog2Name = getArgString(args, "program2");
+        if (prog1Name == null || prog1Name.isEmpty() || prog2Name == null || prog2Name.isEmpty()) {
+            return errorResult("program1 and program2 required");
+        }
+        if (prog1Name.equals(prog2Name)) {
+            return errorResult("program1 and program2 must be different");
+        }
+        boolean doLabels = getArgBool(args, "labels", true);
+        boolean doComments = getArgBool(args, "comments", true);
+        int limit = 50;
+        if (args != null && args.has("limit") && !args.get("limit").isJsonNull()) {
+            limit = args.get("limit").getAsInt();
+            if (limit <= 0) limit = 50;
+        }
+
+        Project project = state == null ? null : state.getProject();
+        if (project == null) return errorResult("No project open");
+
+        Program p1 = null;
+        Program p2 = null;
+        Object consumer = this;
+        try {
+            p1 = openProgramByName(prog1Name, consumer);
+            p2 = openProgramByName(prog2Name, consumer);
+            if (p1 == null) return errorResult("Program not found: " + prog1Name);
+            if (p2 == null) return errorResult("Program not found: " + prog2Name);
+
+            java.util.LinkedHashSet<String> names1 = functionNameSet(p1);
+            java.util.LinkedHashSet<String> matched = new java.util.LinkedHashSet<>();
+            for (String n : names1) {
+                Function f2 = findFunctionByNameInProgram(p2, n);
+                if (f2 != null) matched.add(n);
+            }
+
+            JsonArray transferred = new JsonArray();
+            int count = 0;
+            int txId = p2.startTransaction("transfer_analysis");
+            boolean ok = false;
+            try {
+                for (String n : matched) {
+                    if (count >= limit) break;
+                    Function f1 = findFunctionByNameInProgram(p1, n);
+                    Function f2 = findFunctionByNameInProgram(p2, n);
+                    if (f1 == null || f2 == null) continue;
+
+                    JsonObject row = new JsonObject();
+                    row.addProperty("function", n);
+                    row.addProperty("address_src", f1.getEntryPoint().toString());
+                    row.addProperty("address_dst", f2.getEntryPoint().toString());
+                    boolean changed = false;
+
+                    if (doLabels) {
+                        // Name-set matches already share the function name; create a
+                        // durable secondary user label on program2 that proves transfer.
+                        try {
+                            String labelName = "XFER_" + sanitizeLabel(n);
+                            SymbolTable st2 = p2.getSymbolTable();
+                            Symbol existing = null;
+                            for (Symbol s : st2.getSymbols(f2.getEntryPoint())) {
+                                if (labelName.equals(s.getName())) {
+                                    existing = s;
+                                    break;
+                                }
+                            }
+                            if (existing == null) {
+                                Symbol created = st2.createLabel(
+                                    f2.getEntryPoint(), labelName, SourceType.USER_DEFINED);
+                                if (created != null) {
+                                    row.addProperty("label", labelName);
+                                    changed = true;
+                                }
+                            } else {
+                                row.addProperty("label", labelName);
+                                row.addProperty("label_status", "already_present");
+                            }
+                        } catch (Exception e) {
+                            row.addProperty("label_error", e.getMessage());
+                        }
+                    }
+                    if (doComments) {
+                        try {
+                            String c1 = p1.getListing().getComment(
+                                CodeUnit.EOL_COMMENT, f1.getEntryPoint());
+                            // Prefer source EOL comment; if empty, still write a
+                            // provenance marker so transfer is observable.
+                            String toWrite = (c1 != null && !c1.isEmpty())
+                                ? c1
+                                : ("xfer_from:" + prog1Name + ":" + n);
+                            String c2 = p2.getListing().getComment(
+                                CodeUnit.EOL_COMMENT, f2.getEntryPoint());
+                            if (c2 == null || !c2.equals(toWrite)) {
+                                p2.getListing().setComment(
+                                    f2.getEntryPoint(), CodeUnit.EOL_COMMENT, toWrite);
+                                changed = true;
+                            }
+                            row.addProperty("comment", toWrite);
+                        } catch (Exception e) {
+                            row.addProperty("comment_error", e.getMessage());
+                        }
+                    }
+                    if (changed) {
+                        transferred.add(row);
+                        count++;
+                    }
+                }
+                ok = true;
+            } finally {
+                p2.endTransaction(txId, ok);
+            }
+
+            // Persist mutations before any release (temporary opens would otherwise discard).
+            try {
+                p2.save("transfer_analysis", monitor);
+            } catch (Exception e) {
+                return errorResult("transfer_analysis save failed: " + e.getMessage());
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("status", "success");
+            result.addProperty("program1", prog1Name);
+            result.addProperty("program2", prog2Name);
+            result.addProperty("matched_count", matched.size());
+            result.addProperty("transferred_count", count);
+            result.addProperty("labels", doLabels);
+            result.addProperty("comments", doComments);
+            result.add("transferred", transferred);
+            JsonObject dual = new JsonObject();
+            dual.add("program1", programSideSummary(p1, prog1Name));
+            dual.add("program2", programSideSummary(p2, prog2Name));
+            result.add("dual_provenance", dual);
+            return result;
+        } catch (Exception e) {
+            return errorResult("transfer_analysis failed: " + e.getMessage());
+        } finally {
+            releaseProgramQuietly(p1, consumer);
+            releaseProgramQuietly(p2, consumer);
+        }
+    }
+
+    private String sanitizeLabel(String name) {
+        if (name == null || name.isEmpty()) return "anon";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (Character.isLetterOrDigit(c) || c == '_' || c == '-') sb.append(c);
+            else sb.append('_');
+        }
+        return sb.toString();
+    }
+
+    private Function findFunctionByNameInProgram(Program program, String name) {
+        if (program == null || name == null) return null;
+        FunctionIterator it = program.getFunctionManager().getFunctions(true);
+        while (it.hasNext()) {
+            Function f = it.next();
+            if (f != null && name.equals(f.getName())) return f;
+        }
+        return null;
+    }
+
+    /**
+     * Heuristic structure recovery: walk defined data / references near address
+     * and emit field offset/size candidates for the Rust scorer.
+     */
+    private JsonObject handleStructureRecover(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program open");
+        String addrStr = getArgString(args, "address");
+        if (addrStr == null) addrStr = getArgString(args, "target");
+        if (addrStr == null) return errorResult("address required");
+        int maxFields = 16;
+        if (args != null && args.has("max_fields") && !args.get("max_fields").isJsonNull()) {
+            maxFields = args.get("max_fields").getAsInt();
+            if (maxFields <= 0) maxFields = 16;
+        }
+        try {
+            Address addr = resolveAddress(addrStr);
+            if (addr == null) return errorResult("Could not resolve address: " + addrStr);
+
+            JsonArray fields = new JsonArray();
+            Listing listing = currentProgram.getListing();
+            Data data = listing.getDataAt(addr);
+            if (data != null && data.isStructure()) {
+                DataType dt = data.getDataType();
+                if (dt instanceof Structure) {
+                    Structure st = (Structure) dt;
+                    DataTypeComponent[] comps = st.getComponents();
+                    for (int i = 0; i < comps.length && fields.size() < maxFields; i++) {
+                        DataTypeComponent c = comps[i];
+                        JsonObject f = new JsonObject();
+                        f.addProperty("offset", c.getOffset());
+                        f.addProperty("size", c.getLength());
+                        f.addProperty("name", c.getFieldName() != null ? c.getFieldName() : ("field_" + c.getOffset()));
+                        fields.add(f);
+                    }
+                }
+            }
+            // Fall back: sample sequential undefined bytes as dword-sized fields
+            if (fields.size() == 0) {
+                Memory mem = currentProgram.getMemory();
+                int probe = Math.min(maxFields * 4, 64);
+                byte[] buf = new byte[probe];
+                int n = 0;
+                try {
+                    n = mem.getBytes(addr, buf);
+                } catch (Exception e) {
+                    n = 0;
+                }
+                int off = 0;
+                while (off + 4 <= n && fields.size() < maxFields) {
+                    JsonObject f = new JsonObject();
+                    f.addProperty("offset", off);
+                    f.addProperty("size", 4);
+                    f.addProperty("name", "field_" + off);
+                    fields.add(f);
+                    off += 4;
+                }
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("address", addr.toString());
+            result.add("fields", fields);
+            result.addProperty("field_count", fields.size());
+            result.addProperty("method", fields.size() > 0 && data != null && data.isStructure()
+                ? "existing_structure" : "byte_probe");
+            return result;
+        } catch (Exception e) {
+            return errorResult("structure_recover failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Data-flow over p-code: list defs/uses; optional focus varnode substring.
+     */
+    private JsonObject handleDataFlow(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program open");
+        String target = getArgString(args, "target");
+        if (target == null) target = getArgString(args, "address");
+        if (target == null) return errorResult("target required");
+        String focus = getArgString(args, "focus");
+        int limit = 500;
+        if (args != null && args.has("limit") && !args.get("limit").isJsonNull()) {
+            limit = args.get("limit").getAsInt();
+            if (limit <= 0) limit = 500;
+        }
+        // Reuse pcode listing then shape defs/uses in Java for a richer bridge path.
+        JsonObject pcodeArgs = new JsonObject();
+        pcodeArgs.addProperty("target", target);
+        pcodeArgs.addProperty("limit", limit);
+        JsonObject pcode = handlePcode(pcodeArgs);
+        if (pcode.has("error")) return pcode;
+
+        JsonObject defs = new JsonObject();
+        JsonObject uses = new JsonObject();
+        JsonArray ops = pcode.has("ops") && pcode.get("ops").isJsonArray()
+            ? pcode.getAsJsonArray("ops") : new JsonArray();
+        for (int i = 0; i < ops.size(); i++) {
+            JsonObject op = ops.get(i).getAsJsonObject();
+            if (op.has("output") && op.get("output").isJsonPrimitive()) {
+                String out = op.get("output").getAsString();
+                if (!defs.has(out)) defs.add(out, new JsonArray());
+                JsonObject ref = new JsonObject();
+                ref.addProperty("op_index", i);
+                if (op.has("mnemonic")) ref.addProperty("mnemonic", op.get("mnemonic").getAsString());
+                defs.getAsJsonArray(out).add(ref);
+            }
+            if (op.has("inputs") && op.get("inputs").isJsonArray()) {
+                JsonArray inputs = op.getAsJsonArray("inputs");
+                for (int j = 0; j < inputs.size(); j++) {
+                    if (!inputs.get(j).isJsonPrimitive()) continue;
+                    String in = inputs.get(j).getAsString();
+                    if (!uses.has(in)) uses.add(in, new JsonArray());
+                    JsonObject ref = new JsonObject();
+                    ref.addProperty("op_index", i);
+                    if (op.has("mnemonic")) ref.addProperty("mnemonic", op.get("mnemonic").getAsString());
+                    uses.getAsJsonArray(in).add(ref);
+                }
+            }
+        }
+
+        JsonObject result = new JsonObject();
+        result.addProperty("function", pcode.has("function") ? pcode.get("function").getAsString() : target);
+        result.addProperty("op_count", ops.size());
+        result.add("defs", defs);
+        result.add("uses", uses);
+        result.addProperty("confidence", ops.size() == 0 ? 0.2 : 0.85);
+        result.addProperty("source", "bridge_pcode");
+        if (focus != null && !focus.isEmpty()) {
+            JsonObject foc = new JsonObject();
+            foc.addProperty("varnode", focus);
+            foc.add("defs", defs.has(focus) ? defs.get(focus) : new JsonArray());
+            foc.add("uses", uses.has(focus) ? uses.get(focus) : new JsonArray());
+            // Also match by substring for partial varnode names
+            if ((!foc.get("defs").isJsonArray() || foc.getAsJsonArray("defs").size() == 0)
+                && (!foc.get("uses").isJsonArray() || foc.getAsJsonArray("uses").size() == 0)) {
+                JsonArray dHit = new JsonArray();
+                JsonArray uHit = new JsonArray();
+                for (String key : defs.keySet()) {
+                    if (key.contains(focus)) {
+                        for (JsonElement el : defs.getAsJsonArray(key)) dHit.add(el);
+                    }
+                }
+                for (String key : uses.keySet()) {
+                    if (key.contains(focus)) {
+                        for (JsonElement el : uses.getAsJsonArray(key)) uHit.add(el);
+                    }
+                }
+                foc.add("defs", dHit);
+                foc.add("uses", uHit);
+            }
+            result.add("focus", foc);
+        }
+        result.addProperty("summary", "data-flow over " + ops.size() + " p-code op(s)");
+        return result;
     }
 
     private JsonObject handleDiffFunctions(JsonObject args) {
@@ -4689,6 +5186,156 @@ public class GhidraCliBridge extends GhidraScript {
             return result;
         } catch (Exception e) {
             return errorResult("Failed to read memory: " + e.getMessage());
+        }
+    }
+
+    // --- P-code listing (item 5) ---
+
+    private JsonObject handlePcode(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program open");
+        String target = getArgString(args, "target");
+        if (target == null) target = getArgString(args, "address");
+        if (target == null) return errorResult("target required");
+
+        int limit = 500;
+        if (args != null && args.has("limit") && !args.get("limit").isJsonNull()) {
+            limit = args.get("limit").getAsInt();
+            if (limit <= 0) limit = 500;
+        }
+
+        try {
+            Address addr = resolveAddress(target);
+            if (addr == null) return errorResult("Could not resolve address: " + target);
+
+            Function func = currentProgram.getFunctionManager().getFunctionContaining(addr);
+            if (func == null) {
+                func = currentProgram.getFunctionManager().getFunctionAt(addr);
+            }
+            if (func == null) return errorResult("No function at " + target);
+
+            ghidra.app.decompiler.DecompInterface decomp = new ghidra.app.decompiler.DecompInterface();
+            decomp.openProgram(currentProgram);
+            try {
+                ghidra.app.decompiler.DecompileResults results =
+                    decomp.decompileFunction(func, 30, monitor);
+                if (results == null || !results.decompileCompleted()) {
+                    return errorResult("Decompiler failed for p-code: " +
+                        (results != null ? results.getErrorMessage() : "null results"));
+                }
+                ghidra.program.model.pcode.HighFunction hf = results.getHighFunction();
+                if (hf == null) return errorResult("No high function / p-code available");
+
+                JsonArray ops = new JsonArray();
+                int count = 0;
+                java.util.Iterator<ghidra.program.model.pcode.PcodeOpAST> it = hf.getPcodeOps();
+                while (it.hasNext() && count < limit) {
+                    ghidra.program.model.pcode.PcodeOpAST op = it.next();
+                    JsonObject row = new JsonObject();
+                    Address seq = op.getSeqnum() != null ? op.getSeqnum().getTarget() : null;
+                    if (seq != null) row.addProperty("address", seq.toString());
+                    row.addProperty("mnemonic", op.getMnemonic());
+                    row.addProperty("opcode", op.getOpcode());
+                    JsonArray inputs = new JsonArray();
+                    for (int i = 0; i < op.getNumInputs(); i++) {
+                        ghidra.program.model.pcode.Varnode vn = op.getInput(i);
+                        inputs.add(vn != null ? vn.toString() : "null");
+                    }
+                    row.add("inputs", inputs);
+                    ghidra.program.model.pcode.Varnode out = op.getOutput();
+                    if (out != null) row.addProperty("output", out.toString());
+                    ops.add(row);
+                    count++;
+                }
+
+                JsonObject result = new JsonObject();
+                result.addProperty("function", func.getName());
+                result.addProperty("entry", func.getEntryPoint().toString());
+                result.addProperty("count", count);
+                result.addProperty("truncated", count >= limit);
+                result.add("ops", ops);
+                // Basic data-flow note: list unique output varnodes as "defs"
+                JsonArray defs = new JsonArray();
+                java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
+                for (int i = 0; i < ops.size(); i++) {
+                    JsonObject row = ops.get(i).getAsJsonObject();
+                    if (row.has("output")) {
+                        String o = row.get("output").getAsString();
+                        if (seen.add(o)) defs.add(o);
+                    }
+                }
+                result.add("defined_varnodes", defs);
+                return result;
+            } finally {
+                decomp.dispose();
+            }
+        } catch (Exception e) {
+            return errorResult("pcode failed: " + e.getMessage());
+        }
+    }
+
+    // --- Explicit transaction / undo boundary (item 5) ---
+
+    private JsonObject handleTransactionBegin(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program open");
+        if (explicitTransactionId >= 0) {
+            return errorResult("Transaction already open: " + explicitTransactionName
+                + " (id=" + explicitTransactionId + "). Commit or abort first.");
+        }
+        String name = getArgString(args, "name");
+        if (name == null || name.isEmpty()) name = "ghidra-cli";
+        try {
+            int txId = currentProgram.startTransaction(name);
+            explicitTransactionId = txId;
+            explicitTransactionName = name;
+            JsonObject result = new JsonObject();
+            result.addProperty("transaction_id", txId);
+            result.addProperty("name", name);
+            result.addProperty("status", "open");
+            return result;
+        } catch (Exception e) {
+            return errorResult("transaction_begin failed: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleTransactionCommit() {
+        if (currentProgram == null) return errorResult("No program open");
+        if (explicitTransactionId < 0) {
+            return errorResult("No open transaction to commit");
+        }
+        try {
+            int txId = explicitTransactionId;
+            String name = explicitTransactionName;
+            currentProgram.endTransaction(txId, true);
+            explicitTransactionId = -1;
+            explicitTransactionName = null;
+            JsonObject result = new JsonObject();
+            result.addProperty("transaction_id", txId);
+            result.addProperty("name", name);
+            result.addProperty("status", "committed");
+            return result;
+        } catch (Exception e) {
+            return errorResult("transaction_commit failed: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleTransactionAbort() {
+        if (currentProgram == null) return errorResult("No program open");
+        if (explicitTransactionId < 0) {
+            return errorResult("No open transaction to abort");
+        }
+        try {
+            int txId = explicitTransactionId;
+            String name = explicitTransactionName;
+            currentProgram.endTransaction(txId, false);
+            explicitTransactionId = -1;
+            explicitTransactionName = null;
+            JsonObject result = new JsonObject();
+            result.addProperty("transaction_id", txId);
+            result.addProperty("name", name);
+            result.addProperty("status", "aborted");
+            return result;
+        } catch (Exception e) {
+            return errorResult("transaction_abort failed: " + e.getMessage());
         }
     }
 }

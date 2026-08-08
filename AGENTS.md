@@ -14,3 +14,35 @@ ghidra-cli uses a **direct bridge architecture**:
 - One bridge per project, identified by `~/.local/share/ghidra-cli/bridge-{md5}.port`
 - Import/Analyze commands auto-start the bridge if not running
 - No separate Rust daemon process — the Java bridge IS the persistent server
+
+## Native MCP (prefer over shell-out)
+
+```bash
+ghidra --project myproj start
+ghidra --project myproj mcp stdio          # JSON-RPC line protocol
+ghidra mcp http --listen 127.0.0.1:0       # same tools over HTTP POST /mcp
+```
+
+- Every `tools/call` returns a stable envelope: `status`, `provenance`, `data`, `next_steps`, `recovery_suggestions`, `artifacts`.
+- Mutations use the same job queue/transactions as the CLI; on failure read `recovery_suggestions` and re-verify in a fresh process.
+- `decompile` always includes `nearby_xrefs`, `callers`, `namespace` (possibly empty).
+- `batch` accepts an array of `{name, arguments}`; `script_run` supports `args` / `expect` / `allow_empty` and surfaces manifests under `artifacts[]`.
+- `initialize` / `capabilities` report CLI version, feature flags, and schema version.
+
+Full catalog: `docs/MCP.md`. Example workflow: `skills/triage-decomp-patch-export.md`.
+
+### CLI helpers (same capabilities)
+
+```bash
+ghidra summarize --focus crypto            # triage report with confidence tags
+ghidra pcode main --max-ops 50             # p-code listing
+ghidra data-flow main --focus r0           # defs/uses over p-code
+ghidra type recover 0x401000               # structure field guesses + confidence
+ghidra find similar --mode all             # string/crypto similarity
+ghidra diff explain build_a build_b        # readable dual-program delta
+ghidra diff transfer build_a build_b       # copy labels/comments for matches
+ghidra program firmware-summarize          # summarize each program (single lane)
+ghidra transaction begin --name edit
+ghidra transaction commit
+ghidra --envelope --json function list     # stamp provenance on legacy JSON
+```

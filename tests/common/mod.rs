@@ -52,8 +52,14 @@ pub fn ensure_test_project(project: &str, program: &str) {
         // NOT at <projects_dir>/<project_name>/<project_name>.gpr
         // because start_bridge passes (project_path.parent(), project_path.file_name())
         // to analyzeHeadless.
-        let projects_dir = ghidra_cli::config::Config::default_project_dir()
-            .expect("Could not determine default project dir");
+        // Match CLI resolution (env GHIDRA_PROJECT_DIR, config, then default).
+        // Using default_project_dir() alone diverges from `ghidra import` when
+        // config points at a different directory (e.g. a legacy ~/.ghidra-projects).
+        let projects_dir = ghidra_cli::config::Config::load()
+            .ok()
+            .and_then(|c| c.get_project_dir().ok())
+            .or_else(|| ghidra_cli::config::Config::default_project_dir().ok())
+            .expect("Could not determine project dir");
         let gpr_file = projects_dir.join(format!("{}.gpr", project));
         let rep_dir = projects_dir.join(format!("{}.rep", project));
 
@@ -115,9 +121,12 @@ pub fn ensure_test_project(project: &str, program: &str) {
         // so output()/wait_with_output() blocks forever. Using null avoids this.
         eprintln!("Step 1: Importing binary {:?} ...", binary);
         let ghidra_bin = assert_cmd::cargo::cargo_bin!("ghidra");
+        let projects_dir_str = projects_dir.to_string_lossy().into_owned();
         let import_status = run_cli_with_timeout(
             ghidra_bin,
             &[
+                "--projects-dir",
+                &projects_dir_str,
                 "import",
                 binary.to_str().unwrap(),
                 "--project",
@@ -144,6 +153,8 @@ pub fn ensure_test_project(project: &str, program: &str) {
         let analyze_status = run_cli_with_timeout(
             ghidra_bin,
             &[
+                "--projects-dir",
+                &projects_dir_str,
                 "analyze",
                 "--project",
                 project,
@@ -179,7 +190,13 @@ pub fn ensure_test_project(project: &str, program: &str) {
         eprintln!("Step 3: Stopping bridge to flush project to disk...");
         let stop_status = run_cli_with_timeout(
             ghidra_bin,
-            &["stop", "--project", project],
+            &[
+                "--projects-dir",
+                &projects_dir_str,
+                "stop",
+                "--project",
+                project,
+            ],
             Duration::from_secs(120),
         );
         match stop_status {
@@ -189,6 +206,121 @@ pub fn ensure_test_project(project: &str, program: &str) {
 
         eprintln!("=== Test project setup complete ===");
     });
+}
+
+/// Ensure the project has at least two programs. Re-importing the same fixture
+/// creates `sample_binary.N` names when the base name already exists.
+/// Returns `(program_a, program_b)` names for dual-program tests.
+pub fn ensure_two_programs(project: &str, primary: &str) -> (String, String) {
+    ensure_test_project(project, primary);
+
+    let projects_dir = ghidra_cli::config::Config::load()
+        .ok()
+        .and_then(|c| c.get_project_dir().ok())
+        .or_else(|| ghidra_cli::config::Config::default_project_dir().ok())
+        .expect("project dir");
+    let projects_dir_str = projects_dir.to_string_lossy().into_owned();
+    let ghidra_bin = assert_cmd::cargo::cargo_bin!("ghidra");
+
+    let list_programs = || -> Vec<String> {
+        // Always pass --program primary so bridge start does not pick a stale
+        // config default (e.g. server.dll) that is missing from the project.
+        let output = std::process::Command::new(ghidra_bin)
+            .args([
+                "--projects-dir",
+                &projects_dir_str,
+                "--project",
+                project,
+                "--program",
+                primary,
+                "--json",
+                "program",
+                "list",
+            ])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&o.stdout).unwrap_or(serde_json::json!([]));
+                // envelope or raw
+                let arr = v
+                    .get("data")
+                    .and_then(|d| d.get("programs"))
+                    .or_else(|| v.get("programs"))
+                    .and_then(|p| p.as_array())
+                    .cloned()
+                    .or_else(|| v.as_array().cloned())
+                    .unwrap_or_default();
+                arr.iter()
+                    .filter_map(|x| {
+                        x.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .collect()
+            }
+            Ok(o) => {
+                eprintln!(
+                    "program list failed: status={} stderr={}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                vec![]
+            }
+            Err(e) => {
+                eprintln!("program list error: {}", e);
+                vec![]
+            }
+        }
+    };
+
+    let mut names = list_programs();
+    if names.len() < 2 {
+        let binary = fixture_binary();
+        eprintln!("=== Re-importing fixture to create a second program in {:?} ===", project);
+        let _ = run_cli_with_timeout(
+            ghidra_bin,
+            &[
+                "--projects-dir",
+                &projects_dir_str,
+                "import",
+                binary.to_str().unwrap(),
+                "--project",
+                project,
+            ],
+            Duration::from_secs(300),
+        );
+        let _ = run_cli_with_timeout(
+            ghidra_bin,
+            &[
+                "--projects-dir",
+                &projects_dir_str,
+                "stop",
+                "--project",
+                project,
+            ],
+            Duration::from_secs(120),
+        );
+        names = list_programs();
+    }
+
+    assert!(
+        names.len() >= 2,
+        "need ≥2 programs in project for dual-program tests; found {:?}",
+        names
+    );
+    // Prefer primary as first if present
+    let a = if names.iter().any(|n| n == primary) {
+        primary.to_string()
+    } else {
+        names[0].clone()
+    };
+    let b = names
+        .into_iter()
+        .find(|n| n != &a)
+        .expect("second program");
+    eprintln!("=== Dual programs: {:?} and {:?} ===", a, b);
+    (a, b)
 }
 
 /// Test harness that manages bridge lifecycle for a test suite.
@@ -212,10 +344,13 @@ impl DaemonTestHarness {
     pub fn new(project: &str, program: &str) -> Result<Self> {
         let data_dir = get_unique_data_dir();
 
-        // Resolve the project path (must match the CLI's default via get_project_dir)
-        let project_path = ghidra_cli::config::Config::default_project_dir()
-            .context("Could not determine default project dir")?
-            .join(project);
+        // Resolve the project path the same way ensure_test_project / CLI do.
+        let projects_dir = ghidra_cli::config::Config::load()
+            .ok()
+            .and_then(|c| c.get_project_dir().ok())
+            .or_else(|| ghidra_cli::config::Config::default_project_dir().ok())
+            .context("Could not determine project dir")?;
+        let project_path = projects_dir.join(project);
 
         // Load config to find Ghidra installation
         let config = ghidra_cli::config::Config::load().context("Failed to load config")?;
