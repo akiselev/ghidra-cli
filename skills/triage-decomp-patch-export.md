@@ -90,10 +90,19 @@ Per-item `status` + nested envelope.
 
 Import both programs into one project, then:
 
-- MCP: `diff_programs` / `diff_functions`
-- CLI: `ghidra diff programs --program1 a --program2 b`
+- MCP: `diff_programs` → `diff_explain` → `diff_transfer` (labels/comments) → `diff_functions` for hot spots
+- CLI: `ghidra diff explain a b` then `ghidra diff transfer a b`
 
-Explain deltas from the report; transfer names via `rename_function` / `symbol_rename` / comments as needed. Full interactive Version Tracking UI is out of scope; this is the headless match/delta surface.
+Full interactive Version Tracking UI is out of scope; this is the headless match/transfer/explain surface.
+
+## Multi-program firmware pass
+
+```bash
+ghidra program firmware-summarize --include img1 --include img2
+# MCP: firmware_summarize / programs_foreach
+```
+
+Opens each program sequentially on the single execution lane.
 
 ## Notes
 
