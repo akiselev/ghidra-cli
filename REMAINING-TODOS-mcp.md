@@ -23,11 +23,16 @@ Status: **Slices 1.1–1.7 complete** (2026-08-08). MCP base criteria met.
 - docs/MCP.md + AGENTS.md + README updated
 - Unit tests (no Ghidra) + gated live tests (mutation durability, HTTP launch, stdio)
 
-## Optional follow-ups (non-blocking)
+## Optional follow-ups (non-blocking; out of this PR)
 
 - SSE streaming for long-running jobs over HTTP
-- Full Version Tracking session API beyond `diff_programs` / `diff_functions`
+- Full Version Tracking session API beyond headless `diff_programs` / `diff_functions`
 - Inline script_java/script_python first-class tools (currently prefer script_run files)
+
+## PR notes
+
+- Public docs of record: `docs/MCP.md`, README MCP section, `AGENTS.md`, `CHANGELOG.md`.
+- Process history: `PLAN-mcp-server.md`, this file, `REVIEW-LOG.md` (optional to keep in tree).
 
 ## References
 

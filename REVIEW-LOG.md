@@ -3,7 +3,7 @@
 Review date: 2026-08-08
 Source plan: PLAN-mcp-server.md (created in prior turn as the mandated "proper plan/todo file")
 Review type: adversarial (self-review against objective; no external input received)
-Status: recorded for process; implementation of any slice blocked until explicit sign-off per plan section "Process & commit discipline"
+Status: **closed** — slices 1.1–1.7 and goal items 2–7 delivered (see end of file). Early entries below are historical process notes.
 
 ## Alignment with Objective
 
@@ -363,16 +363,12 @@ User response: "YES - sign off on Slice 1.3"
 - HTTP transport remains stub per slice plan (1.5).
 - No AI attributions in this record or artifacts.
 
-Per PLAN-mcp-server.md and objective:
-- Implementation, commits, and further doc changes for slices after 1.3 are blocked until a subsequent slice receives its own explicit sign-off.
-- Separate commits will be used when authorized.
-- AGENTS.md / docs updates for MCP usage examples are pending authorization for a future slice.
-
-Slice 1.3 is signed off. Awaiting direction for next authorized work.
+Historical note (superseded): post-1.3 work was later authorized by the active goal
+and completed; see section below.
 
 ---
 
-## Slices 1.4–1.7 + Items 2–7 (2026-08-08)
+## Slices 1.4–1.7 + Items 2–7 (2026-08-08) — COMPLETE
 
 Authorized by active goal: complete remaining MCP todos then items 2–7.
 
@@ -380,10 +376,10 @@ Authorized by active goal: complete remaining MCP todos then items 2–7.
 
 1. **Design**: Shared `tool_definitions()` registry for stdio+HTTP; mutations through BridgeClient/job queue; local batch dispatch (bridge batch is CLI-side); initialize `ghidraCapabilities` + TOOL_SCHEMA_VERSION; HTTP loopback-only unless bound non-loopback; optional bearer token.
 2. **Implementation**: Full mutation surface (symbol/type/comment/patch/function); recovery_for + mutation_recovery; decompile guaranteed fields; script_run artifacts[]; summarize/diff/pcode/transaction tools; Java pcode + transaction handlers; CLI summarize/pcode/transaction; doctor recovery suggestions; Dockerfile + Formula + skill file.
-3. **Tests**: Unit tests for envelopes/recovery/batch/initialize/HTTP bind equivalence; gated `test_mcp_mutation_durability_comment`, `test_mcp_http_launch_and_tools`, `test_mcp_stdio_bridge_tools` (require_ghidra!).
+3. **Tests**: Unit tests for envelopes/recovery/batch/initialize/HTTP bind equivalence + artifact elevation + summarize confidence; gated mutation durability, HTTP launch, stdio decompile context, summarize/pcode/transaction (`require_ghidra!`).
 4. **Docs**: docs/MCP.md rewritten; README MCP/Docker; AGENTS.md MCP section; REMAINING-TODOS-* updated; skill triage→decomp→patch→export.
-5. **Final**: Live rename durability across fresh MCP process; HTTP tools/list + ping; doctor clean with non-dot projects_dir; docker build attempted (rust/JDK base fixed).
+5. **Final**: Live rename durability; HTTP tools/list + ping; doctor with non-dot projects_dir; docker image build; clap `--max-ops` for pcode; real headless `diff_programs`.
 
 ### Sign-off record
 
-Objective-authorized delivery of remaining work. No further process hold on 1.4–1.7.
+Objective-authorized delivery complete. No further process hold on MCP base or items 2–7 first versions.

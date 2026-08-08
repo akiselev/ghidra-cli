@@ -9,12 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Native MCP server** (`ghidra mcp stdio` and `ghidra mcp http --listen …`).
+  Focused tools over BridgeClient (no shell-out), shared registry for both
+  transports, stable envelopes with `provenance`, `next_steps`,
+  `recovery_suggestions`, and `artifacts[]`. HTTP is localhost-only when bound
+  to loopback; optional bearer token via `--token` / `GHIDRA_MCP_TOKEN`.
+  `initialize` / `capabilities` report CLI version, feature flags, and tool
+  schema version. See `docs/MCP.md`.
+- Mutation MCP tools (patch, function/symbol/type/comment edits, `script_run`)
+  use the same job queue and transaction paths as the CLI, with actionable
+  recovery text on conflict/verification failures.
+- `script_run` tool: `args`, `expect`, `allow_empty`; declared expect artifacts
+  are elevated onto the envelope `artifacts[]` with manifests.
+- `batch` tool: array of `{name, arguments}` with per-command status envelopes.
+- High-level analysis helpers: `ghidra summarize` / `triage` and MCP `summarize`
+  (confidence-tagged findings); MCP/CLI `diff_programs` (headless function
+  name-set match with dual-side provenance) and existing `diff_functions`.
+- Deeper primitives: `ghidra pcode` / MCP `pcode` (with `--max-ops`); explicit
+  `ghidra transaction begin|commit|abort` and matching MCP tools.
+- Global `--envelope` wraps JSON output in the stable provenance envelope
+  (always on for summarize/pcode/transaction JSON).
+- Official `Dockerfile`, in-repo Homebrew formula (`Formula/ghidra-cli.rb`),
+  and agent skill `skills/triage-decomp-patch-export.md`.
+- `ghidra doctor` prints recovery suggestions for common install/path failures
+  (including Ghidra 12.1+ "dot path component" project-dir warnings).
 - **Responsive control plane with a real job queue.** Socket handling is now split
   from Ghidra program execution. `ping`, `status`, `bridge_info`, `jobs`, and
   `cancel` answer immediately from thread-safe snapshots while a long
   `analyze`/`import`/decompile holds the single Ghidra-owned program lane. Program
   operations get job IDs and wait in a bounded FIFO (256 deep) instead of an
-  invisible socket backlog.
+  infinite socket backlog.
 - `ghidra jobs [JOB_ID]` — inspect the active job, the queue, and recent history
   (the bridge keeps the last 100 jobs), or one job by ID.
 - `ghidra cancel [JOB_ID]` — cooperatively cancel the active job (or a specific
@@ -23,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Decompile (MCP) always includes `nearby_xrefs`, `callers`, and `namespace`
+  (empty when unavailable), with optional `max_xrefs` / `caller_depth`.
 - `ghidra script run` runs a checked-in script by absolute path with real
   positional arguments (everything after `--`) and captured stdout, returning
   `{script, path, stdout, args}`. New `--expect PATH[:MIN_ROWS]` (repeatable) fails
@@ -50,6 +76,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EOL`). The client sent the type under key `type` while the bridge read
   `comment_type`; the client now sends `comment_type` and the bridge still
   accepts the old key as a fallback.
+- `ghidra pcode` uses `--max-ops` (not `--limit`) so it does not collide with
+  global/query `--limit` under clap.
+- Test harness project-dir resolution matches the CLI (`GHIDRA_PROJECT_DIR` /
+  config / default), and setup commands pass `--projects-dir` consistently.
 
 ## [0.2.1]
 
