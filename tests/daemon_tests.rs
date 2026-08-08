@@ -9,7 +9,7 @@ use std::time::Duration;
 
 #[macro_use]
 mod common;
-use common::{ensure_test_project, DaemonTestHarness};
+use common::{ensure_test_project, ensure_two_programs, DaemonTestHarness};
 
 const TEST_PROJECT: &str = "ci-test";
 const TEST_PROGRAM: &str = "sample_binary";
@@ -452,13 +452,13 @@ fn test_mcp_summarize_pcode_transaction() {
     drop(harness);
 }
 
-/// Live: structure recover, data_flow, similarity via MCP; multi-program summarize.
+/// Live: structure recover, data_flow, similarity via MCP; multi-program summarize (≥2).
 #[test]
 #[serial]
 fn test_mcp_deeper_primitives_and_multiprogram() {
     require_ghidra!();
 
-    ensure_test_project(TEST_PROJECT, TEST_PROGRAM);
+    let (prog_a, prog_b) = ensure_two_programs(TEST_PROJECT, TEST_PROGRAM);
 
     let Some(harness) = try_start_daemon() else {
         return;
@@ -543,17 +543,26 @@ fn test_mcp_deeper_primitives_and_multiprogram() {
     assert_eq!(sim["status"], "success", "similarity failed: {}", sim);
     assert!(sim["data"].get("findings").is_some());
 
-    // Multi-program convenience: firmware_summarize over current program list
+    // Multi-program convenience over ≥2 programs (sequential single lane)
     let fw = run_mcp_call(
         "firmware_summarize",
-        json!({"programs": [TEST_PROGRAM], "focus": "imports"}),
+        json!({"programs": [prog_a.clone(), prog_b.clone()], "focus": "imports"}),
     );
     assert_eq!(fw["status"], "success", "firmware_summarize failed: {}", fw);
     let results = fw["data"]["results"].as_array().expect("results");
-    assert!(!results.is_empty());
-    assert_eq!(results[0]["program"], TEST_PROGRAM);
+    assert!(
+        results.len() >= 2,
+        "expected ≥2 program results, got {}",
+        results.len()
+    );
+    let prog_names: Vec<_> = results
+        .iter()
+        .filter_map(|r| r.get("program").and_then(|p| p.as_str()))
+        .collect();
+    assert!(prog_names.contains(&prog_a.as_str()));
+    assert!(prog_names.contains(&prog_b.as_str()));
 
-    // CLI multi-program path
+    // CLI multi-program path with two includes
     assert_cmd::cargo::cargo_bin_cmd!("ghidra")
         .args([
             "--project",
@@ -563,7 +572,9 @@ fn test_mcp_deeper_primitives_and_multiprogram() {
             "program",
             "firmware-summarize",
             "--include",
-            TEST_PROGRAM,
+            &prog_a,
+            "--include",
+            &prog_b,
             "--focus",
             "imports",
         ])
@@ -573,126 +584,218 @@ fn test_mcp_deeper_primitives_and_multiprogram() {
     drop(harness);
 }
 
-/// Live: dual-program explain when a second program exists; transfer is best-effort.
+/// Live dual-program match + transfer + fresh-process re-read of transferred content.
 #[test]
 #[serial]
 fn test_mcp_diff_explain_and_transfer_surface() {
     require_ghidra!();
 
-    ensure_test_project(TEST_PROJECT, TEST_PROGRAM);
+    let (prog_a, prog_b) = ensure_two_programs(TEST_PROJECT, TEST_PROGRAM);
 
     let Some(harness) = try_start_daemon() else {
         return;
     };
 
     let ghidra_bin = assert_cmd::cargo::cargo_bin!("ghidra");
-    // List programs — if only one, exercise explain/transfer error envelopes still
-    let mut child = std::process::Command::new(&ghidra_bin)
-        .args(["--project", TEST_PROJECT, "mcp", "stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn mcp");
-    let mut stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let mut reader = BufReader::new(stdout);
-    let send = |stdin: &mut dyn std::io::Write, v: &serde_json::Value| {
-        writeln!(stdin, "{}", serde_json::to_string(v).unwrap()).unwrap();
-        stdin.flush().unwrap();
+    let run_mcp_call = |tool: &str, args: serde_json::Value| -> serde_json::Value {
+        let mut child = std::process::Command::new(&ghidra_bin)
+            .args(["--project", TEST_PROJECT, "mcp", "stdio"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn mcp");
+        let mut stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let send = |stdin: &mut dyn std::io::Write, v: &serde_json::Value| {
+            writeln!(stdin, "{}", serde_json::to_string(v).unwrap()).unwrap();
+            stdin.flush().unwrap();
+        };
+        let mut line = String::new();
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+        );
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
+        );
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        drop(stdin);
+        let _ = child.wait();
+        let rpc: serde_json::Value = serde_json::from_str(line.trim()).expect("rpc");
+        let text = rpc["result"]["content"][0]["text"].as_str().expect("text");
+        serde_json::from_str(text).expect("envelope")
     };
-    let mut line = String::new();
-    send(
-        &mut stdin,
-        &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
-    );
-    line.clear();
-    reader.read_line(&mut line).unwrap();
-    send(
-        &mut stdin,
-        &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"project_list","arguments":{}}}),
-    );
-    line.clear();
-    reader.read_line(&mut line).unwrap();
-    let rpc: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-    let env: serde_json::Value =
-        serde_json::from_str(rpc["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    let names: Vec<String> = env["data"]
-        .get("programs")
-        .and_then(|p| p.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
 
-    // Always assert tools exist via tools/list
-    send(
-        &mut stdin,
-        &json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+    // Match report
+    let match_env = run_mcp_call(
+        "diff_programs",
+        json!({"program1": prog_a, "program2": prog_b}),
     );
-    line.clear();
-    reader.read_line(&mut line).unwrap();
-    let list: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-    let tnames: Vec<_> = list["result"]["tools"]
+    assert_eq!(
+        match_env["status"], "success",
+        "diff_programs failed: {}",
+        match_env
+    );
+    assert!(
+        match_env["data"]["matched_count"].as_u64().unwrap_or(0) > 0,
+        "expected matched functions: {}",
+        match_env
+    );
+    assert!(
+        match_env["data"].get("dual_provenance").is_some(),
+        "missing dual_provenance: {}",
+        match_env
+    );
+
+    // Explain
+    let exp = run_mcp_call(
+        "diff_explain",
+        json!({"program1": prog_a, "program2": prog_b}),
+    );
+    assert_eq!(exp["status"], "success", "diff_explain failed: {}", exp);
+    assert!(
+        exp["data"].get("summary").is_some() && exp["data"].get("bullets").is_some(),
+        "explain missing summary/bullets: {}",
+        exp
+    );
+    assert!(
+        exp["data"].get("dual_provenance").is_some() || exp["data"].get("program1").is_some(),
+        "explain missing dual side: {}",
+        exp
+    );
+
+    // Transfer labels + comments (creates XFER_* labels and xfer_from: comments on program2)
+    let tr = run_mcp_call(
+        "diff_transfer",
+        json!({
+            "program1": prog_a,
+            "program2": prog_b,
+            "labels": true,
+            "comments": true,
+            "limit": 10
+        }),
+    );
+    assert_eq!(tr["status"], "success", "diff_transfer failed: {}", tr);
+    assert!(
+        tr["data"].get("dual_provenance").is_some(),
+        "transfer missing dual_provenance: {}",
+        tr
+    );
+    assert!(
+        tr["data"]["transferred_count"].as_u64().unwrap_or(0) > 0,
+        "expected at least one transfer: {}",
+        tr
+    );
+    let xfer_blob = tr.to_string();
+    assert!(
+        xfer_blob.contains("XFER_") || xfer_blob.contains("xfer_from"),
+        "transfer payload missing label/comment fields: {}",
+        tr
+    );
+
+    // Fresh process: re-read a concrete transferred address on program2
+    let first = tr["data"]["transferred"]
         .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
-    assert!(tnames.contains(&"diff_transfer"));
-    assert!(tnames.contains(&"diff_explain"));
+        .and_then(|a| a.first())
+        .cloned()
+        .expect("transferred[0]");
+    let dst_addr = first
+        .get("address_dst")
+        .and_then(|a| a.as_str())
+        .expect("address_dst")
+        .to_string();
+    let expect_label = first
+        .get("label")
+        .and_then(|l| l.as_str())
+        .unwrap_or("XFER_")
+        .to_string();
+    let expect_comment = first
+        .get("comment")
+        .and_then(|c| c.as_str())
+        .unwrap_or("xfer_from:")
+        .to_string();
 
-    if names.len() >= 2 {
-        let p1 = &names[0];
-        let p2 = &names[1];
-        send(
-            &mut stdin,
-            &json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"diff_explain","arguments":{"program1":p1,"program2":p2}}}),
-        );
-        line.clear();
-        reader.read_line(&mut line).unwrap();
-        let rpc: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        let exp: serde_json::Value =
-            serde_json::from_str(rpc["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(exp["status"], "success", "diff_explain: {}", exp);
-        assert!(exp["data"].get("summary").is_some() || exp["data"].get("bullets").is_some());
-        assert!(
-            exp["data"].get("dual_provenance").is_some()
-                || exp["data"].get("program1").is_some(),
-            "missing dual provenance: {}",
-            exp
-        );
+    // Stop bridge so re-open is a truly fresh process
+    let _ = assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        .args(["--project", TEST_PROJECT, "stop"])
+        .output();
 
-        send(
-            &mut stdin,
-            &json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"diff_transfer","arguments":{"program1":p1,"program2":p2,"labels":true,"comments":true,"limit":5}}}),
-        );
-        line.clear();
-        reader.read_line(&mut line).unwrap();
-        let rpc: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        let tr: serde_json::Value =
-            serde_json::from_str(rpc["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(tr["status"], "success", "diff_transfer: {}", tr);
-        assert!(tr["data"].get("dual_provenance").is_some() || tr["data"].get("transferred").is_some());
+    let re_comment = assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        .args([
+            "--project",
+            TEST_PROJECT,
+            "--program",
+            &prog_b,
+            "--json",
+            "comment",
+            "get",
+            &dst_addr,
+        ])
+        .output()
+        .expect("comment get program2");
+    assert!(
+        re_comment.status.success(),
+        "comment get failed: {}",
+        String::from_utf8_lossy(&re_comment.stderr)
+    );
+    let re_c = String::from_utf8_lossy(&re_comment.stdout);
+    let has_comment = re_c.contains(&expect_comment) || re_c.contains("xfer_from:");
+
+    let re_sym = assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        .args([
+            "--project",
+            TEST_PROJECT,
+            "--program",
+            &prog_b,
+            "--json",
+            "symbol",
+            "list",
+            "--filter",
+            &format!("name~{}", expect_label.trim_start_matches("XFER_").chars().take(12).collect::<String>()),
+            "--limit",
+            "50",
+        ])
+        .output()
+        .expect("symbol list filter");
+    let re_s = String::from_utf8_lossy(&re_sym.stdout);
+    let has_xfer = re_s.contains("XFER_") || re_s.contains(&expect_label);
+
+    // Broader fallback: unfiltered comment get already done; also try symbols without filter
+    let re_sym2 = if !has_xfer {
+        let o = assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+            .args([
+                "--project",
+                TEST_PROJECT,
+                "--program",
+                &prog_b,
+                "--json",
+                "symbol",
+                "list",
+                "--limit",
+                "0",
+            ])
+            .output()
+            .expect("symbol list all");
+        String::from_utf8_lossy(&o.stdout).contains("XFER_")
     } else {
-        // Single-program project: explain with identical names must error (not crash)
-        send(
-            &mut stdin,
-            &json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"diff_explain","arguments":{"program1":TEST_PROGRAM,"program2":TEST_PROGRAM}}}),
-        );
-        line.clear();
-        reader.read_line(&mut line).unwrap();
-        let rpc: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        let exp: serde_json::Value =
-            serde_json::from_str(rpc["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(exp["status"], "error");
-        assert!(!exp["recovery_suggestions"].as_array().unwrap().is_empty());
-    }
+        true
+    };
 
-    drop(stdin);
-    let _ = child.wait();
+    assert!(
+        has_comment || has_xfer || re_sym2,
+        "fresh-process re-read missing transferred label/comment at {}.\ncomment_get={}\nsymbol_filter={}\ntransfer={}",
+        dst_addr,
+        re_c.chars().take(500).collect::<String>(),
+        re_s.chars().take(500).collect::<String>(),
+        tr
+    );
+
     drop(harness);
 }
 

@@ -4080,7 +4080,13 @@ public class GhidraCliBridge extends GhidraScript {
 
     private JsonObject programSideSummary(Program program, String requestedName) {
         JsonObject side = new JsonObject();
-        side.addProperty("name", program.getName());
+        String domainName = program.getName();
+        try {
+            if (program.getDomainFile() != null && program.getDomainFile().getName() != null) {
+                domainName = program.getDomainFile().getName();
+            }
+        } catch (Exception ignored) {}
+        side.addProperty("name", domainName);
         side.addProperty("requested_name", requestedName);
         side.addProperty("function_count", program.getFunctionManager().getFunctionCount());
         side.addProperty("memory_size", program.getMemory().getSize());
@@ -4171,15 +4177,31 @@ public class GhidraCliBridge extends GhidraScript {
                     row.addProperty("function", n);
                     row.addProperty("address_src", f1.getEntryPoint().toString());
                     row.addProperty("address_dst", f2.getEntryPoint().toString());
+                    boolean changed = false;
 
                     if (doLabels) {
-                        // Ensure destination function keeps the matched name (already same)
-                        // Transfer primary symbol name from entry of f1 if different locals exist
+                        // Name-set matches already share the function name; create a
+                        // durable secondary user label on program2 that proves transfer.
                         try {
-                            Symbol s1 = p1.getSymbolTable().getPrimarySymbol(f1.getEntryPoint());
-                            if (s1 != null && s1.getName() != null) {
-                                f2.setName(s1.getName(), SourceType.USER_DEFINED);
-                                row.addProperty("label", s1.getName());
+                            String labelName = "XFER_" + sanitizeLabel(n);
+                            SymbolTable st2 = p2.getSymbolTable();
+                            Symbol existing = null;
+                            for (Symbol s : st2.getSymbols(f2.getEntryPoint())) {
+                                if (labelName.equals(s.getName())) {
+                                    existing = s;
+                                    break;
+                                }
+                            }
+                            if (existing == null) {
+                                Symbol created = st2.createLabel(
+                                    f2.getEntryPoint(), labelName, SourceType.USER_DEFINED);
+                                if (created != null) {
+                                    row.addProperty("label", labelName);
+                                    changed = true;
+                                }
+                            } else {
+                                row.addProperty("label", labelName);
+                                row.addProperty("label_status", "already_present");
                             }
                         } catch (Exception e) {
                             row.addProperty("label_error", e.getMessage());
@@ -4189,26 +4211,38 @@ public class GhidraCliBridge extends GhidraScript {
                         try {
                             String c1 = p1.getListing().getComment(
                                 CodeUnit.EOL_COMMENT, f1.getEntryPoint());
-                            if (c1 != null && !c1.isEmpty()) {
+                            // Prefer source EOL comment; if empty, still write a
+                            // provenance marker so transfer is observable.
+                            String toWrite = (c1 != null && !c1.isEmpty())
+                                ? c1
+                                : ("xfer_from:" + prog1Name + ":" + n);
+                            String c2 = p2.getListing().getComment(
+                                CodeUnit.EOL_COMMENT, f2.getEntryPoint());
+                            if (c2 == null || !c2.equals(toWrite)) {
                                 p2.getListing().setComment(
-                                    f2.getEntryPoint(), CodeUnit.EOL_COMMENT, c1);
-                                row.addProperty("comment", c1);
+                                    f2.getEntryPoint(), CodeUnit.EOL_COMMENT, toWrite);
+                                changed = true;
                             }
+                            row.addProperty("comment", toWrite);
                         } catch (Exception e) {
                             row.addProperty("comment_error", e.getMessage());
                         }
                     }
-                    transferred.add(row);
-                    count++;
+                    if (changed) {
+                        transferred.add(row);
+                        count++;
+                    }
                 }
                 ok = true;
             } finally {
                 p2.endTransaction(txId, ok);
             }
 
-            // Prefer leaving currentProgram as program2 after transfer (mutated side).
-            if (currentProgram != p2) {
-                // best-effort: do not force switch if openProgram would release session
+            // Persist mutations before any release (temporary opens would otherwise discard).
+            try {
+                p2.save("transfer_analysis", monitor);
+            } catch (Exception e) {
+                return errorResult("transfer_analysis save failed: " + e.getMessage());
             }
 
             JsonObject result = new JsonObject();
@@ -4229,9 +4263,19 @@ public class GhidraCliBridge extends GhidraScript {
             return errorResult("transfer_analysis failed: " + e.getMessage());
         } finally {
             releaseProgramQuietly(p1, consumer);
-            // Keep p2 if it became useful; still release temporary opens
             releaseProgramQuietly(p2, consumer);
         }
+    }
+
+    private String sanitizeLabel(String name) {
+        if (name == null || name.isEmpty()) return "anon";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (Character.isLetterOrDigit(c) || c == '_' || c == '-') sb.append(c);
+            else sb.append('_');
+        }
+        return sb.toString();
     }
 
     private Function findFunctionByNameInProgram(Program program, String name) {

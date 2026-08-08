@@ -208,6 +208,121 @@ pub fn ensure_test_project(project: &str, program: &str) {
     });
 }
 
+/// Ensure the project has at least two programs. Re-importing the same fixture
+/// creates `sample_binary.N` names when the base name already exists.
+/// Returns `(program_a, program_b)` names for dual-program tests.
+pub fn ensure_two_programs(project: &str, primary: &str) -> (String, String) {
+    ensure_test_project(project, primary);
+
+    let projects_dir = ghidra_cli::config::Config::load()
+        .ok()
+        .and_then(|c| c.get_project_dir().ok())
+        .or_else(|| ghidra_cli::config::Config::default_project_dir().ok())
+        .expect("project dir");
+    let projects_dir_str = projects_dir.to_string_lossy().into_owned();
+    let ghidra_bin = assert_cmd::cargo::cargo_bin!("ghidra");
+
+    let list_programs = || -> Vec<String> {
+        // Always pass --program primary so bridge start does not pick a stale
+        // config default (e.g. server.dll) that is missing from the project.
+        let output = std::process::Command::new(ghidra_bin)
+            .args([
+                "--projects-dir",
+                &projects_dir_str,
+                "--project",
+                project,
+                "--program",
+                primary,
+                "--json",
+                "program",
+                "list",
+            ])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&o.stdout).unwrap_or(serde_json::json!([]));
+                // envelope or raw
+                let arr = v
+                    .get("data")
+                    .and_then(|d| d.get("programs"))
+                    .or_else(|| v.get("programs"))
+                    .and_then(|p| p.as_array())
+                    .cloned()
+                    .or_else(|| v.as_array().cloned())
+                    .unwrap_or_default();
+                arr.iter()
+                    .filter_map(|x| {
+                        x.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .collect()
+            }
+            Ok(o) => {
+                eprintln!(
+                    "program list failed: status={} stderr={}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                vec![]
+            }
+            Err(e) => {
+                eprintln!("program list error: {}", e);
+                vec![]
+            }
+        }
+    };
+
+    let mut names = list_programs();
+    if names.len() < 2 {
+        let binary = fixture_binary();
+        eprintln!("=== Re-importing fixture to create a second program in {:?} ===", project);
+        let _ = run_cli_with_timeout(
+            ghidra_bin,
+            &[
+                "--projects-dir",
+                &projects_dir_str,
+                "import",
+                binary.to_str().unwrap(),
+                "--project",
+                project,
+            ],
+            Duration::from_secs(300),
+        );
+        let _ = run_cli_with_timeout(
+            ghidra_bin,
+            &[
+                "--projects-dir",
+                &projects_dir_str,
+                "stop",
+                "--project",
+                project,
+            ],
+            Duration::from_secs(120),
+        );
+        names = list_programs();
+    }
+
+    assert!(
+        names.len() >= 2,
+        "need ≥2 programs in project for dual-program tests; found {:?}",
+        names
+    );
+    // Prefer primary as first if present
+    let a = if names.iter().any(|n| n == primary) {
+        primary.to_string()
+    } else {
+        names[0].clone()
+    };
+    let b = names
+        .into_iter()
+        .find(|n| n != &a)
+        .expect("second program");
+    eprintln!("=== Dual programs: {:?} and {:?} ===", a, b);
+    (a, b)
+}
+
 /// Test harness that manages bridge lifecycle for a test suite.
 ///
 /// The bridge is the Ghidra Java process running GhidraCliBridge.

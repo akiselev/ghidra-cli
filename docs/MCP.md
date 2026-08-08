@@ -275,8 +275,10 @@ Sequential single-lane open/switch (no concurrent mutators):
 
 - MCP `programs_foreach` — run a tool over a list of programs
 - MCP `firmware_summarize` — summarize each program
-- CLI `ghidra program foreach --tool summarize --program A --program B`
-- CLI `ghidra program firmware-summarize [--program …] [--focus …]`
+- CLI `ghidra program foreach --tool summarize --include A --include B`
+- CLI `ghidra program firmware-summarize [--include NAME …] [--focus …]`
+
+(`--include` avoids clashing with the global `--program` flag.)
 
 
 ## License
