@@ -110,6 +110,11 @@ public class GhidraCliBridge extends GhidraScript {
     private volatile String projectNameSnapshot;
     private volatile int programCountSnapshot;
 
+    // Explicit user-visible transaction for multi-mutation undo (item 5).
+    // -1 means no open explicit transaction.
+    private volatile int explicitTransactionId = -1;
+    private volatile String explicitTransactionName;
+
     private static final Pattern NAMED_HEX_ADDRESS_PATTERN =
         Pattern.compile("(?i)^(?:FUN|SUB|LAB|DAT)_([0-9a-f]+)$");
 
@@ -755,6 +760,11 @@ public class GhidraCliBridge extends GhidraScript {
             case "batch":           return handleBatch(args);
             // Memory read
             case "read_memory":     return handleReadMemory(args);
+            // Deeper primitives (item 5)
+            case "pcode":           return handlePcode(args);
+            case "transaction_begin": return handleTransactionBegin(args);
+            case "transaction_commit": return handleTransactionCommit();
+            case "transaction_abort": return handleTransactionAbort();
             default:                return null;
         }
     }
@@ -4689,6 +4699,156 @@ public class GhidraCliBridge extends GhidraScript {
             return result;
         } catch (Exception e) {
             return errorResult("Failed to read memory: " + e.getMessage());
+        }
+    }
+
+    // --- P-code listing (item 5) ---
+
+    private JsonObject handlePcode(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program open");
+        String target = getArgString(args, "target");
+        if (target == null) target = getArgString(args, "address");
+        if (target == null) return errorResult("target required");
+
+        int limit = 500;
+        if (args != null && args.has("limit") && !args.get("limit").isJsonNull()) {
+            limit = args.get("limit").getAsInt();
+            if (limit <= 0) limit = 500;
+        }
+
+        try {
+            Address addr = resolveAddress(target);
+            if (addr == null) return errorResult("Could not resolve address: " + target);
+
+            Function func = currentProgram.getFunctionManager().getFunctionContaining(addr);
+            if (func == null) {
+                func = currentProgram.getFunctionManager().getFunctionAt(addr);
+            }
+            if (func == null) return errorResult("No function at " + target);
+
+            ghidra.app.decompiler.DecompInterface decomp = new ghidra.app.decompiler.DecompInterface();
+            decomp.openProgram(currentProgram);
+            try {
+                ghidra.app.decompiler.DecompileResults results =
+                    decomp.decompileFunction(func, 30, monitor);
+                if (results == null || !results.decompileCompleted()) {
+                    return errorResult("Decompiler failed for p-code: " +
+                        (results != null ? results.getErrorMessage() : "null results"));
+                }
+                ghidra.program.model.pcode.HighFunction hf = results.getHighFunction();
+                if (hf == null) return errorResult("No high function / p-code available");
+
+                JsonArray ops = new JsonArray();
+                int count = 0;
+                java.util.Iterator<ghidra.program.model.pcode.PcodeOpAST> it = hf.getPcodeOps();
+                while (it.hasNext() && count < limit) {
+                    ghidra.program.model.pcode.PcodeOpAST op = it.next();
+                    JsonObject row = new JsonObject();
+                    Address seq = op.getSeqnum() != null ? op.getSeqnum().getTarget() : null;
+                    if (seq != null) row.addProperty("address", seq.toString());
+                    row.addProperty("mnemonic", op.getMnemonic());
+                    row.addProperty("opcode", op.getOpcode());
+                    JsonArray inputs = new JsonArray();
+                    for (int i = 0; i < op.getNumInputs(); i++) {
+                        ghidra.program.model.pcode.Varnode vn = op.getInput(i);
+                        inputs.add(vn != null ? vn.toString() : "null");
+                    }
+                    row.add("inputs", inputs);
+                    ghidra.program.model.pcode.Varnode out = op.getOutput();
+                    if (out != null) row.addProperty("output", out.toString());
+                    ops.add(row);
+                    count++;
+                }
+
+                JsonObject result = new JsonObject();
+                result.addProperty("function", func.getName());
+                result.addProperty("entry", func.getEntryPoint().toString());
+                result.addProperty("count", count);
+                result.addProperty("truncated", count >= limit);
+                result.add("ops", ops);
+                // Basic data-flow note: list unique output varnodes as "defs"
+                JsonArray defs = new JsonArray();
+                java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
+                for (int i = 0; i < ops.size(); i++) {
+                    JsonObject row = ops.get(i).getAsJsonObject();
+                    if (row.has("output")) {
+                        String o = row.get("output").getAsString();
+                        if (seen.add(o)) defs.add(o);
+                    }
+                }
+                result.add("defined_varnodes", defs);
+                return result;
+            } finally {
+                decomp.dispose();
+            }
+        } catch (Exception e) {
+            return errorResult("pcode failed: " + e.getMessage());
+        }
+    }
+
+    // --- Explicit transaction / undo boundary (item 5) ---
+
+    private JsonObject handleTransactionBegin(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program open");
+        if (explicitTransactionId >= 0) {
+            return errorResult("Transaction already open: " + explicitTransactionName
+                + " (id=" + explicitTransactionId + "). Commit or abort first.");
+        }
+        String name = getArgString(args, "name");
+        if (name == null || name.isEmpty()) name = "ghidra-cli";
+        try {
+            int txId = currentProgram.startTransaction(name);
+            explicitTransactionId = txId;
+            explicitTransactionName = name;
+            JsonObject result = new JsonObject();
+            result.addProperty("transaction_id", txId);
+            result.addProperty("name", name);
+            result.addProperty("status", "open");
+            return result;
+        } catch (Exception e) {
+            return errorResult("transaction_begin failed: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleTransactionCommit() {
+        if (currentProgram == null) return errorResult("No program open");
+        if (explicitTransactionId < 0) {
+            return errorResult("No open transaction to commit");
+        }
+        try {
+            int txId = explicitTransactionId;
+            String name = explicitTransactionName;
+            currentProgram.endTransaction(txId, true);
+            explicitTransactionId = -1;
+            explicitTransactionName = null;
+            JsonObject result = new JsonObject();
+            result.addProperty("transaction_id", txId);
+            result.addProperty("name", name);
+            result.addProperty("status", "committed");
+            return result;
+        } catch (Exception e) {
+            return errorResult("transaction_commit failed: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleTransactionAbort() {
+        if (currentProgram == null) return errorResult("No program open");
+        if (explicitTransactionId < 0) {
+            return errorResult("No open transaction to abort");
+        }
+        try {
+            int txId = explicitTransactionId;
+            String name = explicitTransactionName;
+            currentProgram.endTransaction(txId, false);
+            explicitTransactionId = -1;
+            explicitTransactionName = null;
+            JsonObject result = new JsonObject();
+            result.addProperty("transaction_id", txId);
+            result.addProperty("name", name);
+            result.addProperty("status", "aborted");
+            return result;
+        } catch (Exception e) {
+            return errorResult("transaction_abort failed: " + e.getMessage());
         }
     }
 }
