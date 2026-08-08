@@ -180,6 +180,28 @@ ghidra graph callees <func>            # What does this call? (--depth optional)
 ghidra graph export dot                # Export to DOT format
 ```
 
+### MCP Server (Native tools for agents)
+
+Expose the CLI surface as MCP tools over stdio or HTTP. Agents connect directly — no shell + JSON parsing.
+
+```bash
+ghidra mcp stdio                 # Primary transport for local agents
+ghidra mcp http --listen 127.0.0.1:0
+# Optional: --token / GHIDRA_MCP_TOKEN for bearer auth on HTTP
+```
+
+See `docs/MCP.md` for the tool catalog, stable envelope (`provenance`, `next_steps`, `recovery_suggestions`, `artifacts`), curl examples, schema versioning, and mutation durability rules.
+
+Decompile always includes `nearby_xrefs`, `callers`, and `namespace` (may be empty). High-level helpers: `ghidra summarize` / `triage`, `ghidra pcode`, `ghidra transaction begin|commit|abort`. Workflow skill: `skills/triage-decomp-patch-export.md`.
+
+### Docker / packaging
+
+```bash
+docker build -t ghidra-cli .
+docker run --rm -v "$PWD:/work" ghidra-cli doctor
+# Homebrew (in-repo formula): brew install --build-from-source ./Formula/ghidra-cli.rb
+```
+
 ### Binary Patching
 ```bash
 ghidra patch bytes <addr> "90 90"      # Patch bytes

@@ -24,6 +24,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub pretty: bool,
 
+    /// Wrap JSON output in the stable provenance envelope (status, provenance, next_steps)
+    #[arg(long, global = true)]
+    pub envelope: bool,
+
     /// Project name or path (can also be specified per-subcommand)
     #[arg(long, global = true)]
     pub project: Option<String>,
@@ -136,6 +140,17 @@ pub enum Commands {
     #[command(alias = "info")]
     Summary(SummaryArgs),
 
+    /// One-shot triage / interestingness report (confidence-tagged findings)
+    #[command(alias = "triage")]
+    Summarize(SummarizeArgs),
+
+    /// List p-code ops for a function or address
+    Pcode(PcodeArgs),
+
+    /// Explicit mutation transaction / undo boundary
+    #[command(subcommand)]
+    Transaction(TransactionCommands),
+
     /// Program statistics
     Stats(StatsArgs),
 
@@ -220,6 +235,25 @@ pub enum Commands {
     /// Rename a symbol (shortcut for `symbol rename`)
     #[command(alias = "mv")]
     Rename(RenameArgs),
+
+    /// MCP server (expose existing CLI surface as MCP tools)
+    #[command(subcommand)]
+    Mcp(McpCommands),
+}
+
+#[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
+pub enum McpCommands {
+    /// Run MCP server over stdio (primary for local AI agents)
+    Stdio,
+    /// Run MCP server with streamable HTTP transport
+    Http {
+        /// Listen address, e.g. 127.0.0.1:8080 or 127.0.0.1:0 for random port
+        #[arg(long, default_value = "127.0.0.1:0")]
+        listen: String,
+        /// Optional bearer token (also GHIDRA_MCP_TOKEN). Localhost-only by default.
+        #[arg(long, env = "GHIDRA_MCP_TOKEN")]
+        token: Option<String>,
+    },
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -1138,6 +1172,47 @@ pub struct SetDefaultArgs {
 pub struct SummaryArgs {
     #[command(flatten)]
     pub options: QueryOptions,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct SummarizeArgs {
+    /// Focus areas: all, crypto, strings, entry, imports, functions
+    #[arg(long, default_value = "all")]
+    pub focus: String,
+    #[command(flatten)]
+    pub options: QueryOptions,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct PcodeArgs {
+    /// Function name or address
+    pub target: String,
+    /// Max p-code ops to return
+    #[arg(long)]
+    pub limit: Option<usize>,
+    #[command(flatten)]
+    pub options: QueryOptions,
+}
+
+#[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
+pub enum TransactionCommands {
+    /// Begin an explicit transaction (undo boundary)
+    Begin {
+        #[arg(long, default_value = "ghidra-cli")]
+        name: String,
+        #[command(flatten)]
+        options: QueryOptions,
+    },
+    /// Commit the open transaction
+    Commit {
+        #[command(flatten)]
+        options: QueryOptions,
+    },
+    /// Abort / roll back the open transaction
+    Abort {
+        #[command(flatten)]
+        options: QueryOptions,
+    },
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
