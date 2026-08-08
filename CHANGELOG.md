@@ -5,9 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.2]
 
 ### Added
+
+- **Function tags** (#17) — expose Ghidra's `FunctionTagManager` for organizing
+  large codebases: `ghidra tag list|get|create|delete|rename|set-comment|add|remove`,
+  plus `ghidra function list --tag NAME` (repeatable, AND semantics, filtered
+  server-side) and `--untagged`. `tag add` auto-creates missing tags (strict mode
+  via `--no-create`) and reports `added`/`created`/`already_present`; `tag
+  remove` is likewise idempotent. `tag delete` reports both Ghidra's raw
+  `use_count` and the non-external `functions_affected`. Unknown-tag lookups
+  error with a `Did you mean ...?` hint instead of returning empty results.
+  Function rows (`function list`/`get`) now carry a sorted `tags` array.
+- `--filter` expressions now work on array-valued fields (e.g. `tags`,
+  `operands`) with any-element semantics: `tags ~ 'crypto'` matches if any
+  element matches; `tags != 'x'` means NO element equals `x`. Previously such
+  filters silently matched nothing.
 
 - **Responsive control plane with a real job queue.** Socket handling is now split
   from Ghidra program execution. `ping`, `status`, `bridge_info`, `jobs`, and
@@ -23,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CSV output joins array-valued cells with `;` instead of `, ` — a `, `-joined
+  array inside an unquoted CSV field shifted every subsequent column (affects
+  the new `tags` column plus existing in-row arrays like `operands`/`params`).
+- `function list` rows gained a `tags` column, changing CSV/table headers for
+  existing consumers.
+- `BridgeClient::list_functions` grew `tags`/`untagged` parameters.
 - `ghidra script run` runs a checked-in script by absolute path with real
   positional arguments (everything after `--`) and captured stdout, returning
   `{script, path, stdout, args}`. New `--expect PATH[:MIN_ROWS]` (repeatable) fails

@@ -134,6 +134,7 @@ fn requires_bridge(command: &Commands) -> bool {
             | Commands::XRef(_)
             | Commands::Symbol(_)
             | Commands::Type(_)
+            | Commands::Tag(_)
             | Commands::Comment(_)
             | Commands::Graph(_)
             | Commands::Find(_)
@@ -157,7 +158,7 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
         Commands::Summary(args) => args.options.project.clone(),
         Commands::Decompile(args) => args.options.project.clone(),
         Commands::Function(cmd) => match cmd {
-            cli::FunctionCommands::List(opts) => opts.project.clone(),
+            cli::FunctionCommands::List(args) => args.options.project.clone(),
             cli::FunctionCommands::Decompile(args) => args.options.project.clone(),
             cli::FunctionCommands::Get(args) => args.options.project.clone(),
             cli::FunctionCommands::Disasm(args) => args.options.project.clone(),
@@ -233,6 +234,16 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
             cli::TypeCommands::AddField(args) => args.project.clone(),
             cli::TypeCommands::DelField(args) => args.project.clone(),
         },
+        Commands::Tag(cmd) => match cmd {
+            cli::TagCommands::List(args) => args.options.project.clone(),
+            cli::TagCommands::Get(args) => args.options.project.clone(),
+            cli::TagCommands::Create(args) => args.project.clone(),
+            cli::TagCommands::Delete(args) => args.project.clone(),
+            cli::TagCommands::Rename(args) => args.project.clone(),
+            cli::TagCommands::SetComment(args) => args.project.clone(),
+            cli::TagCommands::Add(args) => args.project.clone(),
+            cli::TagCommands::Remove(args) => args.project.clone(),
+        },
         Commands::Patch(cmd) => match cmd {
             cli::PatchCommands::Bytes(args) => args.project.clone(),
             cli::PatchCommands::Nop(args) => args.project.clone(),
@@ -272,7 +283,7 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
         Commands::Summary(args) => args.options.program.clone(),
         Commands::Decompile(args) => args.options.program.clone(),
         Commands::Function(cmd) => match cmd {
-            cli::FunctionCommands::List(opts) => opts.program.clone(),
+            cli::FunctionCommands::List(args) => args.options.program.clone(),
             cli::FunctionCommands::Decompile(args) => args.options.program.clone(),
             cli::FunctionCommands::Get(args) => args.options.program.clone(),
             cli::FunctionCommands::Disasm(args) => args.options.program.clone(),
@@ -348,6 +359,16 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
             cli::TypeCommands::AddField(args) => args.program.clone(),
             cli::TypeCommands::DelField(args) => args.program.clone(),
         },
+        Commands::Tag(cmd) => match cmd {
+            cli::TagCommands::List(args) => args.options.program.clone(),
+            cli::TagCommands::Get(args) => args.options.program.clone(),
+            cli::TagCommands::Create(args) => args.program.clone(),
+            cli::TagCommands::Delete(args) => args.program.clone(),
+            cli::TagCommands::Rename(args) => args.program.clone(),
+            cli::TagCommands::SetComment(args) => args.program.clone(),
+            cli::TagCommands::Add(args) => args.program.clone(),
+            cli::TagCommands::Remove(args) => args.program.clone(),
+        },
         Commands::Patch(cmd) => match cmd {
             cli::PatchCommands::Bytes(args) => args.program.clone(),
             cli::PatchCommands::Nop(args) => args.program.clone(),
@@ -393,7 +414,7 @@ fn extract_query_options(command: &Commands) -> Option<QueryOptions> {
         Commands::Disasm(args) => Some(args.options.clone()),
         Commands::Stats(args) => Some(args.options.clone()),
         Commands::Function(cmd) => match cmd {
-            cli::FunctionCommands::List(opts) => Some(opts.clone()),
+            cli::FunctionCommands::List(args) => Some(args.options.clone()),
             cli::FunctionCommands::Get(args) => Some(args.options.clone()),
             cli::FunctionCommands::Decompile(args) => Some(args.options.clone()),
             cli::FunctionCommands::Disasm(args) => Some(args.options.clone()),
@@ -432,6 +453,11 @@ fn extract_query_options(command: &Commands) -> Option<QueryOptions> {
         Commands::Type(cmd) => match cmd {
             cli::TypeCommands::List(opts) => Some(opts.clone()),
             cli::TypeCommands::Get(args) => Some(args.options.clone()),
+            _ => None,
+        },
+        Commands::Tag(cmd) => match cmd {
+            cli::TagCommands::List(args) => Some(args.options.clone()),
+            cli::TagCommands::Get(args) => Some(args.options.clone()),
             _ => None,
         },
         Commands::Comment(cmd) => match cmd {
@@ -645,9 +671,19 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                 }
             }
 
-            match execute_via_bridge(&client, &cli.command, cli.quiet, config.default_limit) {
-                Ok(value) => value,
-                Err(err) if is_unknown_command_error(&err) => {
+            let first_attempt =
+                execute_via_bridge(&client, &cli.command, cli.quiet, config.default_limit);
+            // Restart on "Unknown command" (old bridge lacks the handler) OR on a
+            // stale list_functions response: an old bridge silently ignores the
+            // newer tags/untagged args and returns a successful, UNFILTERED list.
+            let needs_restart = match &first_attempt {
+                Ok(value) => stale_tags_response(&cli.command, value),
+                Err(err) => is_unknown_command_error(err),
+            };
+            match first_attempt {
+                Ok(value) if !needs_restart => value,
+                Err(err) if !needs_restart => return Err(err),
+                _ => {
                     if !cli.quiet {
                         eprintln!(
                             "Bridge command not supported by running instance. Restarting bridge and retrying..."
@@ -684,6 +720,8 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                         }
                     }
 
+                    // One restart per invocation: the retry result is accepted
+                    // (or its error propagated) without re-probing.
                     execute_via_bridge(
                         &retry_client,
                         &cli.command,
@@ -691,7 +729,6 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                         config.default_limit,
                     )?
                 }
-                Err(err) => return Err(err),
             }
         }
     };
@@ -747,6 +784,34 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
 
 fn is_unknown_command_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("Unknown command:")
+}
+
+/// Detects a stale bridge that ignored the `tags`/`untagged` args on
+/// `list_functions`: an old handler returns a successful but UNFILTERED
+/// response whose rows lack the `"tags"` key (the current row builder always
+/// emits it). Probes the raw bridge envelope, before `unwrap_bridge_response`
+/// and any client-side field projection, so nothing can strip the key first.
+///
+/// Empty row sets pass vacuously: an old bridge ignoring the args returns the
+/// FULL function list, which is only empty when the program has no functions —
+/// where filtered and unfiltered output coincide anyway. Without this rule,
+/// every legitimately empty result would trigger a bridge restart.
+fn stale_tags_response(command: &Commands, value: &serde_json::Value) -> bool {
+    let tag_filter_requested = matches!(
+        command,
+        Commands::Function(cli::FunctionCommands::List(args))
+            if !args.tags.is_empty() || args.untagged
+    );
+    if !tag_filter_requested {
+        return false;
+    }
+    value
+        .get("functions")
+        .and_then(|f| f.as_array())
+        .is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row.is_object() && row.get("tags").is_none())
+        })
 }
 
 /// Make filter parse failures actionable: the DSL needs a field and operator,
@@ -848,7 +913,7 @@ fn execute_via_bridge(
                     args.offset,
                     default_limit,
                 );
-                client.list_functions(lim, filt)
+                client.list_functions(lim, filt, &[], false)
             }
             "strings" => {
                 let (lim, filt) = bridge_list_params(
@@ -874,16 +939,16 @@ fn execute_via_bridge(
         Commands::Function(cmd) => {
             use cli::FunctionCommands;
             match cmd {
-                FunctionCommands::List(opts) => {
+                FunctionCommands::List(args) => {
                     let (lim, filt) = bridge_list_params(
-                        opts.limit,
-                        opts.filter.clone(),
-                        opts.sort.as_deref(),
-                        opts.count,
-                        opts.offset,
+                        args.options.limit,
+                        args.options.filter.clone(),
+                        args.options.sort.as_deref(),
+                        args.options.count,
+                        args.options.offset,
                         default_limit,
                     );
-                    client.list_functions(lim, filt)
+                    client.list_functions(lim, filt, &args.tags, args.untagged)
                 }
                 FunctionCommands::Decompile(args) => client.decompile(
                     args.resolved_target().to_string(),
@@ -1007,7 +1072,7 @@ fn execute_via_bridge(
                         opts.offset,
                         default_limit,
                     );
-                    client.list_functions(lim, filt)
+                    client.list_functions(lim, filt, &[], false)
                 }
                 DumpCommands::Strings(opts) => {
                     let (lim, filt) = bridge_list_params(
@@ -1134,6 +1199,64 @@ fn execute_via_bridge(
                     Some(json!({
                         "type_name": args.type_name,
                         "field_name": args.name,
+                    })),
+                ),
+            }
+        }
+        Commands::Tag(cmd) => {
+            use cli::TagCommands;
+            match cmd {
+                TagCommands::List(args) => {
+                    let (lim, _) = bridge_list_params(
+                        args.options.limit,
+                        args.options.filter.clone(),
+                        args.options.sort.as_deref(),
+                        args.options.count,
+                        args.options.offset,
+                        default_limit,
+                    );
+                    client.tag_list(lim, args.function.as_deref())
+                }
+                TagCommands::Get(args) => {
+                    let (lim, _) = bridge_list_params(
+                        args.options.limit,
+                        args.options.filter.clone(),
+                        args.options.sort.as_deref(),
+                        args.options.count,
+                        args.options.offset,
+                        default_limit,
+                    );
+                    client.tag_get(&args.name, lim)
+                }
+                TagCommands::Create(args) => client.send_command(
+                    "tag_create",
+                    Some(json!({"name": args.name, "comment": args.comment})),
+                ),
+                TagCommands::Delete(args) => {
+                    client.send_command("tag_delete", Some(json!({"name": args.name})))
+                }
+                TagCommands::Rename(args) => client.send_command(
+                    "tag_rename",
+                    Some(json!({"name": args.old_name, "new_name": args.new_name})),
+                ),
+                TagCommands::SetComment(args) => client.send_command(
+                    "tag_set_comment",
+                    Some(json!({"name": args.name, "comment": args.comment})),
+                ),
+                TagCommands::Add(args) => client.send_command(
+                    "tag_add",
+                    Some(json!({
+                        "function": args.target,
+                        "tags": args.tags,
+                        "no_create": args.no_create,
+                    })),
+                ),
+                TagCommands::Remove(args) => client.send_command(
+                    "tag_remove",
+                    Some(json!({
+                        "function": args.target,
+                        "tags": args.tags,
+                        "all": args.all,
                     })),
                 ),
             }
@@ -2027,6 +2150,7 @@ fn unwrap_bridge_response(value: serde_json::Value) -> Vec<serde_json::Value> {
         "results",
         "programs",
         "types",
+        "tags",
         "comments",
         "symbols",
         "callers",

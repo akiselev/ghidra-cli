@@ -186,6 +186,67 @@ ghidra type add-field STRUCT_NAME --name FIELD --type TYPE [--offset N] [--size 
 ghidra type del-field STRUCT_NAME --name FIELD [--project P] [--program PROG]
 ```
 
+### Tag Operations
+
+Function tags organize large codebases: named, program-scoped labels with an
+optional comment, attachable to any number of functions.
+
+```bash
+ghidra tag list [--function TARGET] [QUERY_OPTS]   # alias: tags — all tags (name, comment, use_count), or one function's tags
+ghidra tag get NAME [QUERY_OPTS]                   # alias: show — member functions of a tag (rows: name, address)
+ghidra tag create NAME [--comment TEXT] [--project P] [--program PROG]
+ghidra tag delete NAME [--project P] [--program PROG]                  # alias: rm — detaches from ALL functions; reports use_count + functions_affected
+ghidra tag rename OLD NEW [--project P] [--program PROG]               # alias: mv — global; errors if NEW exists (no implicit merge)
+ghidra tag set-comment NAME COMMENT [--project P] [--program PROG]     # "" clears
+ghidra tag add TARGET TAG... [--no-create] [--project P] [--program PROG]    # auto-creates missing tags; reports added/created/already_present
+ghidra tag remove TARGET TAG... [--project P] [--program PROG]         # reports removed/not_present; idempotent
+ghidra tag remove TARGET --all [--project P] [--program PROG]          # detach every tag
+ghidra function list --tag NAME [--tag NAME2] [QUERY_OPTS]             # server-side filter; multiple --tag = AND
+ghidra function list --untagged [QUERY_OPTS]                           # functions with no tags (triage complement)
+```
+
+Semantics agents should know:
+- Tag names are **case-sensitive** (`Crypto` ≠ `crypto`). Unknown-tag errors
+  include a `Did you mean ...?` hint and exit **nonzero** — check `ghidra tag
+  list` first (or use `--filter`) in speculative loops. A no-match `--filter`
+  exits 0 with empty output; an unknown `--tag` exits nonzero.
+- `tag add`/`remove` are idempotent: already-attached / not-present tags are
+  reported in the response, never errors — safe to retry.
+- Function rows (`function list`/`get`) carry a sorted `tags` array (present
+  even when empty), so `--fields name,address,tags` and `--filter "tags ~
+  'crypto'"` work. DSL `~`/`^`/`$`/`=~`/`in` are case-insensitive on tags;
+  `=`/`!=` are exact. In CSV output, tag arrays join with `;`.
+- Names cannot be empty or contain `,` or `;` (rejected at creation; odd names
+  created in the Ghidra GUI remain attachable/removable/deletable).
+- Names with spaces work but cannot be used in `ghidra batch` files (whitespace
+  tokenizer, no quoting).
+- External functions are out of scope for tag membership operations: a tag
+  applied to externals in the Ghidra GUI may show a higher `use_count` in
+  `tag list` than `tag get`'s member count.
+
+Typical agent workflow:
+
+```bash
+# Define a taxonomy (comments document meaning for future sessions)
+ghidra tag create crypto --comment "Key schedule, cipher rounds, RNG"
+ghidra tag create reviewed --comment "Decompiled and understood"
+
+# Triage and tag
+ghidra tag add FUN_00401a20 crypto
+ghidra tag add aes_key_expand crypto reviewed
+
+# Bulk via batch (one process, one bridge connection; bare tag names only)
+printf 'tag add FUN_00402000 network\ntag add parse_packet network reviewed\n' > triage.batch
+ghidra batch triage.batch
+
+# Drive the next pass off the taxonomy
+ghidra tag list                              # names, comments, use counts
+ghidra tag get network                       # member functions (rows)
+ghidra function list --tag network --filter "size > 200" --fields name,address,tags
+ghidra function list --untagged --limit 20   # what's left to triage
+ghidra tag remove parse_packet wip
+```
+
 ### Comment Operations
 
 ```bash

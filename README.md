@@ -157,6 +157,25 @@ ghidra type rename <old> <new>         # Rename type
 ghidra type delete <name>              # Delete type
 ```
 
+### Function Tags
+```bash
+ghidra tag list                        # All tags (name, comment, use count)
+ghidra tag get <name>                  # Functions carrying a tag
+ghidra tag create <name> --comment "…" # Create a tag (comment optional)
+ghidra tag add <func> <tag>...         # Attach tags (auto-creates missing ones)
+ghidra tag remove <func> <tag>...      # Detach tags (--all clears every tag)
+ghidra tag rename <old> <new>          # Rename everywhere it is used
+ghidra tag set-comment <name> "…"      # Set/clear a tag's comment
+ghidra tag delete <name>               # Delete tag, detaching from all functions
+ghidra function list --tag <name>      # Filter by tag (repeatable = AND)
+ghidra function list --untagged        # Functions with no tags
+```
+
+Tag names are case-sensitive. `tag add`/`remove` are idempotent (already-present
+and not-present tags are reported, not errors). Function rows include a sorted
+`tags` array, so `--fields name,address,tags` and `--filter "tags ~ 'crypto'"`
+work too.
+
 ### Cross-References
 ```bash
 ghidra x-ref to <address>              # References TO address

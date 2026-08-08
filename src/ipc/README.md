@@ -53,6 +53,7 @@ BridgeClient wraps all bridge commands as typed methods:
 | Xrefs | `xrefs_to()`, `xrefs_from()` |
 | Symbols | `symbol_list()`, `symbol_get()`, `symbol_create()`, `symbol_delete()`, `symbol_rename()` |
 | Types | `type_list()`, `type_get()`, `type_create()`, `type_apply()` |
+| Tags | `tag_list()`, `tag_get()` (mutations go through `send_command`) |
 | Comments | `comment_list()`, `comment_get()`, `comment_set()`, `comment_delete()` |
 | Search | `find_string()`, `find_bytes()`, `find_function()`, `find_calls()`, `find_crypto()`, `find_interesting()` |
 | Graph | `graph_calls()`, `graph_callers()`, `graph_callees()`, `graph_export()` |

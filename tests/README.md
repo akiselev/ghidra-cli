@@ -21,6 +21,7 @@ tests/
 ├── readonly_tests.rs    # Read-only query tests
 ├── script_tests.rs      # Script execution
 ├── symbol_tests.rs      # Symbol operations
+├── tag_tests.rs         # Function tag operations
 ├── type_tests.rs        # Type operations
 ├── output_format_integration.rs  # Output format detection
 └── e2e.rs               # Lightweight smoke test

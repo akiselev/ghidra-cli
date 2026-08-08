@@ -44,6 +44,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -721,6 +722,15 @@ public class GhidraCliBridge extends GhidraScript {
             case "type_typedef":    return handleTypeTypedef(args);
             case "type_add_field":  return handleTypeAddField(args);
             case "type_del_field":  return handleTypeDelField(args);
+            // Tag commands
+            case "tag_list":        return handleTagList(args);
+            case "tag_get":         return handleTagGet(args);
+            case "tag_create":      return handleTagCreate(args);
+            case "tag_delete":      return handleTagDelete(args);
+            case "tag_rename":      return handleTagRename(args);
+            case "tag_set_comment": return handleTagSetComment(args);
+            case "tag_add":         return handleTagAdd(args);
+            case "tag_remove":      return handleTagRemove(args);
             // Function signature commands
             case "function_set_signature": return handleFunctionSetSignature(args);
             case "function_set_return_type": return handleFunctionSetReturnType(args);
@@ -1145,9 +1155,24 @@ public class GhidraCliBridge extends GhidraScript {
 
         int limit = getArgInt(args, "limit", 0);
         String nameFilter = getArgString(args, "filter");
+        String[] tagFilterNames = getArgStringArray(args, "tags");
+        boolean untagged = getArgBool(args, "untagged", false);
+
+        FunctionManager fm = currentProgram.getFunctionManager();
+
+        // Resolve tag filter up front: unknown tag is an error, not an empty result
+        // (a typo must not read as "no matches").
+        Set<FunctionTag> requiredTags = new HashSet<>();
+        if (tagFilterNames.length > 0) {
+            FunctionTagManager tm = fm.getFunctionTagManager();
+            for (String tagName : tagFilterNames) {
+                FunctionTag tag = tm.getFunctionTag(tagName);
+                if (tag == null) return errorResult(tagNotFoundError(tagName, tm));
+                requiredTags.add(tag);
+            }
+        }
 
         JsonArray functions = new JsonArray();
-        FunctionManager fm = currentProgram.getFunctionManager();
         int count = 0;
 
         FunctionIterator iter = fm.getFunctions(true);
@@ -1160,12 +1185,19 @@ public class GhidraCliBridge extends GhidraScript {
             if (nameFilter != null && !name.toLowerCase().contains(nameFilter.toLowerCase())) {
                 continue;
             }
+            if (!requiredTags.isEmpty() && !func.getTags().containsAll(requiredTags)) {
+                continue;
+            }
+            if (untagged && !func.getTags().isEmpty()) {
+                continue;
+            }
 
             JsonObject funcData = new JsonObject();
             funcData.addProperty("name", name);
             funcData.addProperty("address", func.getEntryPoint().toString());
             funcData.addProperty("size", func.getBody().getNumAddresses());
             funcData.addProperty("entry_point", func.getEntryPoint().toString());
+            funcData.add("tags", functionTagNames(func));
 
             String sig = null;
             try {
@@ -1204,6 +1236,7 @@ public class GhidraCliBridge extends GhidraScript {
         funcData.addProperty("address", func.getEntryPoint().toString());
         funcData.addProperty("size", func.getBody().getNumAddresses());
         funcData.addProperty("entry_point", func.getEntryPoint().toString());
+        funcData.add("tags", functionTagNames(func));
 
         String sig = null;
         try {
@@ -3332,6 +3365,389 @@ public class GhidraCliBridge extends GhidraScript {
             return result;
         } catch (Exception e) {
             return errorResult("Failed to delete field: " + e.getMessage());
+        }
+    }
+
+    // --- Function Tag Handlers ---
+
+    // Exact (case-sensitive) name order for all serialized tag lists. Do NOT use
+    // FunctionTag's Comparable — it is case-insensitive name-then-comment, and
+    // mixing collations would order Crypto/crypto differently across commands.
+    private static final Comparator<FunctionTag> TAG_NAME_ORDER =
+        Comparator.comparing(FunctionTag::getName);
+
+    private JsonObject tagToJson(FunctionTag tag, FunctionTagManager tm) {
+        JsonObject o = new JsonObject();
+        o.addProperty("name", tag.getName());
+        o.addProperty("comment", tag.getComment());
+        o.addProperty("use_count", tm.getUseCount(tag));
+        return o;
+    }
+
+    // Sorted tag-name array for function rows. getTags() returns the function's
+    // LIVE cached set — copy names out, never mutate it.
+    private JsonArray functionTagNames(Function func) {
+        List<String> names = new ArrayList<>();
+        for (FunctionTag t : func.getTags()) names.add(t.getName());
+        Collections.sort(names);
+        JsonArray arr = new JsonArray();
+        for (String n : names) arr.add(n);
+        return arr;
+    }
+
+    // Validation applies at creation points only (tag_create, tag_rename's new
+    // name, tag_add's to-create names). Existing tags — including odd names
+    // created in the Ghidra GUI — must stay attachable/removable/deletable.
+    private String validateTagName(String name) {
+        if (name == null || name.trim().isEmpty()) return "Tag name cannot be empty";
+        if (name.contains(",")) return "Tag name cannot contain ',' (Ghidra GUI tag separator): " + name;
+        if (name.contains(";")) return "Tag name cannot contain ';' (CSV array separator): " + name;
+        return null;
+    }
+
+    private String tagNotFoundError(String name, FunctionTagManager tm) {
+        StringBuilder msg = new StringBuilder("No tag named '").append(name).append("'");
+        List<String> near = new ArrayList<>();
+        for (FunctionTag t : tm.getAllFunctionTags()) {
+            if (t.getName().equalsIgnoreCase(name) && !t.getName().equals(name)) {
+                near.add(t.getName());
+            }
+        }
+        if (near.isEmpty() && name.length() >= 3) {
+            for (FunctionTag t : tm.getAllFunctionTags()) {
+                if (levenshteinDistance(t.getName().toLowerCase(), name.toLowerCase()) <= 2) {
+                    near.add(t.getName());
+                }
+            }
+        }
+        if (!near.isEmpty()) {
+            Collections.sort(near);
+            msg.append(". Did you mean '").append(near.get(0)).append("'?");
+        }
+        return msg.toString();
+    }
+
+    private JsonObject handleTagList(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+        int limit = getArgInt(args, "limit", 0);
+        String funcTarget = getArgString(args, "function");
+        FunctionTagManager tm = currentProgram.getFunctionManager().getFunctionTagManager();
+
+        List<FunctionTag> all;
+        if (funcTarget != null) {
+            Function func = findFunctionByNameOrAddress(funcTarget);
+            if (func == null) return errorResult(buildFunctionTargetHint(funcTarget));
+            all = new ArrayList<>(func.getTags());          // copy the live set
+        } else {
+            // getAllFunctionTags() returns DB record (creation) order — not sorted.
+            all = new ArrayList<>(tm.getAllFunctionTags());
+        }
+        // Sort BEFORE applying limit, or --limit N truncates by creation order.
+        all.sort(TAG_NAME_ORDER);
+
+        JsonArray tags = new JsonArray();
+        for (FunctionTag t : all) {
+            if (limit > 0 && tags.size() >= limit) break;
+            tags.add(tagToJson(t, tm));
+        }
+        JsonObject result = new JsonObject();
+        result.add("tags", tags);
+        result.addProperty("count", tags.size());
+        return result;
+    }
+
+    private JsonObject handleTagGet(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+        String name = getArgString(args, "name");
+        if (name == null || name.isEmpty()) return errorResult("Tag name required");
+        int limit = getArgInt(args, "limit", 0);
+
+        FunctionTagManager tm = currentProgram.getFunctionManager().getFunctionTagManager();
+        FunctionTag tag = tm.getFunctionTag(name);
+        if (tag == null) return errorResult(tagNotFoundError(name, tm));
+
+        JsonArray functions = new JsonArray();
+        if (tm.getUseCount(tag) > 0) {
+            // No public reverse index in Ghidra; linear scan like Ghidra's own
+            // Function Tags window. Non-external functions only (§7a policy).
+            FunctionIterator iter = currentProgram.getFunctionManager().getFunctions(true);
+            while (iter.hasNext()) {
+                if (limit > 0 && functions.size() >= limit) break;
+                Function func = iter.next();
+                if (func.getTags().contains(tag)) {
+                    JsonObject o = new JsonObject();
+                    o.addProperty("name", func.getName());
+                    o.addProperty("address", func.getEntryPoint().toString());
+                    functions.add(o);
+                }
+            }
+        }
+        // Envelope constraint: "target"/"count" are META_KEYS on the Rust side,
+        // so this unwraps to member-function rows. Do not add non-meta keys
+        // (comment/use_count live in tag_list).
+        JsonObject result = new JsonObject();
+        result.addProperty("target", name);
+        result.add("functions", functions);
+        result.addProperty("count", functions.size());
+        return result;
+    }
+
+    private JsonObject handleTagCreate(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+        String name = getArgString(args, "name");
+        String comment = getArgString(args, "comment");
+        if (name == null) return errorResult("Tag name required");
+
+        try {
+            FunctionTagManager tm = currentProgram.getFunctionManager().getFunctionTagManager();
+            FunctionTag existing = tm.getFunctionTag(name);
+            if (existing != null) {
+                JsonObject result = new JsonObject();
+                result.addProperty("status", "created");
+                result.addProperty("name", existing.getName());
+                result.addProperty("comment", existing.getComment());
+                result.addProperty("existed", true);
+                return result;
+            }
+
+            String err = validateTagName(name);
+            if (err != null) return errorResult(err);
+
+            int txId = currentProgram.startTransaction("Create function tag");
+            FunctionTag tag;
+            try {
+                tag = tm.createFunctionTag(name, comment == null ? "" : comment);
+                currentProgram.endTransaction(txId, true);
+            } catch (Exception e) {
+                currentProgram.endTransaction(txId, false);
+                throw e;
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("status", "created");
+            result.addProperty("name", tag.getName());
+            result.addProperty("comment", tag.getComment());
+            result.addProperty("existed", false);
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to create tag: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleTagDelete(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+        String name = getArgString(args, "name");
+        if (name == null || name.isEmpty()) return errorResult("Tag name required");
+
+        try {
+            FunctionTagManager tm = currentProgram.getFunctionManager().getFunctionTagManager();
+            FunctionTag tag = tm.getFunctionTag(name);
+            if (tag == null) return errorResult(tagNotFoundError(name, tm));
+
+            // Capture BOTH counts before delete: use_count is Ghidra's raw number
+            // (may include external functions); functions_affected is the
+            // non-external membership consistent with what `tag get` shows.
+            int useCount = tm.getUseCount(tag);
+            int functionsAffected = 0;
+            if (useCount > 0) {
+                FunctionIterator iter = currentProgram.getFunctionManager().getFunctions(true);
+                while (iter.hasNext()) {
+                    if (iter.next().getTags().contains(tag)) functionsAffected++;
+                }
+            }
+
+            int txId = currentProgram.startTransaction("Delete function tag");
+            try {
+                tag.delete();                 // global: detaches from ALL functions
+                currentProgram.endTransaction(txId, true);
+            } catch (Exception e) {
+                currentProgram.endTransaction(txId, false);
+                throw e;
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("status", "deleted");
+            result.addProperty("name", name);
+            result.addProperty("use_count", useCount);
+            result.addProperty("functions_affected", functionsAffected);
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to delete tag: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleTagRename(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+        String name = getArgString(args, "name");
+        String newName = getArgString(args, "new_name");
+        if (name == null || newName == null || name.isEmpty())
+            return errorResult("name and new_name required");
+
+        try {
+            FunctionTagManager tm = currentProgram.getFunctionManager().getFunctionTagManager();
+            FunctionTag tag = tm.getFunctionTag(name);
+            if (tag == null) return errorResult(tagNotFoundError(name, tm));
+            if (tm.getFunctionTag(newName) != null)
+                return errorResult("Tag already exists: '" + newName + "'");
+
+            String err = validateTagName(newName);
+            if (err != null) return errorResult(err);
+
+            int useCount = tm.getUseCount(tag);
+            int txId = currentProgram.startTransaction("Rename function tag");
+            try {
+                tag.setName(newName);         // global rename; functions store the id
+                currentProgram.endTransaction(txId, true);
+            } catch (Exception e) {
+                currentProgram.endTransaction(txId, false);
+                throw e;
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("status", "renamed");
+            result.addProperty("old_name", name);
+            result.addProperty("new_name", newName);
+            result.addProperty("use_count", useCount);
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to rename tag: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleTagSetComment(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+        String name = getArgString(args, "name");
+        String comment = getArgString(args, "comment");
+        if (name == null || name.isEmpty()) return errorResult("Tag name required");
+
+        try {
+            FunctionTagManager tm = currentProgram.getFunctionManager().getFunctionTagManager();
+            FunctionTag tag = tm.getFunctionTag(name);
+            if (tag == null) return errorResult(tagNotFoundError(name, tm));
+
+            int txId = currentProgram.startTransaction("Set function tag comment");
+            try {
+                tag.setComment(comment == null ? "" : comment);
+                currentProgram.endTransaction(txId, true);
+            } catch (Exception e) {
+                currentProgram.endTransaction(txId, false);
+                throw e;
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("status", "comment_set");
+            result.addProperty("name", name);
+            result.addProperty("comment", comment == null ? "" : comment);
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to set tag comment: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleTagAdd(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+        String target = getArgString(args, "function");
+        String[] rawTags = getArgStringArray(args, "tags");
+        boolean noCreate = getArgBool(args, "no_create", false);
+        if (target == null || rawTags.length == 0)
+            return errorResult("function and tags are required");
+
+        try {
+            // Dedupe argv up front: `tag add f crypto crypto` must not double-report.
+            LinkedHashSet<String> tagNames = new LinkedHashSet<>(Arrays.asList(rawTags));
+            Function func = findFunctionByNameOrAddress(target);
+            if (func == null) return errorResult(buildFunctionTargetHint(target));
+
+            FunctionTagManager tm = currentProgram.getFunctionManager().getFunctionTagManager();
+            Set<String> current = new HashSet<>();
+            for (FunctionTag t : func.getTags()) current.add(t.getName());
+
+            List<String> toCreate = new ArrayList<>();
+            for (String name : tagNames) {
+                if (tm.getFunctionTag(name) != null) continue;  // existing: any name attachable
+                String err = validateTagName(name);             // validate only names we'd CREATE
+                if (err != null) return errorResult(err);
+                toCreate.add(name);
+            }
+            if (noCreate && !toCreate.isEmpty())
+                return errorResult("Tags do not exist (--no-create): " + String.join(", ", toCreate));
+
+            JsonArray added = new JsonArray(), created = new JsonArray(), already = new JsonArray();
+            int txId = currentProgram.startTransaction("Add function tags");
+            try {
+                for (String name : tagNames) {
+                    if (current.contains(name)) { already.add(name); continue; }
+                    func.addTag(name);   // auto-creates; returns true unconditionally
+                    added.add(name);
+                    if (toCreate.contains(name)) created.add(name);
+                }
+                currentProgram.endTransaction(txId, true);
+            } catch (Exception e) {
+                currentProgram.endTransaction(txId, false);
+                throw e;
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("status", "tagged");
+            result.addProperty("function", func.getName());
+            result.addProperty("address", func.getEntryPoint().toString());
+            result.add("added", added);
+            result.add("created", created);
+            result.add("already_present", already);
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to add tags: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleTagRemove(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+        String target = getArgString(args, "function");
+        String[] rawTags = getArgStringArray(args, "tags");
+        boolean all = getArgBool(args, "all", false);
+        if (target == null || (rawTags.length == 0 && !all))
+            return errorResult("function and tags (or all) are required");
+
+        try {
+            Function func = findFunctionByNameOrAddress(target);
+            if (func == null) return errorResult(buildFunctionTargetHint(target));
+
+            // Pre-read into a COPY: getTags() is the live set and removeTag
+            // mutates it — iterating it directly while removing throws CME.
+            List<String> currentNames = new ArrayList<>();
+            for (FunctionTag t : func.getTags()) currentNames.add(t.getName());
+            Set<String> current = new HashSet<>(currentNames);
+
+            LinkedHashSet<String> tagNames = all
+                ? new LinkedHashSet<>(currentNames)
+                : new LinkedHashSet<>(Arrays.asList(rawTags));
+
+            JsonArray removed = new JsonArray(), notPresent = new JsonArray();
+            int txId = currentProgram.startTransaction("Remove function tags");
+            try {
+                for (String name : tagNames) {
+                    if (current.contains(name)) {
+                        func.removeTag(name);   // void; silent — membership pre-checked
+                        removed.add(name);
+                    } else {
+                        notPresent.add(name);
+                    }
+                }
+                currentProgram.endTransaction(txId, true);
+            } catch (Exception e) {
+                currentProgram.endTransaction(txId, false);
+                throw e;
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("status", "untagged");
+            result.addProperty("function", func.getName());
+            result.addProperty("address", func.getEntryPoint().toString());
+            result.add("removed", removed);
+            result.add("not_present", notPresent);
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to remove tags: " + e.getMessage());
         }
     }
 

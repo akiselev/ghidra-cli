@@ -82,7 +82,38 @@ fn evaluate_compare(field: &str, op: CompareOp, value: &Value, data: &JsonValue)
                 ))
             }
         }),
+        (JsonValue::Array(elems), val) => {
+            // Array fields (e.g. `tags`): `=` is any-element-equals; `!=` is
+            // NO-element-equals (i.e. `tags != 'x'` ≡ `NOT(tags = 'x')` —
+            // naive any-element `!=` would be true for nearly every
+            // multi-element array). Ordering comparisons on arrays are false.
+            match op {
+                CompareOp::Equal | CompareOp::NotEqual => {
+                    let any_equal = elems.iter().any(|elem| scalar_equals(elem, val));
+                    Ok(if matches!(op, CompareOp::Equal) {
+                        any_equal
+                    } else {
+                        !any_equal
+                    })
+                }
+                _ => Ok(false),
+            }
+        }
         _ => Ok(false),
+    }
+}
+
+/// Element-vs-value equality for array-field filters. Mirrors the scalar `=`
+/// semantics (exact, case-sensitive for strings); type mismatches are simply
+/// not-equal rather than errors, since arrays can hold mixed content.
+fn scalar_equals(elem: &JsonValue, val: &Value) -> bool {
+    match (elem, val) {
+        (JsonValue::String(s), Value::String(v)) => s == v,
+        (JsonValue::Number(n), v) => v
+            .as_f64()
+            .is_some_and(|c| (n.as_f64().unwrap() - c).abs() < f64::EPSILON),
+        (JsonValue::Bool(b), Value::Boolean(v)) => *b == *v,
+        _ => false,
     }
 }
 
@@ -93,21 +124,43 @@ fn evaluate_string_op(field: &str, op: StringOp, value: &str, data: &JsonValue) 
         return Ok(false);
     }
 
-    let field_str = match field_value.unwrap() {
-        JsonValue::String(s) => s.to_lowercase(),
-        JsonValue::Number(n) => n.to_string(),
-        JsonValue::Bool(b) => b.to_string(),
-        _ => return Ok(false),
+    let value_lower = value.to_lowercase();
+    let matches_str = |field_str: &str| -> Result<bool> {
+        Ok(match op {
+            StringOp::Contains => field_str.contains(&value_lower),
+            StringOp::StartsWith => field_str.starts_with(&value_lower),
+            StringOp::EndsWith => field_str.ends_with(&value_lower),
+            StringOp::Regex => compiled_regex(value)?.is_match(field_str),
+        })
     };
 
-    let value_lower = value.to_lowercase();
+    match field_value.unwrap() {
+        // Array fields (e.g. `tags`): any-element semantics — match if any
+        // element satisfies the predicate.
+        JsonValue::Array(elems) => {
+            for elem in elems {
+                if let Some(s) = scalar_to_lower_string(elem) {
+                    if matches_str(&s)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        other => match scalar_to_lower_string(other) {
+            Some(s) => matches_str(&s),
+            None => Ok(false),
+        },
+    }
+}
 
-    Ok(match op {
-        StringOp::Contains => field_str.contains(&value_lower),
-        StringOp::StartsWith => field_str.starts_with(&value_lower),
-        StringOp::EndsWith => field_str.ends_with(&value_lower),
-        StringOp::Regex => compiled_regex(value)?.is_match(&field_str),
-    })
+fn scalar_to_lower_string(v: &JsonValue) -> Option<String> {
+    match v {
+        JsonValue::String(s) => Some(s.to_lowercase()),
+        JsonValue::Number(n) => Some(n.to_string()),
+        JsonValue::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
 }
 
 /// Compile a filter regex once per pattern; `evaluate` runs per row, and
@@ -187,28 +240,27 @@ fn evaluate_in(field: &str, values: &[Value], data: &JsonValue) -> Result<bool> 
 
     let field_value = field_value.unwrap();
 
-    for val in values {
-        match (field_value, val) {
-            (JsonValue::String(s), Value::String(v)) => {
-                if s.eq_ignore_ascii_case(v) {
-                    return Ok(true);
-                }
-            }
-            (JsonValue::Number(n), v) => {
-                if let Some(compare_num) = v.as_f64() {
-                    if (n.as_f64().unwrap() - compare_num).abs() < f64::EPSILON {
-                        return Ok(true);
-                    }
-                }
-            }
-            (JsonValue::Bool(b), Value::Boolean(v)) if *b == *v => {
-                return Ok(true);
-            }
-            _ => {}
-        }
+    // Array fields (e.g. `tags`): any-element semantics.
+    if let JsonValue::Array(elems) = field_value {
+        return Ok(elems
+            .iter()
+            .any(|elem| values.iter().any(|v| scalar_matches_in(elem, v))));
     }
 
-    Ok(false)
+    Ok(values.iter().any(|v| scalar_matches_in(field_value, v)))
+}
+
+/// `IN`-list membership for one scalar. Strings compare case-insensitively,
+/// matching the operator's pre-existing scalar semantics.
+fn scalar_matches_in(field_value: &JsonValue, val: &Value) -> bool {
+    match (field_value, val) {
+        (JsonValue::String(s), Value::String(v)) => s.eq_ignore_ascii_case(v),
+        (JsonValue::Number(n), v) => v
+            .as_f64()
+            .is_some_and(|c| (n.as_f64().unwrap() - c).abs() < f64::EPSILON),
+        (JsonValue::Bool(b), Value::Boolean(v)) => *b == *v,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -259,6 +311,103 @@ mod tests {
             value: "^PK_".to_string(),
         };
 
+        assert!(evaluate(&expr, &data).unwrap());
+    }
+
+    #[test]
+    fn test_array_field_contains_any_element() {
+        let data = json!({ "tags": ["Crypto", "reviewed"] });
+
+        // ~ is case-insensitive and matches any element
+        let expr = FilterExpr::StringOp {
+            field: "tags".to_string(),
+            op: StringOp::Contains,
+            value: "crypto".to_string(),
+        };
+        assert!(evaluate(&expr, &data).unwrap());
+
+        let expr = FilterExpr::StringOp {
+            field: "tags".to_string(),
+            op: StringOp::Contains,
+            value: "network".to_string(),
+        };
+        assert!(!evaluate(&expr, &data).unwrap());
+    }
+
+    #[test]
+    fn test_array_field_equals_is_exact_any_element() {
+        let data = json!({ "tags": ["Crypto", "reviewed"] });
+
+        // = is exact-match (case-sensitive), any element
+        let eq = |v: &str| FilterExpr::Compare {
+            field: "tags".to_string(),
+            op: CompareOp::Equal,
+            value: Value::String(v.to_string()),
+        };
+        assert!(evaluate(&eq("Crypto"), &data).unwrap());
+        assert!(!evaluate(&eq("crypto"), &data).unwrap());
+    }
+
+    #[test]
+    fn test_array_field_not_equal_is_no_element_equals() {
+        // tags != 'x' must mean NO element equals x, not "some element differs".
+        let data = json!({ "tags": ["crypto", "reviewed"] });
+
+        let ne = |v: &str| FilterExpr::Compare {
+            field: "tags".to_string(),
+            op: CompareOp::NotEqual,
+            value: Value::String(v.to_string()),
+        };
+        assert!(!evaluate(&ne("crypto"), &data).unwrap());
+        assert!(evaluate(&ne("network"), &data).unwrap());
+    }
+
+    #[test]
+    fn test_array_field_ordering_comparison_is_false() {
+        let data = json!({ "tags": ["crypto"] });
+        let expr = FilterExpr::Compare {
+            field: "tags".to_string(),
+            op: CompareOp::Greater,
+            value: Value::Integer(1),
+        };
+        assert!(!evaluate(&expr, &data).unwrap());
+    }
+
+    #[test]
+    fn test_array_field_in_any_element() {
+        let data = json!({ "tags": ["crypto", "reviewed"] });
+        let expr = FilterExpr::In {
+            field: "tags".to_string(),
+            values: vec![
+                Value::String("network".to_string()),
+                Value::String("CRYPTO".to_string()), // IN is case-insensitive
+            ],
+        };
+        assert!(evaluate(&expr, &data).unwrap());
+
+        let expr = FilterExpr::In {
+            field: "tags".to_string(),
+            values: vec![Value::String("network".to_string())],
+        };
+        assert!(!evaluate(&expr, &data).unwrap());
+    }
+
+    #[test]
+    fn test_empty_array_field() {
+        let data = json!({ "tags": [] });
+        let expr = FilterExpr::StringOp {
+            field: "tags".to_string(),
+            op: StringOp::Contains,
+            value: "x".to_string(),
+        };
+        assert!(!evaluate(&expr, &data).unwrap());
+
+        // tags != 'x' on an empty array: no element equals x → true
+        let expr = FilterExpr::Compare {
+            field: "tags".to_string(),
+            op: CompareOp::NotEqual,
+            value: Value::String("x".to_string()),
+        };
         assert!(evaluate(&expr, &data).unwrap());
     }
 

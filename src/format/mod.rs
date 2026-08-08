@@ -159,7 +159,7 @@ fn format_csv<T: Serialize>(data: &[T], delimiter: char) -> Result<String> {
                 .iter()
                 .map(|k| {
                     map.get(k)
-                        .map(format_json_value)
+                        .map(format_csv_value)
                         .unwrap_or_else(|| "".to_string())
                 })
                 .collect();
@@ -169,6 +169,20 @@ fn format_csv<T: Serialize>(data: &[T], delimiter: char) -> Result<String> {
     }
 
     Ok(result)
+}
+
+/// CSV cell rendering. Arrays join with `;` (never with `, `): format_csv does
+/// no field quoting, so a `, `-joined array (e.g. `tags`, `operands`) would
+/// inject the delimiter and shift every subsequent column.
+fn format_csv_value(value: &JsonValue) -> String {
+    match value {
+        JsonValue::Array(arr) => arr
+            .iter()
+            .map(format_csv_value)
+            .collect::<Vec<_>>()
+            .join(";"),
+        other => format_json_value(other),
+    }
 }
 
 /// Compact human-readable format: one line per item with key fields.

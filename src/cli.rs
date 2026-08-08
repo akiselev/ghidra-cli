@@ -86,6 +86,10 @@ pub enum Commands {
     #[command(subcommand, alias = "types")]
     Type(TypeCommands),
 
+    /// Function tag operations
+    #[command(subcommand, alias = "tags")]
+    Tag(TagCommands),
+
     /// Comment operations
     #[command(subcommand, alias = "comments")]
     Comment(CommentCommands),
@@ -330,7 +334,7 @@ pub struct ExportArgs {
 pub enum FunctionCommands {
     /// List all functions
     #[command(alias = "ls")]
-    List(QueryOptions),
+    List(FunctionListArgs),
     /// Get function details
     #[command(alias = "show", alias = "detail")]
     Get(FunctionGetArgs),
@@ -359,6 +363,18 @@ pub enum FunctionCommands {
     SetCallingConvention(SetCallingConventionArgs),
     /// Set variable type in a function
     SetVarType(SetVarTypeArgs),
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct FunctionListArgs {
+    /// Only functions carrying this tag (repeatable; multiple tags = AND)
+    #[arg(long = "tag", value_name = "NAME")]
+    pub tags: Vec<String>,
+    /// Only functions with no tags
+    #[arg(long, conflicts_with = "tags")]
+    pub untagged: bool,
+    #[command(flatten)]
+    pub options: QueryOptions,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -785,6 +801,131 @@ pub struct TypeDelFieldArgs {
     /// Field name to remove
     #[arg(long)]
     pub name: String,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
+pub enum TagCommands {
+    /// List all function tags (or one function's tags with --function)
+    #[command(alias = "ls")]
+    List(TagListArgs),
+    /// Show the functions carrying a tag
+    #[command(alias = "show")]
+    Get(TagGetArgs),
+    /// Create a function tag
+    Create(TagCreateArgs),
+    /// Delete a tag (detaches it from all functions)
+    #[command(alias = "rm")]
+    Delete(TagDeleteArgs),
+    /// Rename a tag everywhere it is used
+    #[command(alias = "mv")]
+    Rename(TagRenameArgs),
+    /// Set or clear a tag's comment ("" clears)
+    SetComment(TagSetCommentArgs),
+    /// Attach tags to a function (auto-creates missing tags)
+    Add(TagAttachArgs),
+    /// Detach tags from a function
+    Remove(TagDetachArgs),
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct TagListArgs {
+    /// Only tags attached to this function (name | 0xaddr | FUN_<hex>)
+    #[arg(long = "function", value_name = "TARGET")]
+    pub function: Option<String>,
+    #[command(flatten)]
+    pub options: QueryOptions,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct TagGetArgs {
+    /// Tag name (case-sensitive)
+    pub name: String,
+    #[command(flatten)]
+    pub options: QueryOptions,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct TagCreateArgs {
+    /// Tag name (case-sensitive; commas and semicolons not allowed)
+    pub name: String,
+    /// Optional comment describing the tag's meaning
+    #[arg(long)]
+    pub comment: Option<String>,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct TagDeleteArgs {
+    /// Tag name
+    pub name: String,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct TagRenameArgs {
+    /// Current tag name
+    pub old_name: String,
+    /// New tag name
+    pub new_name: String,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct TagSetCommentArgs {
+    /// Tag name
+    pub name: String,
+    /// New comment text; empty string clears the comment
+    pub comment: String,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct TagAttachArgs {
+    /// Function target (name | 0xaddr | FUN_<hex>)
+    #[arg(value_name = "TARGET")]
+    pub target: String,
+    /// One or more tag names to attach
+    // `required = true` is mandatory: num_args = 1.. alone does NOT make a
+    // positional required — `ghidra tag add crypto` would parse with the tag
+    // name consumed as TARGET and an empty tag list.
+    #[arg(value_name = "TAG", required = true, num_args = 1..)]
+    pub tags: Vec<String>,
+    /// Error instead of auto-creating tags that don't exist yet
+    #[arg(long)]
+    pub no_create: bool,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct TagDetachArgs {
+    /// Function target (name | 0xaddr | FUN_<hex>)
+    #[arg(value_name = "TARGET")]
+    pub target: String,
+    /// Tag names to detach
+    #[arg(value_name = "TAG", num_args = 0.., required_unless_present = "all")]
+    pub tags: Vec<String>,
+    /// Detach every tag from the function
+    #[arg(long, conflicts_with = "tags")]
+    pub all: bool,
     #[arg(long)]
     pub program: Option<String>,
     #[arg(long)]
