@@ -3,6 +3,7 @@
 mod cli;
 mod config;
 mod error;
+mod extras;
 mod filter;
 mod format;
 mod ghidra;
@@ -156,6 +157,7 @@ fn requires_bridge(command: &Commands) -> bool {
             | Commands::Rename(_)
             | Commands::Summarize(_)
             | Commands::Pcode(_)
+            | Commands::DataFlow(_)
             | Commands::Transaction(_)
     )
 }
@@ -213,6 +215,7 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
             cli::FindCommands::Calls(args) => args.options.project.clone(),
             cli::FindCommands::Crypto(opts) => opts.project.clone(),
             cli::FindCommands::Interesting(opts) => opts.project.clone(),
+            cli::FindCommands::Similar(args) => args.options.project.clone(),
         },
         Commands::Graph(cmd) => match cmd {
             cli::GraphCommands::Calls(opts) => opts.project.clone(),
@@ -244,6 +247,7 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
             cli::TypeCommands::Typedef(args) => args.project.clone(),
             cli::TypeCommands::AddField(args) => args.project.clone(),
             cli::TypeCommands::DelField(args) => args.project.clone(),
+            cli::TypeCommands::Recover(args) => args.options.project.clone(),
         },
         Commands::Patch(cmd) => match cmd {
             cli::PatchCommands::Bytes(args) => args.project.clone(),
@@ -263,15 +267,20 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
             cli::ProgramCommands::Delete(args) => args.project.clone(),
             cli::ProgramCommands::Info(args) => args.project.clone(),
             cli::ProgramCommands::Export(args) => args.project.clone(),
+            cli::ProgramCommands::Foreach(args) => args.project.clone(),
+            cli::ProgramCommands::FirmwareSummarize(args) => args.project.clone(),
         },
         Commands::Diff(cmd) => match cmd {
             cli::DiffCommands::Programs(args) => args.project.clone(),
             cli::DiffCommands::Functions(args) => args.project.clone(),
+            cli::DiffCommands::Transfer(args) => args.project.clone(),
+            cli::DiffCommands::Explain(args) => args.project.clone(),
         },
         Commands::Batch(args) => args.project.clone(),
         Commands::Rename(args) => args.project.clone(),
         Commands::Summarize(args) => args.options.project.clone(),
         Commands::Pcode(args) => args.options.project.clone(),
+        Commands::DataFlow(args) => args.options.project.clone(),
         Commands::Transaction(cmd) => match cmd {
             cli::TransactionCommands::Begin { options, .. } => options.project.clone(),
             cli::TransactionCommands::Commit { options } => options.project.clone(),
@@ -335,6 +344,7 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
             cli::FindCommands::Calls(args) => args.options.program.clone(),
             cli::FindCommands::Crypto(opts) => opts.program.clone(),
             cli::FindCommands::Interesting(opts) => opts.program.clone(),
+            cli::FindCommands::Similar(args) => args.options.program.clone(),
         },
         Commands::Graph(cmd) => match cmd {
             cli::GraphCommands::Calls(opts) => opts.program.clone(),
@@ -366,6 +376,7 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
             cli::TypeCommands::Typedef(args) => args.program.clone(),
             cli::TypeCommands::AddField(args) => args.program.clone(),
             cli::TypeCommands::DelField(args) => args.program.clone(),
+            cli::TypeCommands::Recover(args) => args.options.program.clone(),
         },
         Commands::Patch(cmd) => match cmd {
             cli::PatchCommands::Bytes(args) => args.program.clone(),
@@ -385,11 +396,14 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
             cli::ProgramCommands::Delete(args) => args.program.clone(),
             cli::ProgramCommands::Info(args) => args.program.clone(),
             cli::ProgramCommands::Export(args) => args.program.clone(),
+            cli::ProgramCommands::Foreach(_) => None,
+            cli::ProgramCommands::FirmwareSummarize(_) => None,
         },
         Commands::Batch(args) => args.program.clone(),
         Commands::Rename(args) => args.program.clone(),
         Commands::Summarize(args) => args.options.program.clone(),
         Commands::Pcode(args) => args.options.program.clone(),
+        Commands::DataFlow(args) => args.options.program.clone(),
         Commands::Transaction(cmd) => match cmd {
             cli::TransactionCommands::Begin { options, .. } => options.program.clone(),
             cli::TransactionCommands::Commit { options } => options.program.clone(),
@@ -417,6 +431,7 @@ fn extract_query_options(command: &Commands) -> Option<QueryOptions> {
         Commands::Summary(args) => Some(args.options.clone()),
         Commands::Summarize(args) => Some(args.options.clone()),
         Commands::Pcode(args) => Some(args.options.clone()),
+        Commands::DataFlow(args) => Some(args.options.clone()),
         Commands::Transaction(cmd) => match cmd {
             cli::TransactionCommands::Begin { options, .. } => Some(options.clone()),
             cli::TransactionCommands::Commit { options } => Some(options.clone()),
@@ -465,6 +480,7 @@ fn extract_query_options(command: &Commands) -> Option<QueryOptions> {
         Commands::Type(cmd) => match cmd {
             cli::TypeCommands::List(opts) => Some(opts.clone()),
             cli::TypeCommands::Get(args) => Some(args.options.clone()),
+            cli::TypeCommands::Recover(args) => Some(args.options.clone()),
             _ => None,
         },
         Commands::Comment(cmd) => match cmd {
@@ -485,6 +501,7 @@ fn extract_query_options(command: &Commands) -> Option<QueryOptions> {
             cli::FindCommands::Calls(args) => Some(args.options.clone()),
             cli::FindCommands::Crypto(opts) => Some(opts.clone()),
             cli::FindCommands::Interesting(opts) => Some(opts.clone()),
+            cli::FindCommands::Similar(args) => Some(args.options.clone()),
         },
         _ => None,
     }
@@ -762,7 +779,18 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
     // envelope transport for agents.
     let force_envelope = matches!(
         cli.command,
-        Commands::Summarize(_) | Commands::Pcode(_) | Commands::Transaction(_)
+        Commands::Summarize(_)
+            | Commands::Pcode(_)
+            | Commands::DataFlow(_)
+            | Commands::Transaction(_)
+    ) || matches!(
+        &cli.command,
+        Commands::Diff(cli::DiffCommands::Transfer(_))
+            | Commands::Diff(cli::DiffCommands::Explain(_))
+            | Commands::Type(cli::TypeCommands::Recover(_))
+            | Commands::Find(cli::FindCommands::Similar(_))
+            | Commands::Program(cli::ProgramCommands::Foreach(_))
+            | Commands::Program(cli::ProgramCommands::FirmwareSummarize(_))
     ) || cli.envelope;
 
     // Apply Rust-side query processing (filter, fields, sort) if QueryOptions are present.
@@ -823,9 +851,16 @@ fn cli_json_envelope(command: &Commands, data: serde_json::Value) -> serde_json:
     let cmd_name = match command {
         Commands::Summarize(_) => "summarize",
         Commands::Pcode(_) => "pcode",
+        Commands::DataFlow(_) => "data_flow",
         Commands::Transaction(_) => "transaction",
         Commands::Decompile(_) => "decompile",
         Commands::Patch(_) => "patch",
+        Commands::Diff(cli::DiffCommands::Transfer(_)) => "diff_transfer",
+        Commands::Diff(cli::DiffCommands::Explain(_)) => "diff_explain",
+        Commands::Type(cli::TypeCommands::Recover(_)) => "structure_recover",
+        Commands::Find(cli::FindCommands::Similar(_)) => "similarity",
+        Commands::Program(cli::ProgramCommands::Foreach(_)) => "programs_foreach",
+        Commands::Program(cli::ProgramCommands::FirmwareSummarize(_)) => "firmware_summarize",
         _ => "ghidra",
     };
     let now = chrono::Utc::now().to_rfc3339();
@@ -1145,6 +1180,42 @@ fn execute_via_bridge(
             }
             client.send_command("pcode", Some(payload))
         }
+        Commands::DataFlow(args) => {
+            let mut payload = json!({"target": args.target});
+            if let Some(ref f) = args.focus {
+                payload["focus"] = json!(f);
+            }
+            if let Some(l) = args.max_ops {
+                payload["limit"] = json!(l);
+            }
+            match client.send_command("data_flow", Some(payload.clone())) {
+                Ok(d) if d.get("error").is_none() => Ok(d),
+                _ => {
+                    let mut pcode_payload = json!({"target": args.target});
+                    if let Some(l) = args.max_ops {
+                        pcode_payload["limit"] = json!(l);
+                    }
+                    let pc = client.send_command("pcode", Some(pcode_payload))?;
+                    let ops = pc
+                        .get("ops")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut df =
+                        extras::assemble_data_flow_from_ops(&ops, args.focus.as_deref());
+                    if let Some(obj) = df.as_object_mut() {
+                        obj.insert(
+                            "function".into(),
+                            pc.get("function")
+                                .cloned()
+                                .unwrap_or(json!(args.target.clone())),
+                        );
+                        obj.insert("source".into(), json!("pcode_fallback"));
+                    }
+                    Ok(df)
+                }
+            }
+        }
         Commands::Transaction(cmd) => match cmd {
             cli::TransactionCommands::Begin { name, .. } => {
                 client.send_command("transaction_begin", Some(json!({"name": name})))
@@ -1176,6 +1247,90 @@ fn execute_via_bridge(
                         anyhow::anyhow!("Program name required. Use --program <name>")
                     })?;
                     client.open_program(program)
+                }
+                ProgramCommands::Foreach(args) => {
+                    let progs: Vec<String> = if args.programs.is_empty() {
+                        client
+                            .list_programs()?
+                            .get("programs")
+                            .and_then(|p| p.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| {
+                                        x.get("name")
+                                            .and_then(|n| n.as_str())
+                                            .map(|s| s.to_string())
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        args.programs.clone()
+                    };
+                    let mut results = Vec::new();
+                    for (i, prog) in progs.iter().enumerate() {
+                        let _ = client.open_program(prog);
+                        let data = match args.tool.as_str() {
+                            "summarize" | "triage" => {
+                                mcp::build_summarize_report(client, "all")?
+                            }
+                            "stats" => client.stats()?,
+                            "program_info" | "info" => client.program_info()?,
+                            other => {
+                                anyhow::bail!(
+                                    "programs foreach: unsupported tool '{}' (use summarize|stats|info)",
+                                    other
+                                )
+                            }
+                        };
+                        results.push(json!({
+                            "index": i,
+                            "program": prog,
+                            "status": "success",
+                            "data": data
+                        }));
+                    }
+                    Ok(json!({
+                        "results": results,
+                        "count": progs.len(),
+                        "tool": args.tool
+                    }))
+                }
+                ProgramCommands::FirmwareSummarize(args) => {
+                    let progs: Vec<String> = if args.programs.is_empty() {
+                        client
+                            .list_programs()?
+                            .get("programs")
+                            .and_then(|p| p.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| {
+                                        x.get("name")
+                                            .and_then(|n| n.as_str())
+                                            .map(|s| s.to_string())
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        args.programs.clone()
+                    };
+                    let mut results = Vec::new();
+                    for (i, prog) in progs.iter().enumerate() {
+                        let _ = client.open_program(prog);
+                        let data = mcp::build_summarize_report(client, &args.focus)?;
+                        results.push(json!({
+                            "index": i,
+                            "program": prog,
+                            "status": "success",
+                            "data": data
+                        }));
+                    }
+                    Ok(json!({
+                        "results": results,
+                        "count": progs.len(),
+                        "focus": args.focus
+                    }))
                 }
                 ProgramCommands::Close(_) => client.program_close(),
                 ProgramCommands::Delete(args) => {
@@ -1269,6 +1424,19 @@ fn execute_via_bridge(
                         "field_name": args.name,
                     })),
                 ),
+                TypeCommands::Recover(args) => {
+                    let raw = client.send_command(
+                        "structure_recover",
+                        Some(json!({
+                            "address": args.address,
+                            "max_fields": args.max_fields
+                        })),
+                    )?;
+                    Ok(extras::structure_recover_envelope_data(
+                        &args.address,
+                        raw,
+                    ))
+                }
             }
         }
         Commands::Comment(cmd) => {
@@ -1314,6 +1482,66 @@ fn execute_via_bridge(
                 FindCommands::Calls(args) => client.find_calls(args.resolved_target()),
                 FindCommands::Crypto(_) => client.find_crypto(),
                 FindCommands::Interesting(_) => client.find_interesting(),
+                FindCommands::Similar(args) => {
+                    let mut findings = Vec::new();
+                    if args.mode == "all" || args.mode == "strings" {
+                        if let Ok(slist) = client.list_strings(Some(80), None) {
+                            let strings: Vec<String> = slist
+                                .get("strings")
+                                .and_then(|v| v.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|s| {
+                                            s.get("value")
+                                                .or(s.get("string"))
+                                                .or(s.get("text"))
+                                                .and_then(|v| v.as_str())
+                                                .map(|x| x.to_string())
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            findings.extend(extras::similar_string_pairs(
+                                &strings,
+                                args.threshold,
+                                args.limit,
+                            ));
+                        }
+                    }
+                    if args.mode == "all" || args.mode == "crypto" {
+                        let mut candidates = Vec::new();
+                        if let Ok(crypto) = client.find_crypto() {
+                            if let Some(arr) = crypto
+                                .get("matches")
+                                .or(crypto.get("results"))
+                                .and_then(|v| v.as_array())
+                            {
+                                for m in arr {
+                                    if let Some(s) = m
+                                        .get("name")
+                                        .or(m.get("const"))
+                                        .or(m.get("value"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        candidates.push(s.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        findings.extend(extras::crypto_similarity_hits(
+                            &candidates,
+                            extras::DEFAULT_CRYPTO_TOKENS,
+                            args.threshold * 0.8,
+                        ));
+                    }
+                    findings.truncate(args.limit);
+                    Ok(json!({
+                        "mode": args.mode,
+                        "threshold": args.threshold,
+                        "findings": findings,
+                        "count": findings.len()
+                    }))
+                }
             }
         }
         Commands::Diff(cmd) => {
@@ -1323,6 +1551,22 @@ fn execute_via_bridge(
                     client.diff_programs(&args.program1, &args.program2)
                 }
                 DiffCommands::Functions(args) => client.diff_functions(&args.func1, &args.func2),
+                DiffCommands::Transfer(args) => {
+                    let mut payload = json!({
+                        "program1": args.program1,
+                        "program2": args.program2,
+                        "labels": args.labels,
+                        "comments": args.comments
+                    });
+                    if let Some(l) = args.limit {
+                        payload["limit"] = json!(l);
+                    }
+                    client.send_command("transfer_analysis", Some(payload))
+                }
+                DiffCommands::Explain(args) => {
+                    let report = client.diff_programs(&args.program1, &args.program2)?;
+                    Ok(extras::explain_diff_match(&report))
+                }
             }
         }
         Commands::Patch(cmd) => {

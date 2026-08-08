@@ -234,6 +234,51 @@ Optional args: `max_xrefs` (default 50), `caller_depth` (default 2).
 - PLAN-mcp-server.md — historical slice plan
 - skills/triage-decomp-patch-export.md — example workflow skill
 
+
+
+## HTTP long-job progress (SSE)
+
+Request streamable progress with either:
+
+- query: `POST /mcp?stream=1`
+- header: `Accept: text/event-stream`
+
+The response is `text/event-stream` with:
+
+1. One or more `event: progress` frames (`percent`, `message`, `kind: mcp_progress`)
+2. A final `event: result` frame carrying the **same JSON-RPC body** as non-stream mode (stable tool envelope inside `content[].text`)
+
+Non-stream `POST /mcp` is unchanged (single JSON response).
+
+## Match / transfer / explain
+
+| Tool | Purpose |
+|------|---------|
+| `diff_programs` | Headless function name-set match + dual provenance |
+| `diff_transfer` | Copy labels/EOL comments for matched names (mutation on program2) |
+| `diff_explain` | Agent-readable bullets, match ratio, samples, dual provenance |
+| `diff_functions` | Decompile-level line delta for two functions |
+
+CLI: `ghidra diff programs|transfer|explain|functions …`
+
+## Deeper primitives
+
+| Tool / CLI | Purpose |
+|------------|---------|
+| `data_flow` / `ghidra data-flow` | Defs/uses over p-code; optional `--focus` varnode |
+| `structure_recover` / `ghidra type recover` | Field guesses + confidence at an address |
+| `similarity` / `ghidra find similar` | String/crypto similarity with confidence tags |
+
+## Multi-program / firmware convenience
+
+Sequential single-lane open/switch (no concurrent mutators):
+
+- MCP `programs_foreach` — run a tool over a list of programs
+- MCP `firmware_summarize` — summarize each program
+- CLI `ghidra program foreach --tool summarize --program A --program B`
+- CLI `ghidra program firmware-summarize [--program …] [--focus …]`
+
+
 ## License
 
 Same as ghidra-cli (GPL-3.0). See LICENSE.

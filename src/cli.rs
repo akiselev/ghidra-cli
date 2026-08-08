@@ -147,6 +147,10 @@ pub enum Commands {
     /// List p-code ops for a function or address
     Pcode(PcodeArgs),
 
+    /// Basic data-flow (defs/uses) over p-code
+    #[command(name = "data-flow", alias = "data_flow")]
+    DataFlow(DataFlowArgs),
+
     /// Explicit mutation transaction / undo boundary
     #[command(subcommand)]
     Transaction(TransactionCommands),
@@ -337,6 +341,37 @@ pub enum ProgramCommands {
     Info(ProgramTargetArgs),
     /// Export program
     Export(ExportArgs),
+    /// Run a focused analysis over multiple programs sequentially (single lane)
+    Foreach(ProgramsForeachArgs),
+    /// Summarize all (or listed) programs in the project one-by-one
+    #[command(alias = "firmware")]
+    FirmwareSummarize(FirmwareSummarizeArgs),
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct ProgramsForeachArgs {
+    /// Program names to include (repeatable). Empty = all programs in the project.
+    /// Named --include to avoid clashing with the global --program flag.
+    #[arg(long = "include")]
+    pub programs: Vec<String>,
+    /// Tool/command name to run per program (e.g. summarize, stats)
+    #[arg(long)]
+    pub tool: String,
+    /// Project name
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct FirmwareSummarizeArgs {
+    /// Program names to include (repeatable). Empty = all programs.
+    /// Named --include to avoid clashing with the global --program flag.
+    #[arg(long = "include")]
+    pub programs: Vec<String>,
+    #[arg(long, default_value = "all")]
+    pub focus: String,
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -712,6 +747,18 @@ pub enum TypeCommands {
     AddField(TypeAddFieldArgs),
     /// Remove a field from a struct type
     DelField(TypeDelFieldArgs),
+    /// Structure-recovery assist at an address (field guesses + confidence)
+    Recover(TypeRecoverArgs),
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct TypeRecoverArgs {
+    /// Address of the data / structure start
+    pub address: String,
+    #[arg(long, default_value_t = 16)]
+    pub max_fields: usize,
+    #[command(flatten)]
+    pub options: QueryOptions,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -875,6 +922,23 @@ pub enum FindCommands {
     /// Find interesting functions
     #[command(alias = "suspicious", alias = "notable")]
     Interesting(QueryOptions),
+    /// String/crypto similarity findings with confidence tags
+    #[command(alias = "sim")]
+    Similar(FindSimilarArgs),
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct FindSimilarArgs {
+    /// strings | crypto | all
+    #[arg(long, default_value = "all")]
+    pub mode: String,
+    /// Similarity threshold 0..1
+    #[arg(long, default_value_t = 0.72)]
+    pub threshold: f64,
+    #[arg(long, default_value_t = 25)]
+    pub limit: usize,
+    #[command(flatten)]
+    pub options: QueryOptions,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -1018,10 +1082,14 @@ impl DisasmArgs {
 
 #[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
 pub enum DiffCommands {
-    /// Compare two programs
+    /// Compare two programs (function name-set match)
     Programs(DiffProgramsArgs),
-    /// Compare functions
+    /// Compare functions (decompile-level)
     Functions(DiffFunctionsArgs),
+    /// Transfer labels/comments from program1 to program2 for matched names
+    Transfer(DiffTransferArgs),
+    /// Explain dual-program delta in agent-readable form
+    Explain(DiffExplainArgs),
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -1042,6 +1110,31 @@ pub struct DiffFunctionsArgs {
     pub func2: String,
     #[arg(long)]
     pub format: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct DiffTransferArgs {
+    pub program1: String,
+    pub program2: String,
+    /// Transfer primary labels (default true)
+    #[arg(long, default_value_t = true)]
+    pub labels: bool,
+    /// Transfer EOL comments at function entries (default true)
+    #[arg(long, default_value_t = true)]
+    pub comments: bool,
+    /// Max matched functions to transfer
+    #[arg(long)]
+    pub limit: Option<usize>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct DiffExplainArgs {
+    pub program1: String,
+    pub program2: String,
     #[arg(long)]
     pub project: Option<String>,
 }
@@ -1188,6 +1281,19 @@ pub struct PcodeArgs {
     /// Function name or address
     pub target: String,
     /// Max p-code ops to return (avoids clash with QueryOptions --limit)
+    #[arg(long = "max-ops")]
+    pub max_ops: Option<usize>,
+    #[command(flatten)]
+    pub options: QueryOptions,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct DataFlowArgs {
+    /// Function name or address
+    pub target: String,
+    /// Optional varnode / register substring to focus
+    #[arg(long)]
+    pub focus: Option<String>,
     #[arg(long = "max-ops")]
     pub max_ops: Option<usize>,
     #[command(flatten)]

@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ghidra transaction begin|commit|abort` and matching MCP tools.
 - Global `--envelope` wraps JSON output in the stable provenance envelope
   (always on for summarize/pcode/transaction JSON).
+- HTTP MCP long-job progress: SSE frames via `POST /mcp?stream=1` or `Accept: text/event-stream` (progress + final JSON-RPC envelope).
+- Headless analysis transfer/explain: `diff transfer`, `diff explain` (CLI) and MCP `diff_transfer` / `diff_explain`.
+- Deeper helpers: `data-flow`, `type recover`, `find similar` (CLI + MCP) with confidence tags.
+- Multi-program convenience: `program foreach`, `program firmware-summarize` / MCP `programs_foreach`, `firmware_summarize` (sequential single lane).
 - Official `Dockerfile`, in-repo Homebrew formula (`Formula/ghidra-cli.rb`),
   and agent skill `skills/triage-decomp-patch-export.md`.
 - `ghidra doctor` prints recovery suggestions for common install/path failures

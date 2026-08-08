@@ -35,9 +35,14 @@ Full catalog: `docs/MCP.md`. Example workflow: `skills/triage-decomp-patch-expor
 
 ```bash
 ghidra summarize --focus crypto            # triage report with confidence tags
-ghidra pcode main                          # p-code listing
+ghidra pcode main --max-ops 50             # p-code listing
+ghidra data-flow main --focus r0           # defs/uses over p-code
+ghidra type recover 0x401000               # structure field guesses + confidence
+ghidra find similar --mode all             # string/crypto similarity
+ghidra diff explain build_a build_b        # readable dual-program delta
+ghidra diff transfer build_a build_b       # copy labels/comments for matches
+ghidra program firmware-summarize          # summarize each program (single lane)
 ghidra transaction begin --name edit
-ghidra rename-function ...                 # or MCP rename_function
 ghidra transaction commit
 ghidra --envelope --json function list     # stamp provenance on legacy JSON
 ```

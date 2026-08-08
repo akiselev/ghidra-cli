@@ -1,52 +1,44 @@
 # Remaining Work for Full Active Goal (Items 1–7)
 
-Status update (2026-08-08): Item 1 MCP base (1.1–1.7) complete. Items 2–7 shipped as focused first versions below.
+Status update (2026-08-08): MCP base complete; deferred extras (HTTP SSE progress,
+headless transfer/explain, deeper primitives, multi-program convenience) shipped.
 
 ## Item 1: Native MCP — **complete**
 
-See `REMAINING-TODOS-mcp.md`.
+See `REMAINING-TODOS-mcp.md`. HTTP long-job SSE progress via `?stream=1` / `Accept: text/event-stream`.
 
-## Item 2: LLM-optimized tool design — **shipped (base)**
+## Item 2: LLM-optimized tool design — **shipped**
 
-- Decompile extra context guaranteed fields + max_xrefs/caller_depth params
-- next_steps / recovery_suggestions on MCP paths
-- Compact tool schemas via shared `tool_definitions()`
-- CLI `--envelope` for provenance on demand; summarize/pcode/transaction always envelope on JSON
+- Decompile extra context, next_steps/recovery, compact schemas, `--envelope`
 
-## Item 3: Binary diffing / Version Tracker — **minimal surface**
+## Item 3: Binary diffing / Version Tracker — **headless shipped**
 
-- MCP + existing CLI: `diff_programs`, `diff_functions` with envelopes
-- Full interactive VT session not in scope; headless match/delta is the shipped path
-- Documented in docs/MCP.md and skills workflow
+- `diff_programs` name-set match + dual provenance
+- `diff_transfer` labels/comments for matched names
+- `diff_explain` agent-readable delta
+- `diff_functions` decompile-level
+- Full interactive GUI VT: out of band (optional later)
 
 ## Item 4: High-level analysis helpers — **shipped**
 
-- CLI: `ghidra summarize` / `triage --focus ...`
-- MCP: `summarize` tool with confidence-tagged findings
-- Assembled from existing find_crypto / imports / stats / strings
+- `summarize` / `triage` + `similarity` / `find similar` with confidence tags
 
-## Item 5: Deeper primitives — **shipped (base)**
+## Item 5: Deeper primitives — **shipped**
 
-- `pcode` (CLI + MCP + Java bridge handler)
-- Explicit `transaction begin|commit|abort` (CLI + MCP + bridge)
-- Structure recovery remains Ghidra analyzer / type tools (`type_create`, `type_apply`, fields)
+- `pcode`, `data_flow` / `data-flow`, `structure_recover` / `type recover`
+- Explicit transactions
 
 ## Item 6: Packaging — **in-repo**
 
-- `Dockerfile` (build + run docs)
-- `Formula/ghidra-cli.rb` Homebrew formula (in-repo)
-- `ghidra doctor` recovery suggestions for common install failures
+- Dockerfile, Homebrew formula, doctor recovery suggestions
 
 ## Item 7: Agent extras — **shipped**
 
-- `skills/triage-decomp-patch-export.md`
-- MCP provenance envelopes everywhere; CLI `--envelope` + auto for new commands
-- Multi-program/firmware convenience deferred (optional; not required)
+- Skill workflow, envelopes, multi-program `programs_foreach` / `firmware_summarize`
 
-## Optional later
+## Truly optional / out-of-band (not blocking)
 
-- Publish Docker image to registry
+- Publish Docker image to a registry
 - Submit Homebrew formula upstream
-- Full Ghidra Version Tracking session transfer UX
-- Structure recovery “guess from accesses” helper
-- Multi-program firmware convenience commands
+- Full interactive Ghidra Version Tracking GUI session
+- SSE continuous push for multi-minute jobs (current path: progress frames + final result)

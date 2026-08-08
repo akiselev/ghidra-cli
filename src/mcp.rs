@@ -5,6 +5,11 @@
 //! optional artifacts[].
 
 use crate::config::Config;
+use crate::extras::{
+    assemble_data_flow_from_ops, build_streamed_tool_response, crypto_similarity_hits,
+    explain_diff_match, similar_string_pairs, structure_recover_envelope_data, wants_sse_stream,
+    DEFAULT_CRYPTO_TOKENS,
+};
 use crate::ghidra::bridge;
 use crate::ipc::client::BridgeClient;
 use serde_json::{json, Map, Value};
@@ -201,8 +206,15 @@ pub fn tool_definitions() -> Value {
         // Diff / triage / deeper primitives (items 3–5)
         tool("diff_programs", "Diff two programs in the project (match/delta report).", json!({"program1": {"type": "string"}, "program2": {"type": "string"}})),
         tool("diff_functions", "Diff two functions.", json!({"func1": {"type": "string"}, "func2": {"type": "string"}})),
+        tool("diff_transfer", "Transfer labels and/or comments from program1 to program2 for matched function names (mutation).", json!({"program1": {"type": "string"}, "program2": {"type": "string"}, "labels": {"type": "boolean"}, "comments": {"type": "boolean"}, "limit": {"type": "integer"}})),
+        tool("diff_explain", "Human/agent-readable delta explanation from a dual-program match (program1+program2 or inline report).", json!({"program1": {"type": "string"}, "program2": {"type": "string"}})),
         tool("summarize", "One-shot triage/summarize report with confidence-tagged findings.", json!({"focus": {"type": "string", "description": "optional: crypto,strings,entry,imports,all"}})),
-        tool("pcode", "List p-code for a function or address.", json!({"target": {"type": "string"}, "limit": {"type": "integer"}})),
+        tool("pcode", "List p-code ops for a function or address.", json!({"target": {"type": "string"}, "limit": {"type": "integer"}})),
+        tool("data_flow", "Basic data-flow (defs/uses) over p-code for a function; optional focus varnode.", json!({"target": {"type": "string"}, "focus": {"type": "string"}, "limit": {"type": "integer"}})),
+        tool("structure_recover", "Structure-recovery assist at an address (field guesses + confidence).", json!({"address": {"type": "string"}, "max_fields": {"type": "integer"}})),
+        tool("similarity", "String/crypto similarity findings with confidence tags.", json!({"mode": {"type": "string", "description": "strings|crypto|all"}, "threshold": {"type": "number"}, "limit": {"type": "integer"}})),
+        tool("programs_foreach", "Run a tool over multiple programs in the project sequentially (single program lane).", json!({"programs": {"type": "array", "items": {"type": "string"}}, "tool": {"type": "string"}, "arguments": {"type": "object"}})),
+        tool("firmware_summarize", "Summarize all (or listed) programs in the project one-by-one.", json!({"programs": {"type": "array", "items": {"type": "string"}}, "focus": {"type": "string"}})),
         tool("transaction_begin", "Begin an explicit mutation transaction (undo boundary).", json!({"name": {"type": "string"}})),
         tool("transaction_commit", "Commit the open mutation transaction.", json!({})),
         tool("transaction_abort", "Abort/rollback the open mutation transaction.", json!({})),
@@ -1046,6 +1058,104 @@ fn dispatch_tool(
             )
         }
 
+        "diff_transfer" => {
+            let p1 = args.get("program1").and_then(|v| v.as_str()).unwrap_or("");
+            let p2 = args.get("program2").and_then(|v| v.as_str()).unwrap_or("");
+            if p1.is_empty() || p2.is_empty() {
+                return tool_error(
+                    id,
+                    "diff_transfer",
+                    "program1 and program2 required",
+                    recovery_for("diff_transfer", "missing fields"),
+                );
+            }
+            let labels = args.get("labels").and_then(|v| v.as_bool()).unwrap_or(true);
+            let comments = args.get("comments").and_then(|v| v.as_bool()).unwrap_or(true);
+            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let a = p1.to_string();
+            let b = p2.to_string();
+            bridge_tool(
+                id,
+                "diff_transfer",
+                cached_client,
+                default_project,
+                default_program,
+                projects_dir,
+                true,
+                move |client| {
+                    let mut payload = json!({
+                        "program1": a,
+                        "program2": b,
+                        "labels": labels,
+                        "comments": comments
+                    });
+                    if let Some(l) = limit {
+                        payload["limit"] = json!(l);
+                    }
+                    client.send_command("transfer_analysis", Some(payload))
+                },
+                None,
+            )
+        }
+
+        "diff_explain" => {
+            let p1 = args.get("program1").and_then(|v| v.as_str()).unwrap_or("");
+            let p2 = args.get("program2").and_then(|v| v.as_str()).unwrap_or("");
+            if p1.is_empty() || p2.is_empty() {
+                return tool_error(
+                    id,
+                    "diff_explain",
+                    "program1 and program2 required",
+                    recovery_for("diff_explain", "missing fields"),
+                );
+            }
+            let a = p1.to_string();
+            let b = p2.to_string();
+            match get_bridge_client(
+                cached_client,
+                default_project.clone(),
+                default_program.clone(),
+                projects_dir.clone(),
+            ) {
+                Ok((client, proj_name)) => match client.diff_programs(&a, &b) {
+                    Ok(report) => {
+                        if let Some(err) = report.get("error").and_then(|e| e.as_str()) {
+                            return tool_error(
+                                id,
+                                "diff_explain",
+                                err,
+                                recovery_for("diff_explain", err),
+                            );
+                        }
+                        let explained = explain_diff_match(&report);
+                        wrap_envelope_as_content(
+                            make_envelope(
+                                "diff_explain",
+                                explained,
+                                Some(&proj_name),
+                                default_program.as_deref(),
+                                compute_next_steps("diff_explain", None),
+                                None,
+                            ),
+                            id,
+                        )
+                    }
+                    Err(e) => tool_error(
+                        id,
+                        "diff_explain",
+                        &e.to_string(),
+                        recovery_for("diff_explain", &e.to_string()),
+                    ),
+                },
+                Err(e) => tool_error(
+                    id,
+                    "diff_explain",
+                    &format!("No bridge: {}", e),
+                    recovery_for("diff_explain", &e.to_string()),
+                ),
+            }
+        }
+
         "summarize" => {
             let focus = args
                 .get("focus")
@@ -1098,6 +1208,404 @@ fn dispatch_tool(
                     client.send_command("pcode", Some(payload))
                 },
                 Some(target),
+            )
+        }
+
+        "data_flow" => {
+            let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            if target.is_empty() {
+                return tool_error(
+                    id,
+                    "data_flow",
+                    "target required",
+                    recovery_for("data_flow", "target required"),
+                );
+            }
+            let focus = args
+                .get("focus")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let t = target.to_string();
+            match get_bridge_client(
+                cached_client,
+                default_project.clone(),
+                default_program.clone(),
+                projects_dir.clone(),
+            ) {
+                Ok((client, proj_name)) => {
+                    // Prefer bridge data_flow; fall back to pcode + pure assembly.
+                    let mut payload = json!({"target": t.clone()});
+                    if let Some(ref f) = focus {
+                        payload["focus"] = json!(f);
+                    }
+                    if let Some(l) = limit {
+                        payload["limit"] = json!(l);
+                    }
+                    let data = match client.send_command("data_flow", Some(payload.clone())) {
+                        Ok(d) if d.get("error").is_none() => d,
+                        _ => {
+                            let mut pcode_payload = json!({"target": t});
+                            if let Some(l) = limit {
+                                pcode_payload["limit"] = json!(l);
+                            }
+                            match client.send_command("pcode", Some(pcode_payload)) {
+                                Ok(pc) => {
+                                    let ops = pc
+                                        .get("ops")
+                                        .and_then(|v| v.as_array())
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    let mut df = assemble_data_flow_from_ops(
+                                        &ops,
+                                        focus.as_deref(),
+                                    );
+                                    if let Some(obj) = df.as_object_mut() {
+                                        obj.insert("function".into(), pc.get("function").cloned().unwrap_or(json!(target)));
+                                        obj.insert("source".into(), json!("pcode_fallback"));
+                                    }
+                                    df
+                                }
+                                Err(e) => {
+                                    return tool_error(
+                                        id,
+                                        "data_flow",
+                                        &e.to_string(),
+                                        recovery_for("data_flow", &e.to_string()),
+                                    );
+                                }
+                            }
+                        }
+                    };
+                    if let Some(err) = data.get("error").and_then(|e| e.as_str()) {
+                        return tool_error(
+                            id,
+                            "data_flow",
+                            err,
+                            recovery_for("data_flow", err),
+                        );
+                    }
+                    wrap_envelope_as_content(
+                        make_envelope(
+                            "data_flow",
+                            data,
+                            Some(&proj_name),
+                            default_program.as_deref(),
+                            compute_next_steps("data_flow", Some(target)),
+                            None,
+                        ),
+                        id,
+                    )
+                }
+                Err(e) => tool_error(
+                    id,
+                    "data_flow",
+                    &format!("No bridge: {}", e),
+                    recovery_for("data_flow", &e.to_string()),
+                ),
+            }
+        }
+
+        "structure_recover" => {
+            let address = args.get("address").and_then(|v| v.as_str()).unwrap_or("");
+            if address.is_empty() {
+                return tool_error(
+                    id,
+                    "structure_recover",
+                    "address required",
+                    recovery_for("structure_recover", "address required"),
+                );
+            }
+            let max_fields = args
+                .get("max_fields")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(16);
+            let a = address.to_string();
+            match get_bridge_client(
+                cached_client,
+                default_project.clone(),
+                default_program.clone(),
+                projects_dir.clone(),
+            ) {
+                Ok((client, proj_name)) => {
+                    match client.send_command(
+                        "structure_recover",
+                        Some(json!({"address": a, "max_fields": max_fields})),
+                    ) {
+                        Ok(raw) => {
+                            if let Some(err) = raw.get("error").and_then(|e| e.as_str()) {
+                                return tool_error(
+                                    id,
+                                    "structure_recover",
+                                    err,
+                                    recovery_for("structure_recover", err),
+                                );
+                            }
+                            let data = structure_recover_envelope_data(address, raw);
+                            wrap_envelope_as_content(
+                                make_envelope(
+                                    "structure_recover",
+                                    data,
+                                    Some(&proj_name),
+                                    default_program.as_deref(),
+                                    compute_next_steps("structure_recover", Some(address)),
+                                    None,
+                                ),
+                                id,
+                            )
+                        }
+                        Err(e) => tool_error(
+                            id,
+                            "structure_recover",
+                            &e.to_string(),
+                            recovery_for("structure_recover", &e.to_string()),
+                        ),
+                    }
+                }
+                Err(e) => tool_error(
+                    id,
+                    "structure_recover",
+                    &format!("No bridge: {}", e),
+                    recovery_for("structure_recover", &e.to_string()),
+                ),
+            }
+        }
+
+        "similarity" => {
+            let mode = args
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("all")
+                .to_lowercase();
+            let threshold = args
+                .get("threshold")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.72);
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(25) as usize;
+            match get_bridge_client(
+                cached_client,
+                default_project.clone(),
+                default_program.clone(),
+                projects_dir.clone(),
+            ) {
+                Ok((client, proj_name)) => {
+                    let mut findings = Vec::new();
+                    if mode == "all" || mode == "strings" {
+                        if let Ok(slist) = client.list_strings(Some(80), None) {
+                            let strings: Vec<String> = slist
+                                .get("strings")
+                                .and_then(|v| v.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|s| {
+                                            s.get("value")
+                                                .or(s.get("string"))
+                                                .or(s.get("text"))
+                                                .and_then(|v| v.as_str())
+                                                .map(|x| x.to_string())
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            findings.extend(similar_string_pairs(&strings, threshold, limit));
+                        }
+                    }
+                    if mode == "all" || mode == "crypto" {
+                        let mut candidates = Vec::new();
+                        if let Ok(crypto) = client.find_crypto() {
+                            if let Some(arr) = crypto
+                                .get("matches")
+                                .or(crypto.get("results"))
+                                .and_then(|v| v.as_array())
+                            {
+                                for m in arr {
+                                    if let Some(s) = m
+                                        .get("name")
+                                        .or(m.get("const"))
+                                        .or(m.get("value"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        candidates.push(s.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        if let Ok(slist) = client.list_strings(Some(40), None) {
+                            if let Some(arr) = slist.get("strings").and_then(|v| v.as_array()) {
+                                for s in arr {
+                                    if let Some(v) = s
+                                        .get("value")
+                                        .or(s.get("string"))
+                                        .and_then(|x| x.as_str())
+                                    {
+                                        candidates.push(v.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        findings.extend(crypto_similarity_hits(
+                            &candidates,
+                            DEFAULT_CRYPTO_TOKENS,
+                            threshold * 0.8,
+                        ));
+                    }
+                    findings.truncate(limit);
+                    let data = json!({
+                        "mode": mode,
+                        "threshold": threshold,
+                        "findings": findings,
+                        "count": findings.len()
+                    });
+                    wrap_envelope_as_content(
+                        make_envelope(
+                            "similarity",
+                            data,
+                            Some(&proj_name),
+                            default_program.as_deref(),
+                            compute_next_steps("similarity", None),
+                            None,
+                        ),
+                        id,
+                    )
+                }
+                Err(e) => tool_error(
+                    id,
+                    "similarity",
+                    &format!("No bridge: {}", e),
+                    recovery_for("similarity", &e.to_string()),
+                ),
+            }
+        }
+
+        "programs_foreach" => {
+            let programs: Vec<String> = args
+                .get("programs")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let tool_name = args.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+            if tool_name.is_empty() {
+                return tool_error(
+                    id,
+                    "programs_foreach",
+                    "tool required",
+                    recovery_for("programs_foreach", "tool required"),
+                );
+            }
+            if tool_name == "programs_foreach" || tool_name == "batch" || tool_name == "firmware_summarize" {
+                return tool_error(
+                    id,
+                    "programs_foreach",
+                    "nested multi-program tools are not supported",
+                    recovery_for("programs_foreach", "nested"),
+                );
+            }
+            let tool_args = args.get("arguments").cloned().unwrap_or(json!({}));
+            let prog_list = if programs.is_empty() {
+                // list from bridge or local
+                match get_bridge_client(
+                    cached_client,
+                    default_project.clone(),
+                    default_program.clone(),
+                    projects_dir.clone(),
+                ) {
+                    Ok((client, _)) => client
+                        .list_programs()
+                        .ok()
+                        .and_then(|v| {
+                            v.get("programs")
+                                .and_then(|p| p.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|x| {
+                                            x.get("name")
+                                                .and_then(|n| n.as_str())
+                                                .map(|s| s.to_string())
+                                        })
+                                        .collect()
+                                })
+                        })
+                        .unwrap_or_default(),
+                    Err(_) => vec![],
+                }
+            } else {
+                programs
+            };
+            if prog_list.is_empty() {
+                return tool_error(
+                    id,
+                    "programs_foreach",
+                    "no programs to process",
+                    recovery_for("programs_foreach", "no programs"),
+                );
+            }
+            let mut results = Vec::new();
+            for (i, prog) in prog_list.iter().enumerate() {
+                // Sequential single-lane: open program then dispatch tool.
+                if let Ok((client, _)) = get_bridge_client(
+                    cached_client,
+                    default_project.clone(),
+                    Some(prog.clone()),
+                    projects_dir.clone(),
+                ) {
+                    let _ = client.open_program(prog);
+                }
+                let resp = dispatch_tool(
+                    tool_name,
+                    &tool_args,
+                    Some(json!(i)),
+                    cached_client,
+                    default_project.clone(),
+                    Some(prog.clone()),
+                    projects_dir.clone(),
+                );
+                let env = extract_envelope_from_rpc(&resp);
+                results.push(json!({
+                    "index": i,
+                    "program": prog,
+                    "status": env.get("status").cloned().unwrap_or(json!("error")),
+                    "envelope": env
+                }));
+            }
+            wrap_envelope_as_content(
+                make_envelope(
+                    "programs_foreach",
+                    json!({"results": results, "count": prog_list.len(), "tool": tool_name}),
+                    default_project.as_deref(),
+                    None,
+                    compute_next_steps("programs_foreach", None),
+                    None,
+                ),
+                id,
+            )
+        }
+
+        "firmware_summarize" => {
+            let focus = args
+                .get("focus")
+                .and_then(|v| v.as_str())
+                .unwrap_or("all")
+                .to_string();
+            let mut args2 = args.clone();
+            if let Some(obj) = args2.as_object_mut() {
+                obj.insert("tool".into(), json!("summarize"));
+                obj.insert("arguments".into(), json!({"focus": focus}));
+            }
+            dispatch_tool(
+                "programs_foreach",
+                &args2,
+                id,
+                cached_client,
+                default_project,
+                default_program,
+                projects_dir,
             )
         }
 
@@ -1491,8 +1999,15 @@ fn build_server_capabilities(
             "mutations": true,
             "decompile_extra_context": true,
             "diff": true,
+            "diff_transfer": true,
+            "diff_explain": true,
             "summarize": true,
             "pcode": true,
+            "data_flow": true,
+            "structure_recover": true,
+            "similarity": true,
+            "programs_foreach": true,
+            "http_sse_progress": true,
             "transactions": true
         },
         "bridge_connected": false,
@@ -1786,13 +2301,37 @@ fn compute_next_steps(command: &str, target: Option<&str>) -> Vec<String> {
         "program_info" => vec!["function_list or strings_list".into()],
         "stats" => vec!["program_info for context".into()],
         "diff_programs" | "diff_functions" => {
-            vec!["review delta; transfer labels via rename/comment tools if needed".into()]
+            vec![
+                "diff_explain for a readable delta".into(),
+                "diff_transfer to copy labels/comments for matched names".into(),
+            ]
         }
+        "diff_transfer" => vec![
+            "re-open program2 in a fresh process and verify labels/comments".into(),
+            "diff_explain to summarize remaining delta".into(),
+        ],
+        "diff_explain" => vec![
+            "diff_transfer for matched names".into(),
+            "diff_functions on interesting pairs".into(),
+        ],
         "summarize" => vec![
             "decompile high-confidence findings".into(),
             "xrefs_to on interesting addresses".into(),
         ],
-        "pcode" => vec!["decompile for C view; use data-flow notes in pcode ops".into()],
+        "pcode" => vec!["data_flow on a varnode; decompile for C view".into()],
+        "data_flow" => vec!["decompile; structure_recover near pointer defs".into()],
+        "structure_recover" => vec![
+            "type_create from suggested fields".into(),
+            "type_apply at the address after review".into(),
+        ],
+        "similarity" => vec![
+            "xrefs_to on high-confidence string hits".into(),
+            "find_crypto for related constants".into(),
+        ],
+        "programs_foreach" | "firmware_summarize" => vec![
+            "decompile high-confidence findings per program".into(),
+            "diff_programs between related builds".into(),
+        ],
         "transaction_begin" => vec!["run mutations, then transaction_commit or transaction_abort".into()],
         "transaction_commit" | "transaction_abort" => {
             vec!["verify state with decompile/list tools".into()]
@@ -1878,7 +2417,16 @@ fn handle_http_connection(
         }
     }
 
-    match (method, path) {
+    let accept = headers
+        .get("accept")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let stream_mode = wants_sse_stream(path, accept.as_deref());
+
+    // Strip query string for route matching.
+    let path_only = path.split('?').next().unwrap_or(path);
+
+    match (method, path_only) {
         ("GET", "/health") | ("GET", "/healthz") => {
             write_http_response(&mut stream, 200, "application/json", br#"{"status":"ok"}"#)?;
         }
@@ -1901,20 +2449,81 @@ fn handle_http_connection(
                         "id": null,
                         "error": {"code": -32700, "message": format!("Parse error: {}", e)}
                     });
-                    let bytes = serde_json::to_vec(&err)?;
-                    write_http_response(&mut stream, 200, "application/json", &bytes)?;
+                    if stream_mode {
+                        let sse = build_streamed_tool_response(
+                            &err,
+                            &[(100, "parse_error")],
+                        );
+                        write_sse_response(&mut stream, &sse)?;
+                    } else {
+                        let bytes = serde_json::to_vec(&err)?;
+                        write_http_response(&mut stream, 200, "application/json", &bytes)?;
+                    }
                     return Ok(());
                 }
             };
-            let resp = handle_request(
-                &req,
-                cached_client,
-                default_project,
-                default_program,
-                projects_dir,
-            );
-            let bytes = serde_json::to_vec(&resp)?;
-            write_http_response(&mut stream, 200, "application/json", &bytes)?;
+
+            // Long-job path: emit progress frames (and optional job_status poll),
+            // then the same JSON-RPC result envelope as non-stream mode.
+            if stream_mode {
+                let method_name = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                let tool_name = req
+                    .pointer("/params/name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                let mut steps: Vec<(u8, String)> = vec![
+                    (5, "accepted".into()),
+                    (15, format!("dispatch:{}", method_name)),
+                ];
+                if method_name == "tools/call" {
+                    steps.push((25, format!("tool:{}", tool_name)));
+                }
+                // Best-effort job queue snapshot for multi-second work.
+                if let Ok((client, _)) = get_bridge_client(
+                    cached_client,
+                    default_project.clone(),
+                    default_program.clone(),
+                    projects_dir.clone(),
+                ) {
+                    if let Ok(st) = client.job_status(None) {
+                        let msg = st
+                            .get("active_job")
+                            .and_then(|j| j.get("progress_message").or(j.get("command")))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("bridge_idle_or_busy");
+                        steps.push((40, format!("bridge:{}", msg)));
+                    } else {
+                        steps.push((40, "bridge_connected".into()));
+                    }
+                } else {
+                    steps.push((40, "no_bridge_local_handler".into()));
+                }
+                steps.push((60, "executing".into()));
+
+                let resp = handle_request(
+                    &req,
+                    cached_client,
+                    default_project,
+                    default_program,
+                    projects_dir,
+                );
+                steps.push((90, "finalizing".into()));
+                steps.push((100, "complete".into()));
+                let step_refs: Vec<(u8, &str)> =
+                    steps.iter().map(|(p, m)| (*p, m.as_str())).collect();
+                let sse = build_streamed_tool_response(&resp, &step_refs);
+                write_sse_response(&mut stream, &sse)?;
+            } else {
+                let resp = handle_request(
+                    &req,
+                    cached_client,
+                    default_project,
+                    default_program,
+                    projects_dir,
+                );
+                let bytes = serde_json::to_vec(&resp)?;
+                write_http_response(&mut stream, 200, "application/json", &bytes)?;
+            }
         }
         ("OPTIONS", _) => {
             write_http_response(&mut stream, 204, "text/plain", b"")?;
@@ -1955,6 +2564,18 @@ fn write_http_response(
     );
     stream.write_all(header.as_bytes())?;
     stream.write_all(body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// SSE response for long-job progress + final JSON-RPC result.
+fn write_sse_response(stream: &mut TcpStream, sse_body: &str) -> anyhow::Result<()> {
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n",
+        sse_body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(sse_body.as_bytes())?;
     stream.flush()?;
     Ok(())
 }
@@ -2466,9 +3087,109 @@ mod tests {
             "transaction_abort",
             "diff_programs",
             "diff_functions",
+            "diff_transfer",
+            "diff_explain",
+            "data_flow",
+            "structure_recover",
+            "similarity",
+            "programs_foreach",
+            "firmware_summarize",
         ] {
             assert!(names.iter().any(|n| n == t), "missing tool {}", t);
         }
+    }
+
+    #[test]
+    fn http_stream_mode_emits_progress_and_result_envelope() {
+        use crate::extras::{build_streamed_tool_response, wants_sse_stream};
+        use std::io::{Read as _, Write as _};
+        use std::thread;
+        use std::time::Duration;
+
+        assert!(wants_sse_stream("/mcp?stream=1", None));
+
+        let port_file = std::env::temp_dir().join(format!(
+            "ghidra-mcp-sse-port-{}",
+            std::process::id()
+        ));
+        let port_file2 = port_file.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let thr = thread::spawn(move || {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = listener.local_addr().unwrap();
+            std::fs::write(&port_file2, format!("{}", a.port())).unwrap();
+            listener.set_nonblocking(true).ok();
+            let mut cached: Option<(String, BridgeClient)> = None;
+            for _ in 0..200 {
+                if stop2.load(Ordering::SeqCst) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = handle_http_connection(
+                            stream,
+                            &mut cached,
+                            None,
+                            None,
+                            None,
+                            None,
+                            true,
+                        );
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut port = 0u16;
+        for _ in 0..50 {
+            if let Ok(s) = std::fs::read_to_string(&port_file) {
+                if let Ok(p) = s.trim().parse() {
+                    port = p;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(port > 0);
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping","arguments":{}}}"#;
+        let req = format!(
+            "POST /mcp?stream=1 HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut resp = String::new();
+        let mut reader = BufReader::new(stream);
+        reader.read_to_string(&mut resp).ok();
+        assert!(resp.contains("text/event-stream"), "resp={}", resp);
+        assert!(resp.contains("event: progress"), "resp={}", resp);
+        assert!(resp.contains("event: result"), "resp={}", resp);
+        assert!(resp.contains("mcp_progress") || resp.contains("percent"), "resp={}", resp);
+        assert!(resp.contains("pong") || resp.contains("success"), "resp={}", resp);
+        // Final envelope keys present in result payload
+        assert!(
+            resp.contains("provenance") || resp.contains("tool_version") || resp.contains("next_steps"),
+            "resp={}",
+            resp
+        );
+
+        // Also exercise pure framing helper used by the server path
+        let framed = build_streamed_tool_response(
+            &json!({"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"status\":\"success\",\"provenance\":{}}"}]}}),
+            &[(10, "queued"), (100, "done")],
+        );
+        assert!(framed.contains("event: progress") && framed.contains("event: result"));
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = thr.join();
+        let _ = std::fs::remove_file(port_file);
     }
 
     #[test]

@@ -188,11 +188,12 @@ Expose the CLI surface as MCP tools over stdio or HTTP. Agents connect directly 
 ghidra mcp stdio                 # Primary transport for local agents
 ghidra mcp http --listen 127.0.0.1:0
 # Optional: --token / GHIDRA_MCP_TOKEN for bearer auth on HTTP
+# Long-job progress: POST /mcp?stream=1 (SSE progress + final envelope)
 ```
 
 See `docs/MCP.md` for the tool catalog, stable envelope (`provenance`, `next_steps`, `recovery_suggestions`, `artifacts`), curl examples, schema versioning, and mutation durability rules.
 
-Decompile always includes `nearby_xrefs`, `callers`, and `namespace` (may be empty). High-level helpers: `ghidra summarize` / `triage`, `ghidra pcode`, `ghidra transaction begin|commit|abort`. Workflow skill: `skills/triage-decomp-patch-export.md`.
+Decompile always includes `nearby_xrefs`, `callers`, and `namespace` (may be empty). High-level helpers: `ghidra summarize` / `triage`, `ghidra pcode`, `ghidra data-flow`, `ghidra type recover`, `ghidra find similar`, `ghidra diff transfer|explain`, `ghidra program firmware-summarize`, `ghidra transaction begin|commit|abort`. Workflow skill: `skills/triage-decomp-patch-export.md`.
 
 ### Docker / packaging
 
