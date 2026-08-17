@@ -44,8 +44,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -1440,12 +1442,26 @@ public class GhidraCliBridge extends GhidraScript {
 
                 Function created;
                 try {
-                    created = fm.createFunction(functionName, addr, null, SourceType.USER_DEFINED);
+                    // FunctionManager.createFunction(..., body=null, ...) does not compute a
+                    // body by following flow from the entry point -- for many perfectly valid
+                    // entry points (notably ARM/Thumb vtable targets never reached by static
+                    // auto-analysis) it deterministically rejects the address with "Function
+                    // body must contain the entrypoint". CreateFunctionCmd is what
+                    // GhidraScript.createFunction()/the UI's "Create Function" action use: it
+                    // follows flow from the entry point to compute a correct body first.
+                    ghidra.app.cmd.function.CreateFunctionCmd cmd =
+                        new ghidra.app.cmd.function.CreateFunctionCmd(
+                            functionName, addr, null, SourceType.USER_DEFINED);
+                    boolean ok = cmd.applyTo(currentProgram, monitor);
+                    if (!ok) {
+                        currentProgram.endTransaction(txId, true);
+                        return diagnoseCreateFunctionFailure(addr, autoDisassembled, cmd.getStatusMsg());
+                    }
+                    created = fm.getFunctionAt(addr);
                 } catch (Exception e) {
-                    // createFunction rejects some addresses by throwing (e.g. "Function body
-                    // must contain the entrypoint") rather than returning null -- run it
-                    // through the same diagnosis either way instead of losing the detail to
-                    // the generic catch below.
+                    // CreateFunctionCmd rejects some addresses by throwing rather than
+                    // returning false -- run it through the same diagnosis either way instead
+                    // of losing the detail to the generic catch below.
                     currentProgram.endTransaction(txId, true);
                     return diagnoseCreateFunctionFailure(addr, autoDisassembled, e.getMessage());
                 }
@@ -3282,23 +3298,88 @@ public class GhidraCliBridge extends GhidraScript {
         return err;
     }
 
+    /**
+     * Common C spellings that aren't registered under that literal name in
+     * Ghidra's data type managers (fixed-width stdint names, "unsigned X")
+     * -- mapped to the canonical Ghidra builtin name that resolveDataType()
+     * can find directly.
+     */
+    private static final Map<String, String> TYPE_NAME_ALIASES = buildTypeNameAliases();
+
+    private static Map<String, String> buildTypeNameAliases() {
+        Map<String, String> m = new HashMap<>();
+        m.put("uint8_t", "byte");
+        m.put("u8", "byte");
+        m.put("int8_t", "sbyte");
+        m.put("s8", "sbyte");
+        m.put("uint16_t", "ushort");
+        m.put("u16", "ushort");
+        m.put("int16_t", "short");
+        m.put("s16", "short");
+        m.put("uint32_t", "uint");
+        m.put("u32", "uint");
+        m.put("int32_t", "int");
+        m.put("s32", "int");
+        m.put("uint64_t", "ulonglong");
+        m.put("u64", "ulonglong");
+        m.put("int64_t", "longlong");
+        m.put("s64", "longlong");
+        m.put("unsigned", "uint");
+        m.put("unsigned int", "uint");
+        m.put("unsigned long", "ulong");
+        m.put("unsigned long long", "ulonglong");
+        m.put("unsigned short", "ushort");
+        m.put("unsigned char", "uchar");
+        m.put("signed char", "char");
+        return m;
+    }
+
     private DataType resolveDataType(String name) {
         if (name == null || name.isEmpty()) return null;
+        String trimmed = name.trim();
         DataTypeManager dtm = currentProgram.getDataTypeManager();
+
         // Try by path first (e.g., "/int" or "/myCategory/myStruct")
-        DataType dt = dtm.getDataType(name);
+        DataType dt = dtm.getDataType(trimmed);
         if (dt != null) return dt;
-        // Scan by simple name
-        Iterator<DataType> iter = dtm.getAllDataTypes();
+
+        // Handle pointer syntax: "int *" or "char **" -- peel one level and
+        // recurse so aliasing/builtin fallback below also applies to the
+        // pointee (e.g. "void *", "uint32_t *").
+        if (trimmed.endsWith("*")) {
+            String base = trimmed.substring(0, trimmed.lastIndexOf('*')).trim();
+            DataType baseType = resolveDataType(base);
+            return baseType != null ? new PointerDataType(baseType) : null;
+        }
+
+        // Scan by simple name: the program's own data type manager first,
+        // then Ghidra's built-in primitives (int, uint, dword, qword, ulong,
+        // byte, ...). Built-ins usually aren't materialized in the
+        // program's own DTM until something references them, so scanning
+        // only currentProgram.getDataTypeManager() misses most of the
+        // ordinary C type names a user would type.
+        DataType found = findDataTypeByName(dtm, trimmed);
+        if (found == null) {
+            found = findDataTypeByName(BuiltInDataTypeManager.getDataTypeManager(), trimmed);
+        }
+        if (found != null) return found;
+
+        // Retry under the canonical alias (uint32_t -> uint, u32 -> uint, etc.)
+        String canonical = TYPE_NAME_ALIASES.get(trimmed);
+        if (canonical != null) {
+            found = findDataTypeByName(dtm, canonical);
+            if (found == null) {
+                found = findDataTypeByName(BuiltInDataTypeManager.getDataTypeManager(), canonical);
+            }
+        }
+        return found;
+    }
+
+    private DataType findDataTypeByName(DataTypeManager mgr, String name) {
+        Iterator<DataType> iter = mgr.getAllDataTypes();
         while (iter.hasNext()) {
             DataType c = iter.next();
             if (c.getName().equals(name)) return c;
-        }
-        // Handle pointer syntax: "int *" or "char **"
-        if (name.endsWith("*")) {
-            String base = name.substring(0, name.lastIndexOf('*')).trim();
-            DataType baseType = resolveDataType(base);
-            if (baseType != null) return new PointerDataType(baseType);
         }
         return null;
     }
@@ -3463,8 +3544,27 @@ public class GhidraCliBridge extends GhidraScript {
             try {
                 int offset = getArgInt(args, "offset", -1);
                 if (offset >= 0) {
+                    // replaceAtOffset() places the field at that exact byte offset,
+                    // never shifting components that sit elsewhere -- insertAtOffset()
+                    // instead shifts every later field by the new field's size, which
+                    // silently corrupts a struct being built (or patched) offset-by-offset
+                    // out of order. Unlike insertAtOffset(), replaceAtOffset() does not
+                    // grow the structure itself, so grow it first when the field falls
+                    // past the current end (the common case: fields added in ascending
+                    // offset order into a struct that's only as big as its last field).
                     int fieldSize = getArgInt(args, "size", fieldDataType.getLength());
-                    struct.insertAtOffset(offset, fieldDataType, fieldSize, fieldName, null);
+                    // A brand-new struct (StructureDataType(name, 0)) has zero real
+                    // components but getLength() still reports 1 (Ghidra's minimum
+                    // displayable data type length) rather than the true internal 0 --
+                    // growing off that reported length silently comes up 1 byte short
+                    // for the first field. Use 0 as the starting length until a
+                    // component actually exists, when getLength() is accurate.
+                    int currentLength = struct.getNumComponents() == 0 ? 0 : struct.getLength();
+                    int needed = (offset + fieldSize) - currentLength;
+                    if (needed > 0) {
+                        struct.growStructure(needed);
+                    }
+                    struct.replaceAtOffset(offset, fieldDataType, fieldSize, fieldName, null);
                 } else {
                     struct.add(fieldDataType, fieldName, null);
                 }

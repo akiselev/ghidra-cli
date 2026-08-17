@@ -64,6 +64,31 @@ fn evaluate_compare(field: &str, op: CompareOp, value: &Value, data: &JsonValue)
                 CompareOp::LessEqual => field_num <= compare_num,
             })
         }
+        (JsonValue::String(s), val) if val.as_f64().is_some() => {
+            // Ghidra addresses come back from the bridge as hex strings
+            // (e.g. "002dad4c", or "ram:002dad4c" for multi-space
+            // programs), never as JSON numbers. A numeric filter value
+            // (0x..., a bare int) against such a field used to fall
+            // through to the catch-all `Ok(false)` below -- silently
+            // matching nothing instead of comparing addresses. Parse the
+            // field as hex (falling back to decimal) so `address >= 0x...`
+            // works the way it looks like it should.
+            let compare_num = val.as_f64().unwrap();
+            match parse_numeric_field(s) {
+                Some(field_num) => Ok(match op {
+                    CompareOp::Equal => (field_num - compare_num).abs() < f64::EPSILON,
+                    CompareOp::NotEqual => (field_num - compare_num).abs() >= f64::EPSILON,
+                    CompareOp::Greater => field_num > compare_num,
+                    CompareOp::GreaterEqual => field_num >= compare_num,
+                    CompareOp::Less => field_num < compare_num,
+                    CompareOp::LessEqual => field_num <= compare_num,
+                }),
+                None => Err(GhidraError::InvalidFilter(format!(
+                    "Cannot compare non-numeric string field {:?} numerically",
+                    s
+                ))),
+            }
+        }
         (JsonValue::String(s), Value::String(val)) => Ok(match op {
             CompareOp::Equal => s == val,
             CompareOp::NotEqual => s != val,
@@ -84,6 +109,24 @@ fn evaluate_compare(field: &str, op: CompareOp, value: &Value, data: &JsonValue)
         }),
         _ => Ok(false),
     }
+}
+
+/// Parse a JSON string field as a number for numeric comparison. Ghidra
+/// address strings are unprefixed hex (optionally with an address-space
+/// prefix like "ram:"), so hex is tried first; plain decimal is the
+/// fallback for other numeric-looking string fields.
+fn parse_numeric_field(s: &str) -> Option<f64> {
+    let hex_part = s.rsplit(':').next().unwrap_or(s);
+    let hex_part = hex_part
+        .strip_prefix("0x")
+        .or_else(|| hex_part.strip_prefix("0X"))
+        .unwrap_or(hex_part);
+    if !hex_part.is_empty() {
+        if let Ok(n) = u64::from_str_radix(hex_part, 16) {
+            return Some(n as f64);
+        }
+    }
+    s.parse::<f64>().ok()
 }
 
 fn evaluate_string_op(field: &str, op: StringOp, value: &str, data: &JsonValue) -> Result<bool> {
@@ -245,6 +288,35 @@ mod tests {
         };
 
         assert!(evaluate(&expr, &data).unwrap());
+    }
+
+    #[test]
+    fn test_evaluate_address_range_filter() {
+        // Regression: Ghidra addresses come back as hex strings (e.g.
+        // "002dad4c"), never JSON numbers. A numeric filter against that
+        // field used to silently fall through to `Ok(false)` for every
+        // row instead of comparing addresses.
+        let in_range = json!({ "name": "f1", "address": "002df100" });
+        let below_range = json!({ "name": "f2", "address": "002d0000" });
+
+        let expr = FilterExpr::Logical {
+            op: LogicalOp::And,
+            exprs: vec![
+                FilterExpr::Compare {
+                    field: "address".to_string(),
+                    op: CompareOp::GreaterEqual,
+                    value: Value::Hex(0x002df000),
+                },
+                FilterExpr::Compare {
+                    field: "address".to_string(),
+                    op: CompareOp::LessEqual,
+                    value: Value::Hex(0x002e3600),
+                },
+            ],
+        };
+
+        assert!(evaluate(&expr, &in_range).unwrap());
+        assert!(!evaluate(&expr, &below_range).unwrap());
     }
 
     #[test]
