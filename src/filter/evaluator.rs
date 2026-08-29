@@ -90,8 +90,8 @@ fn evaluate_compare(field: &str, op: CompareOp, value: &Value, data: &JsonValue)
             }
         }
         (JsonValue::String(s), Value::String(val)) => Ok(match op {
-            CompareOp::Equal => s == val,
-            CompareOp::NotEqual => s != val,
+            CompareOp::Equal => strings_equal_lenient(field, s, val),
+            CompareOp::NotEqual => !strings_equal_lenient(field, s, val),
             _ => {
                 return Err(GhidraError::InvalidFilter(
                     "Cannot use numeric comparison on strings".to_string(),
@@ -109,6 +109,39 @@ fn evaluate_compare(field: &str, op: CompareOp, value: &Value, data: &JsonValue)
         }),
         _ => Ok(false),
     }
+}
+
+/// Equal/NotEqual on two string values for `evaluate_compare`: exact match,
+/// or -- for address-shaped fields -- tolerant of a `0x`/`0X` prefix on the
+/// filter's value. Ghidra addresses are stored and returned as bare hex
+/// (e.g. "ff90"), but every other place in this CLI's own docs/output uses
+/// `0xADDR` freely (`ghidra decompile 0x0331`, `ghidra x-ref to 0xff90`),
+/// so a quoted `--filter "address = '0xff90'"` used to silently match
+/// nothing instead of comparing the same way those other commands do.
+fn strings_equal_lenient(field: &str, field_val: &str, filter_val: &str) -> bool {
+    if field_val == filter_val {
+        return true;
+    }
+    if !is_address_field(field) {
+        return false;
+    }
+    let stripped = filter_val
+        .strip_prefix("0x")
+        .or_else(|| filter_val.strip_prefix("0X"));
+    match stripped {
+        Some(stripped) => field_val.eq_ignore_ascii_case(stripped),
+        None => false,
+    }
+}
+
+/// Field names (last path segment) that hold a Ghidra address as a bare hex
+/// string, per the JSON the bridge emits (`address`, `entry_point`, xref
+/// `from`/`to`, `min_address`/`max_address`).
+fn is_address_field(field: &str) -> bool {
+    matches!(
+        field.rsplit('.').next().unwrap_or(field),
+        "address" | "entry_point" | "from" | "to" | "min_address" | "max_address"
+    )
 }
 
 /// Parse a JSON string field as a number for numeric comparison. Ghidra
@@ -317,6 +350,38 @@ mod tests {
 
         assert!(evaluate(&expr, &in_range).unwrap());
         assert!(!evaluate(&expr, &below_range).unwrap());
+    }
+
+    #[test]
+    fn test_evaluate_quoted_hex_address_equality() {
+        // Regression: a quoted filter value ('0xff90') parses as
+        // Value::String, not Value::Hex, so it used to fall into plain
+        // string equality against the bare-hex stored field and never
+        // match, even though every other command in this CLI accepts
+        // 0x-prefixed addresses freely.
+        let data = json!({ "name": "g_game_state", "address": "ff90" });
+
+        let expr = FilterExpr::Compare {
+            field: "address".to_string(),
+            op: CompareOp::Equal,
+            value: Value::String("0xff90".to_string()),
+        };
+        assert!(evaluate(&expr, &data).unwrap());
+
+        let expr_ne = FilterExpr::Compare {
+            field: "address".to_string(),
+            op: CompareOp::NotEqual,
+            value: Value::String("0xff90".to_string()),
+        };
+        assert!(!evaluate(&expr_ne, &data).unwrap());
+
+        // Non-address string fields are unaffected by 0x-stripping.
+        let name_expr = FilterExpr::Compare {
+            field: "name".to_string(),
+            op: CompareOp::Equal,
+            value: Value::String("0xff90".to_string()),
+        };
+        assert!(!evaluate(&name_expr, &data).unwrap());
     }
 
     #[test]

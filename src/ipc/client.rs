@@ -418,14 +418,26 @@ impl BridgeClient {
         )
     }
 
-    pub fn symbol_delete(&self, name: &str) -> Result<serde_json::Value> {
-        self.send_command("symbol_delete", Some(json!({"name": name})))
+    /// `addresses` scopes the delete to exactly those symbols (by address);
+    /// see `resolve_symbol_addresses` in main.rs for how callers compute it.
+    pub fn symbol_delete(&self, name: &str, addresses: &[String]) -> Result<serde_json::Value> {
+        self.send_command(
+            "symbol_delete",
+            Some(json!({"name": name, "addresses": addresses})),
+        )
     }
 
-    pub fn symbol_rename(&self, old_name: &str, new_name: &str) -> Result<serde_json::Value> {
+    /// `addresses` scopes the rename to exactly those symbols (by address);
+    /// see `resolve_symbol_addresses` in main.rs for how callers compute it.
+    pub fn symbol_rename(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        addresses: &[String],
+    ) -> Result<serde_json::Value> {
         self.send_command(
             "symbol_rename",
-            Some(json!({"old_name": old_name, "new_name": new_name})),
+            Some(json!({"old_name": old_name, "new_name": new_name, "addresses": addresses})),
         )
     }
 

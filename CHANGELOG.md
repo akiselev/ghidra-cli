@@ -92,6 +92,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EOL`). The client sent the type under key `type` while the bridge read
   `comment_type`; the client now sends `comment_type` and the bridge still
   accepts the old key as a fallback.
+- `ghidra script run` no longer fails intermittently with "Failed to get OSGi
+  bundle containing script" for `.java` scripts. Two bugs compounded: the
+  bridge resolved the target script through `GhidraScriptUtil`'s ambiguous
+  "first registered ancestor directory" bundle lookup instead of the exact
+  bundle it had just registered, so an unrelated, broader script directory
+  registered earlier (e.g. from another project) could shadow it; and a
+  reflective `Class.forName()` call with a literal class-name string caused
+  the bnd OSGi analyzer to add an unwireable `Import-Package` to the bridge's
+  own bundle, breaking bridge startup outright. `script run` now builds and
+  loads the class from the exact bundle it resolved for the script's
+  directory.
+- `symbol rename`/`symbol delete NAME` no longer silently mutate every symbol
+  in the program sharing `NAME` (Ghidra reuses auto-generated names like
+  `caseD_XX`/`LAB_XXXX` across unrelated addresses). Both now require
+  `--address`/`--filter` to disambiguate a name shared by more than one
+  symbol, or `--all` to explicitly opt into affecting every match; `symbol
+  delete --filter` now actually scopes the deletion instead of being silently
+  ignored.
+- `type create` now rejects a value that isn't a bare identifier (e.g.
+  `type create "struct Foo {}"`) instead of silently creating a type
+  literally named after the whole unparsed string. It only ever creates an
+  empty struct — build fields afterward with `type add-field`.
+- `--filter "address = '0xADDR'"` (quoted, `0x`-prefixed) now matches the
+  same symbol as `--filter "address = 'ADDR'"`. Address-shaped filter fields
+  (`address`, `entry_point`, `from`, `to`, `min_address`, `max_address`)
+  tolerate an optional `0x`/`0X` prefix on the compared value.
+- `function rename OLD NEW --address ADDR` no longer silently ignores
+  `--address`. It now scopes the rename to the function whose entry point is
+  exactly `ADDR`, and errors loudly (instead of renaming an unrelated
+  function) if `OLD` doesn't match the function actually found there. Same
+  root cause as the `symbol rename` fix above: Ghidra reuses auto-generated
+  names across unrelated addresses, so a bare name isn't a safe rename target
+  without `--address`.
+- `memory read ADDR SIZE` no longer fails on overlay-qualified addresses
+  (e.g. `rom20::69f0`) with `Failed to read memory: For input string ...
+  under radix 16`. The address argument now goes through the same
+  `resolveAddress` helper `disasm-at`/`function get`/etc. already use instead
+  of a bare hex parse restricted to the default address space.
 
 ## [0.2.1]
 

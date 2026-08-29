@@ -477,6 +477,22 @@ impl FunctionGetArgs {
 pub struct RenameArgs {
     pub old_name: String,
     pub new_name: String,
+    /// Address of the specific symbol to rename. Required when `old_name`
+    /// is shared by more than one symbol -- Ghidra reuses auto-generated
+    /// names (`caseD_XX`, `LAB_XXXX`, ...) across unrelated addresses
+    /// program-wide, so a bare name alone is not a safe rename target.
+    #[arg(long)]
+    pub address: Option<String>,
+    /// Filter expression (same syntax as `--filter` on query commands) used
+    /// to narrow which of the name's matches get renamed, e.g.
+    /// `--filter 'address=0xc200'`.
+    #[arg(short, long)]
+    pub filter: Option<String>,
+    /// Rename every symbol named `old_name`, program-wide. Without this (or
+    /// `--address`/`--filter`), an ambiguous name is a hard error rather
+    /// than silently renaming every match.
+    #[arg(long)]
+    pub all: bool,
     #[arg(long)]
     pub program: Option<String>,
     #[arg(long)]
@@ -654,7 +670,7 @@ pub enum SymbolCommands {
     /// Create symbol
     Create(CreateSymbolArgs),
     /// Delete symbol
-    Delete(SymbolGetArgs),
+    Delete(SymbolDeleteArgs),
     /// Rename symbol
     Rename(RenameArgs),
 }
@@ -662,6 +678,24 @@ pub enum SymbolCommands {
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct SymbolGetArgs {
     pub name: String,
+    #[command(flatten)]
+    pub options: QueryOptions,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct SymbolDeleteArgs {
+    pub name: String,
+    /// Address of the specific symbol to delete. Required when `name` is
+    /// shared by more than one symbol -- Ghidra reuses auto-generated names
+    /// (`caseD_XX`, `LAB_XXXX`, ...) across unrelated addresses
+    /// program-wide, so a bare name alone is not a safe delete target.
+    #[arg(long)]
+    pub address: Option<String>,
+    /// Delete every symbol named `name`, program-wide. Without this (or
+    /// `--address`/`--filter`), an ambiguous name is a hard error rather
+    /// than silently deleting every match.
+    #[arg(long)]
+    pub all: bool,
     #[command(flatten)]
     pub options: QueryOptions,
 }
@@ -780,6 +814,9 @@ pub struct TypeGetArgs {
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct CreateTypeArgs {
+    /// Bare identifier for the new (empty) struct type -- NOT a C-style
+    /// struct definition. Build fields afterward with `type add-field`.
+    #[arg(value_name = "NAME")]
     pub definition: String,
     #[arg(long)]
     pub program: Option<String>,

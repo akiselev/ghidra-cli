@@ -14,6 +14,11 @@ import ghidra.app.script.GhidraScriptUtil;
 import ghidra.app.script.GhidraScriptLoadException;
 import ghidra.app.script.GhidraState;
 import ghidra.util.exception.CancelledException;
+// org.osgi.framework is the OSGi core framework API, exported to every
+// bundle unconditionally (unlike Ghidra-internal packages such as
+// ghidra.app.plugin.core.osgi, which the bridge's own bundle cannot wire --
+// see handleScriptRun()). Safe to import directly.
+import org.osgi.framework.Bundle;
 import generic.jar.ResourceFile;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
@@ -1371,14 +1376,35 @@ public class GhidraCliBridge extends GhidraScript {
 
         String oldTarget = getArgString(args, "old_name");
         String newName = getArgString(args, "new_name");
+        String addressArg = getArgString(args, "address");
         if (oldTarget == null || newName == null || oldTarget.isEmpty() || newName.isEmpty()) {
             return errorResult("old_name and new_name required");
         }
 
         try {
-            Function func = findFunctionByNameOrAddress(oldTarget);
-            if (func == null) {
-                return errorResult(buildFunctionTargetHint(oldTarget));
+            Function func;
+            if (addressArg != null && !addressArg.isEmpty()) {
+                // Scope the rename to the function whose entry point is exactly
+                // this address, rather than resolving old_name program-wide --
+                // Ghidra reuses auto-generated names (caseD_XX, LAB_XXXX, ...)
+                // across unrelated addresses.
+                Address addr = resolveAddress(addressArg);
+                if (addr == null) {
+                    return errorResult("Invalid address: " + addressArg);
+                }
+                func = currentProgram.getFunctionManager().getFunctionAt(addr);
+                if (func == null) {
+                    return errorResult("No function at address " + addressArg);
+                }
+                if (!func.getName().equals(oldTarget)) {
+                    return errorResult("Function at address " + addressArg + " is named '"
+                        + func.getName() + "', not '" + oldTarget + "'");
+                }
+            } else {
+                func = findFunctionByNameOrAddress(oldTarget);
+                if (func == null) {
+                    return errorResult(buildFunctionTargetHint(oldTarget));
+                }
             }
 
             int txId = currentProgram.startTransaction("Rename function");
@@ -2993,23 +3019,78 @@ public class GhidraCliBridge extends GhidraScript {
         }
     }
 
+    /** Strip an optional 0x/0X prefix and lowercase, for tolerant address comparison. */
+    private String normalizeAddressForCompare(String addr) {
+        if (addr == null) return null;
+        String a = addr.trim().toLowerCase();
+        if (a.startsWith("0x")) a = a.substring(2);
+        return a;
+    }
+
+    /**
+     * Resolve exactly which symbols named `name` a mutation should touch.
+     *
+     * Ghidra auto-generates names (`caseD_XX`, `LAB_XXXX`, ...) that are
+     * routinely reused across unrelated addresses program-wide, so a bare
+     * name is not a safe mutation target on its own: without this guard,
+     * `symbol rename`/`symbol delete` would silently touch every symbol
+     * sharing that name, not just the one address the caller meant.
+     *
+     * When `addresses` is non-empty, scope to exactly those addresses
+     * (erroring if any requested address has no matching symbol). When it's
+     * empty and more than one symbol shares `name`, refuse to guess.
+     */
+    private List<Symbol> resolveScopedSymbols(SymbolTable symbolTable, String name, String[] addresses)
+            throws Exception {
+        SymbolIterator syms = symbolTable.getSymbols(name);
+        List<Symbol> all = new ArrayList<>();
+        while (syms.hasNext()) {
+            all.add(syms.next());
+        }
+        if (all.isEmpty()) {
+            throw new IllegalArgumentException("Symbol not found: " + name);
+        }
+
+        if (addresses != null && addresses.length > 0) {
+            Set<String> wanted = new HashSet<>();
+            for (String a : addresses) wanted.add(normalizeAddressForCompare(a));
+            List<Symbol> scoped = new ArrayList<>();
+            for (Symbol s : all) {
+                if (wanted.contains(normalizeAddressForCompare(s.getAddress().toString()))) {
+                    scoped.add(s);
+                }
+            }
+            if (scoped.isEmpty()) {
+                throw new IllegalArgumentException(
+                    "No symbol named '" + name + "' at the given address(es)");
+            }
+            return scoped;
+        }
+
+        if (all.size() > 1) {
+            StringBuilder addrs = new StringBuilder();
+            for (Symbol s : all) {
+                if (addrs.length() > 0) addrs.append(", ");
+                addrs.append(s.getAddress().toString());
+            }
+            throw new IllegalArgumentException("'" + name + "' matches " + all.size()
+                + " symbols at addresses [" + addrs + "] -- pass explicit address(es) to pick "
+                + "one, or request all of them explicitly");
+        }
+
+        return all;
+    }
+
     private JsonObject handleSymbolDelete(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
 
         String name = getArgString(args, "name");
         if (name == null) return errorResult("Symbol name required");
+        String[] addresses = getArgStringArray(args, "addresses");
 
         try {
             SymbolTable symbolTable = currentProgram.getSymbolTable();
-            SymbolIterator syms = symbolTable.getSymbols(name);
-            List<Symbol> toDelete = new ArrayList<>();
-            while (syms.hasNext()) {
-                toDelete.add(syms.next());
-            }
-
-            if (toDelete.isEmpty()) {
-                return errorResult("Symbol not found: " + name);
-            }
+            List<Symbol> toDelete = resolveScopedSymbols(symbolTable, name, addresses);
 
             int txId = currentProgram.startTransaction("Delete symbol");
             try {
@@ -3025,6 +3106,7 @@ public class GhidraCliBridge extends GhidraScript {
             JsonObject result = new JsonObject();
             result.addProperty("status", "deleted");
             result.addProperty("name", name);
+            result.addProperty("count", toDelete.size());
             return result;
         } catch (Exception e) {
             return errorResult("Failed to delete symbol: " + e.getMessage());
@@ -3039,23 +3121,20 @@ public class GhidraCliBridge extends GhidraScript {
         if (oldName == null || newName == null) {
             return errorResult("old_name and new_name required");
         }
+        String[] addresses = getArgStringArray(args, "addresses");
 
         try {
             SymbolTable symbolTable = currentProgram.getSymbolTable();
-            SymbolIterator syms = symbolTable.getSymbols(oldName);
-            List<Symbol> toRename = new ArrayList<>();
-            while (syms.hasNext()) {
-                toRename.add(syms.next());
-            }
+            List<Symbol> toRename = resolveScopedSymbols(symbolTable, oldName, addresses);
 
-            if (toRename.isEmpty()) {
-                return errorResult("Symbol not found: " + oldName);
-            }
-
+            JsonArray renamed = new JsonArray();
             int txId = currentProgram.startTransaction("Rename symbol");
             try {
                 for (Symbol s : toRename) {
+                    JsonObject entry = new JsonObject();
+                    entry.addProperty("address", s.getAddress().toString());
                     s.setName(newName, SourceType.USER_DEFINED);
+                    renamed.add(entry);
                 }
                 currentProgram.endTransaction(txId, true);
             } catch (Exception e) {
@@ -3067,6 +3146,7 @@ public class GhidraCliBridge extends GhidraScript {
             result.addProperty("status", "renamed");
             result.addProperty("old_name", oldName);
             result.addProperty("new_name", newName);
+            result.add("addresses", renamed);
             return result;
         } catch (Exception e) {
             return errorResult("Failed to rename symbol: " + e.getMessage());
@@ -3197,6 +3277,17 @@ public class GhidraCliBridge extends GhidraScript {
         String typeName = getArgString(args, "definition");
         if (typeName == null) typeName = getArgString(args, "name");
         if (typeName == null) return errorResult("Type name required");
+
+        // This only ever creates an empty struct named `typeName` -- it does
+        // NOT parse a C-style struct body. Reject anything that isn't a bare
+        // identifier instead of silently creating a type literally named
+        // after the whole (unparsed) string, e.g. `struct Foo {}` -- that
+        // used to succeed and leave a garbage type behind with no error.
+        if (!typeName.matches("[A-Za-z_][A-Za-z0-9_]*")) {
+            return errorResult("Invalid type name: '" + typeName + "'. `type create` takes a "
+                + "bare identifier and always creates an empty struct; build fields afterward "
+                + "with `type add-field`. It does not parse a C-style struct definition.");
+        }
 
         try {
             DataTypeManager dtm = currentProgram.getDataTypeManager();
@@ -4953,23 +5044,37 @@ public class GhidraCliBridge extends GhidraScript {
         PrintWriter out = new PrintWriter(buffer);
         try {
             // A script only resolves if its parent directory is a registered
-            // bundle/source directory (GhidraScriptUtil.findSourceDirectoryContaining
-            // scans BundleHost.getBundleFiles()). Register it if it is not already.
+            // bundle/source directory. Register it if it is not already.
             //
-            // Done via reflection on purpose: referencing BundleHost directly would
-            // add an OSGi Import-Package on ghidra.app.plugin.core.osgi, which the
-            // bridge's own script bundle cannot wire, so the whole bridge fails to
-            // load. handleScriptList() uses the same reflection pattern.
+            // Done via reflection on purpose: referencing BundleHost/GhidraBundle
+            // directly -- even Class.forName() with a literal class-name string --
+            // makes bnd's OSGi Import-Package analysis add ghidra.app.plugin.core.osgi
+            // as a hard dependency of the bridge's own bundle, which the bridge
+            // cannot wire, so the whole bridge fails to load. Every reflective type
+            // token below is obtained via .getClass() on an already-held instance
+            // instead, exactly like the getBundleHost()/bhClass pair here already
+            // did. handleScriptList() uses the same .getClass() pattern.
             Object bundleHost = GhidraScriptUtil.class
                 .getMethod("getBundleHost").invoke(null);
             if (bundleHost == null) return errorResult("Ghidra script bundle host unavailable");
             Class<?> bhClass = bundleHost.getClass();
-            Object existing = bhClass
-                .getMethod("getExistingGhidraBundle", ResourceFile.class)
+            // getGhidraBundle() is a plain map lookup; getExistingGhidraBundle()
+            // is for callers who expect the bundle to already exist and logs an
+            // ERROR to application.log on a miss -- which is exactly what happens
+            // here on every first-ever run of a script in a new directory. Using
+            // getGhidraBundle() for this existence check avoids that misleading
+            // (and otherwise benign) log noise.
+            Object bundle = bhClass
+                .getMethod("getGhidraBundle", ResourceFile.class)
                 .invoke(bundleHost, sourceDir);
-            if (existing == null) {
-                bhClass.getMethod("add", ResourceFile.class, boolean.class, boolean.class)
-                    .invoke(bundleHost, sourceDir, true, false);
+            if (bundle == null) {
+                // enabled=true: matches how Ghidra's own script manager registers
+                // a directory a user actually wants to run scripts from.
+                bundle = bhClass.getMethod("add", ResourceFile.class, boolean.class, boolean.class)
+                    .invoke(bundleHost, sourceDir, true, true);
+            }
+            if (bundle == null) {
+                return errorResult("Failed to register script bundle for " + sourceDir.getAbsolutePath());
             }
 
             GhidraScriptProvider provider = GhidraScriptUtil.getProvider(source);
@@ -4978,8 +5083,71 @@ public class GhidraCliBridge extends GhidraScript {
                     + " (unsupported script type)");
             }
 
-            // getScriptInstance compiles the source via the bundle host.
-            GhidraScript script = provider.getScriptInstance(source, out);
+            GhidraScript script;
+            if (scriptFile.getName().endsWith(".java")) {
+                // Build and load the class from the EXACT bundle we just resolved
+                // above, rather than delegating to provider.getScriptInstance(),
+                // which internally re-resolves the bundle via
+                // GhidraScriptUtil.findSourceDirectoryContaining(). That lookup
+                // returns the FIRST registered source directory that is an
+                // ancestor of the script -- not necessarily the most specific
+                // one -- so when a broader, unrelated ancestor directory is also
+                // registered as a bundle (e.g. from a prior `script run`/`script
+                // list` against a sibling or parent project), it can silently
+                // resolve to the WRONG bundle: either failing outright with
+                // "Failed to get OSGi bundle containing script" because the
+                // class isn't there, or worse, loading a same-named class from
+                // the wrong bundle entirely. Pinning to `bundle` here sidesteps
+                // that ambiguity altogether.
+                Class<?> bundleClass = bundle.getClass();
+                try {
+                    bundleClass.getMethod("build", PrintWriter.class).invoke(bundle, out);
+                    String locationId = (String) bundleClass
+                        .getMethod("getLocationIdentifier").invoke(bundle);
+                    bhClass.getMethod("activateSynchronously", String.class)
+                        .invoke(bundleHost, locationId);
+                } catch (java.lang.reflect.InvocationTargetException ite) {
+                    Throwable cause = ite.getCause() != null ? ite.getCause() : ite;
+                    out.flush();
+                    return errorResult("Script failed to build: " + cause.getMessage()
+                        + (buffer.getBuffer().length() > 0 ? "\n" + buffer : ""));
+                }
+
+                // Typed as the org.osgi.framework.Bundle interface (not the
+                // concrete Felix impl class .getOSGiBundle() actually returns):
+                // reflectively invoking loadClass() via the concrete class's own
+                // Method object throws IllegalAccessException, because that
+                // class isn't public even though the method is -- the standard
+                // reflection gotcha for "public method of non-public class".
+                // Going through the public Bundle interface sidesteps it.
+                Object rawOsgiBundle = bundleClass.getMethod("getOSGiBundle").invoke(bundle);
+                if (rawOsgiBundle == null) {
+                    out.flush();
+                    return errorResult("Failed to get OSGi bundle containing script: "
+                        + scriptFile.getPath()
+                        + (buffer.getBuffer().length() > 0 ? "\n" + buffer : ""));
+                }
+                Bundle osgiBundle = (Bundle) rawOsgiBundle;
+                String className = (String) bundleClass
+                    .getMethod("classNameForScript", ResourceFile.class)
+                    .invoke(bundle, source);
+                Class<?> loadedClass;
+                try {
+                    loadedClass = osgiBundle.loadClass(className);
+                } catch (ClassNotFoundException cnfe) {
+                    return errorResult("The class could not be found. It must be the public "
+                        + "class of the .java file: " + cnfe.getMessage());
+                }
+                if (!GhidraScript.class.isAssignableFrom(loadedClass)) {
+                    return errorResult("Loaded class " + className + " does not extend GhidraScript");
+                }
+                script = (GhidraScript) loadedClass.getDeclaredConstructor().newInstance();
+                script.setSourceFile(source);
+            } else {
+                // Non-Java providers (e.g. Python) aren't resolved via the OSGi
+                // bundle path above; fall back to the provider's own resolution.
+                script = provider.getScriptInstance(source, out);
+            }
             script.setScriptArgs(scriptArgs);
 
             // Run on the program executor's exclusive objects. `monitor` is the
@@ -5225,17 +5393,11 @@ public class GhidraCliBridge extends GhidraScript {
 
         try {
             ghidra.program.model.mem.Memory mem = currentProgram.getMemory();
-            ghidra.program.model.address.AddressFactory af = currentProgram.getAddressFactory();
 
-            // Parse address
-            long addrLong;
-            if (addrStr.startsWith("0x") || addrStr.startsWith("0X")) {
-                addrLong = Long.parseUnsignedLong(addrStr.substring(2), 16);
-            } else {
-                addrLong = Long.parseUnsignedLong(addrStr, 16);
+            Address baseAddr = resolveAddress(addrStr);
+            if (baseAddr == null) {
+                return errorResult("Invalid address: " + addrStr);
             }
-
-            ghidra.program.model.address.Address baseAddr = af.getDefaultAddressSpace().getAddress(addrLong);
 
             // Read bytes
             byte[] bytes = new byte[size];
@@ -5256,12 +5418,13 @@ public class GhidraCliBridge extends GhidraScript {
                 }
                 JsonObject ptrObj = new JsonObject();
                 ptrObj.addProperty("offset", i);
-                ptrObj.addProperty("address", String.format("0x%08x", addrLong + i));
+                ptrObj.addProperty("address", baseAddr.add(i).toString());
                 ptrObj.addProperty("value", String.format("0x%016x", val));
 
                 // Check if value looks like a code address
                 if (val >= 0x00401000L && val <= 0x05bb99ffL) {
-                    ghidra.program.model.address.Address funcAddr = af.getDefaultAddressSpace().getAddress(val);
+                    ghidra.program.model.address.Address funcAddr =
+                        currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(val);
                     ghidra.program.model.listing.Function func = currentProgram.getFunctionManager().getFunctionAt(funcAddr);
                     if (func != null) {
                         ptrObj.addProperty("function", func.getName());
@@ -5272,7 +5435,7 @@ public class GhidraCliBridge extends GhidraScript {
             }
 
             JsonObject result = new JsonObject();
-            result.addProperty("address", String.format("0x%08x", addrLong));
+            result.addProperty("address", baseAddr.toString());
             result.addProperty("size", bytesRead);
             result.addProperty("hex", hexStr.toString());
             result.add("pointers", pointers);

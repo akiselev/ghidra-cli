@@ -182,9 +182,11 @@ ghidra strings refs STRING [QUERY_OPTS]     # xrefs to string
 ghidra symbol list [QUERY_OPTS]             # aliases: sym, symbols
 ghidra symbol get NAME [QUERY_OPTS]
 ghidra symbol create ADDRESS NAME [--project P] [--program PROG]
-ghidra symbol delete NAME [QUERY_OPTS]
-ghidra symbol rename OLD NEW [--project P] [--program PROG]
+ghidra symbol delete NAME [--address ADDR] [--all] [QUERY_OPTS]
+ghidra symbol rename OLD NEW [--address ADDR] [--all] [--filter EXPR] [--project P] [--program PROG]
 ```
+
+Ghidra auto-generates names (`caseD_XX`, `LAB_XXXX`, ...) that are commonly reused across unrelated addresses program-wide. Because of this, `symbol delete`/`symbol rename` refuse to guess when `NAME`/`OLD` matches more than one symbol: pass `--address 0xADDR` (or `--filter`, e.g. `--filter 'address=0xc200'`) to pick the one you mean, or `--all` to explicitly affect every match. A name matching exactly one symbol needs no disambiguation.
 
 ### Memory Operations
 
@@ -210,7 +212,7 @@ ghidra x-ref list TARGET [QUERY_OPTS]   # refs both to and from the target
 ```bash
 ghidra type list [QUERY_OPTS]               # alias: types  (includes "kind" field: struct/union/enum/typedef/pointer/array/other)
 ghidra type get NAME [QUERY_OPTS]           # shows struct fields, enum members, typedef base type, kind
-ghidra type create DEFINITION [--project P] [--program PROG]        # create empty struct
+ghidra type create NAME [--project P] [--program PROG]              # create empty struct (bare identifier only, NOT a C struct definition -- use `type add-field` to build it)
 ghidra type apply ADDRESS TYPE_NAME [--force] [--project P] [--program PROG]  # --force/--clear-conflicting clears a conflicting data unit first
 ghidra type delete NAME [--project P] [--program PROG]              # alias: rm
 ghidra type rename OLD NEW [--project P] [--program PROG]           # alias: mv
