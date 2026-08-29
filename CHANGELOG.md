@@ -130,6 +130,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under radix 16`. The address argument now goes through the same
   `resolveAddress` helper `disasm-at`/`function get`/etc. already use instead
   of a bare hex parse restricted to the default address space.
+- `clear RANGE` no longer fails to parse overlay-qualified ranges (e.g.
+  `rom1::5512:551d` or `rom1::5512:rom1::551d`) with `Invalid start address:
+  rom1`. `RANGE` was split on the first `:`, which took everything before the
+  `::` bank separator as the whole start address; it now splits on the `:`
+  that actually separates start from end, treating `::` as a unit, and a bare
+  end address inherits the start address's overlay space.
+- A `script run` job that outlives `GHIDRA_CLI_READ_TIMEOUT` no longer prints
+  an error indistinguishable from a real failure. The client giving up on the
+  read is now a distinct `Timeout:`-prefixed message with exit code 75
+  (`EX_TEMPFAIL`), separate from the generic `Error:`/exit 1 used when the
+  bridge actually reports failure — the job itself is unaffected and keeps
+  running server-side (poll it via `ghidra jobs <id>`).
 
 ## [0.2.1]
 

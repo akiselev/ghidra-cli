@@ -85,6 +85,17 @@ fn main() {
     };
 
     if let Err(e) = result {
+        // A client-side read timeout means the CLI gave up waiting, not that
+        // the job actually failed -- it may still be running server-side and
+        // complete normally after this process exits (see `ghidra jobs`).
+        // Give it a distinguishable prefix and exit code (EX_TEMPFAIL, 75,
+        // from sysexits.h: "temporary failure; user is invited to retry") so
+        // a wrapper script can tell "poll `ghidra jobs` and keep going" apart
+        // from a genuine failure without string-matching stderr.
+        if let Some(timeout) = e.downcast_ref::<ipc::protocol::BridgeTimeoutError>() {
+            eprintln!("Timeout: {}", timeout);
+            std::process::exit(75);
+        }
         eprintln!("Error: {}", e);
         // Bridge errors that carry structured detail (e.g. the containing
         // function's name/entry/size on "function already exists", or the
@@ -1426,13 +1437,15 @@ fn execute_via_bridge(
         Commands::Disasm(args) => client.disasm(args.resolved_target(), args.num_instructions),
         Commands::DisasmAt(args) => client.disasm_at(&args.address, args.count),
         Commands::Clear(args) => {
-            let (start, end) = args.range.split_once(':').ok_or_else(|| {
+            let (start, end) = split_range(&args.range).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Invalid range '{}': expected START:END, e.g. 0bf3:0bfa",
+                    "Invalid range '{}': expected START:END, e.g. 0bf3:0bfa \
+                     (overlay addresses are supported, e.g. rom1::5512:551d or \
+                     rom1::5512:rom1::551d)",
                     args.range
                 )
             })?;
-            client.clear_range(start, end, args.disasm_at.as_deref())
+            client.clear_range(&start, &end, args.disasm_at.as_deref())
         }
         Commands::Batch(args) => {
             // Read batch file and execute each command locally
@@ -1691,6 +1704,38 @@ fn handle_program_save(cli: Cli) -> anyhow::Result<()> {
         println!("Saved (bridge restarted).");
     }
     Ok(())
+}
+
+/// Split a `clear` RANGE argument into (start, end) addresses, treating `::`
+/// (the overlay-space separator, e.g. `rom20::69f0`) as a single unit rather
+/// than a split point -- a bare `split_once(':')` breaks on it, taking
+/// everything before the first `:` (just the overlay space name) as the
+/// whole start address.
+///
+/// If only the start address carries an overlay-space prefix and the end
+/// address is bare (e.g. `rom1::5512:551d`), the end address inherits the
+/// start's space (`rom1::551d`) rather than resolving in the default space.
+fn split_range(range: &str) -> Option<(String, String)> {
+    let bytes = range.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b':' {
+                i += 2;
+                continue;
+            }
+            let start = &range[..i];
+            let end = &range[i + 1..];
+            return Some(match start.split_once("::") {
+                Some((space, _)) if !end.contains("::") && !end.is_empty() => {
+                    (start.to_string(), format!("{}::{}", space, end))
+                }
+                _ => (start.to_string(), end.to_string()),
+            });
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Get bridge status for a project.
@@ -2480,6 +2525,47 @@ fn resolve_project_path(project: &Option<String>, config: &Config) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_range_plain_addresses() {
+        assert_eq!(
+            split_range("0bf3:0bfa"),
+            Some(("0bf3".to_string(), "0bfa".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_range_overlay_start_bare_end_inherits_space() {
+        // ghidra-bug.md: naive split_once(':') took "rom1" as the whole start
+        // address; the correct split is on the ':' after the overlay prefix,
+        // and the bare end address inherits the start's overlay space.
+        assert_eq!(
+            split_range("rom1::5512:551d"),
+            Some(("rom1::5512".to_string(), "rom1::551d".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_range_overlay_both_sides_qualified() {
+        assert_eq!(
+            split_range("rom1::5512:rom1::551d"),
+            Some(("rom1::5512".to_string(), "rom1::551d".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_range_overlay_end_in_different_space() {
+        assert_eq!(
+            split_range("rom1::5512:rom2::551d"),
+            Some(("rom1::5512".to_string(), "rom2::551d".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_range_missing_colon_is_none() {
+        assert_eq!(split_range("rom1::5512"), None);
+        assert_eq!(split_range("0bf3"), None);
+    }
 
     #[test]
     fn bridge_list_params_limit_zero_means_unlimited() {

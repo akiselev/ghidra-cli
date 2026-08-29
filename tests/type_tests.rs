@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 #[macro_use]
 mod common;
-use common::{ensure_test_project, get_function_address, DaemonTestHarness};
+use common::{ensure_test_project, get_function_address, ghidra, DaemonTestHarness};
 
 const TEST_PROJECT: &str = "ci-test";
 const TEST_PROGRAM: &str = "sample_binary";
@@ -115,6 +115,89 @@ fn test_type_apply() {
             || stderr.contains("conflict"),
         "Expected success or instruction conflict, got: {}",
         stderr
+    );
+}
+
+/// `main` in the shared, cross-test `ci-test`/`sample_binary` fixture is relied
+/// on (read-only) by dozens of tests across the suite. Add `delta` bytes to a
+/// hex address string, preserving width, so this test can clear/redisassemble
+/// a small window around it without hardcoding a magic offset.
+fn hex_addr_plus(addr: &str, delta: u64) -> String {
+    let val = u64::from_str_radix(addr, 16).expect("hex address");
+    format!("{:0width$x}", val + delta, width = addr.len())
+}
+
+/// Force-clear+redisassemble a small window at `addr` back to instructions,
+/// via the same `clear --disasm-at` path a caller would use to recover from
+/// this (ghidra-bug.md's own suggested workaround) -- used both to armor this
+/// test against `main` having been left mid-disassembled by another test
+/// sharing the fixture, and to restore it afterward.
+fn restore_disassembly(harness: &DaemonTestHarness, addr: &str) {
+    ghidra(harness)
+        .arg("clear")
+        .arg(format!("{}:{}", addr, hex_addr_plus(addr, 15)))
+        .arg("--disasm-at")
+        .arg(addr)
+        .arg("--json")
+        .with_project(TEST_PROJECT, TEST_PROGRAM)
+        .run()
+        .assert_success();
+}
+
+#[test]
+#[serial]
+// `#[serial]` only serializes within this binary; cargo runs test *files* as
+// separate processes in parallel by default, and `main`'s entry is read by
+// dozens of tests across other files (readonly_tests.rs, patch_tests.rs,
+// etc.) with no cross-process lock protecting it. This test's clear/restore
+// steps below are correct and leave `main` intact on exit, but a
+// concurrently-running test in another file can still observe it broken in
+// the window in between. Run explicitly (`cargo test -- --ignored`) or
+// alone; skip it in a full parallel `cargo test` run.
+#[ignore]
+fn test_type_apply_force_on_function_entry_warns() {
+    require_ghidra!();
+    let harness = harness();
+
+    let addr = get_function_address(harness, TEST_PROJECT, TEST_PROGRAM, "main");
+    // Armor against `main` having been left mid-disassembled by another test
+    // sharing this cached fixture (e.g. `test_type_apply` above can itself
+    // silently succeed rather than conflict, if a prior run left the entry
+    // only partially defined) -- this test needs a clean function entry to
+    // exercise the case it's actually testing.
+    restore_disassembly(harness, &addr);
+
+    // --force on a function's own entry point clears its code (not a
+    // conflicting data unit) -- the response must flag that distinctly so a
+    // caller doesn't mistake it for a normal conflict-clear (ghidra-bug.md).
+    let result = ghidra(harness)
+        .arg("type")
+        .arg("apply")
+        .arg(&addr)
+        .arg("int")
+        .arg("--force")
+        .arg("--json")
+        .with_project(TEST_PROJECT, TEST_PROGRAM)
+        .run();
+
+    // Restore `main`'s disassembly for the many other tests sharing this
+    // fixture regardless of what the assertions below find.
+    restore_disassembly(harness, &addr);
+
+    result.assert_success();
+    // The CLI wraps single-address results in a JSON array.
+    let json: serde_json::Value = result.json();
+    let entry = &json[0];
+    assert_eq!(entry["cleared_conflicting"], true);
+    assert_eq!(
+        entry["is_function_entry"], true,
+        "expected is_function_entry:true when --force clears a function's own entry, got: {}",
+        entry
+    );
+    assert!(
+        entry["warning"].as_str().is_some_and(|w| w.contains("main")),
+        "expected a warning naming the cleared function, got: {}",
+        entry
     );
 }
 

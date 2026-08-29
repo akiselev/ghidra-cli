@@ -3329,6 +3329,13 @@ public class GhidraCliBridge extends GhidraScript {
                 return errorResult("Type not found: " + typeName);
             }
 
+            // Captured before the clear below (which can silently remove the Function
+            // object along with its code) so a `--force` that lands on a function's own
+            // entry -- rather than an actual conflicting data unit -- is still reported.
+            ghidra.program.model.listing.Function forcedFunctionEntry = force
+                ? currentProgram.getFunctionManager().getFunctionAt(addr)
+                : null;
+
             Listing listing = currentProgram.getListing();
             int txId = currentProgram.startTransaction("Apply type");
             try {
@@ -3351,7 +3358,21 @@ public class GhidraCliBridge extends GhidraScript {
             result.addProperty("status", "applied");
             result.addProperty("address", addressStr);
             result.addProperty("type", typeName);
-            if (force) result.addProperty("cleared_conflicting", true);
+            if (force) {
+                result.addProperty("cleared_conflicting", true);
+                // `--force` means force: clearing a function's own entry point (as opposed
+                // to an actual conflicting data unit) "succeeds" the same way, but silently
+                // -- `function get` still reports the function's old name/size afterward,
+                // and only a later `function disasm` failing with "No instruction at
+                // address" exposes the corruption. Flag it here instead.
+                if (forcedFunctionEntry != null) {
+                    result.addProperty("is_function_entry", true);
+                    result.addProperty("warning", "Cleared the entry point of function '"
+                        + forcedFunctionEntry.getName() + "' (code, not a conflicting data "
+                        + "unit) and replaced it with " + typeName
+                        + " data -- the function's code is gone, not just its conflicting bytes.");
+                }
+            }
             return result;
         } catch (Exception e) {
             return errorResult("Failed to apply type: " + e.getMessage());

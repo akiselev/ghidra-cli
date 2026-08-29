@@ -11,7 +11,7 @@ use anyhow::Result;
 use serde_json::json;
 use tracing::debug;
 
-use super::protocol::{BridgeCommandError, BridgeRequest, BridgeResponse};
+use super::protocol::{BridgeCommandError, BridgeRequest, BridgeResponse, BridgeTimeoutError};
 
 /// Default socket read timeout for short, interactive commands, in seconds.
 ///
@@ -208,14 +208,11 @@ impl BridgeClient {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                anyhow::bail!(
-                    "Bridge did not respond within {}s while running '{}' — the program job is \
-                     still queued or running. Inspect `ghidra jobs`, raise the wait via \
-                     GHIDRA_CLI_READ_TIMEOUT (seconds; 0 = wait indefinitely), or use \
-                     GHIDRA_CLI_OP_TIMEOUT for long analyze/import operations.",
-                    read_timeout.map(|d| d.as_secs()).unwrap_or(0),
-                    command
-                )
+                return Err(BridgeTimeoutError {
+                    command: command.to_string(),
+                    timeout_secs: read_timeout.map(|d| d.as_secs()).unwrap_or(0),
+                }
+                .into())
             }
             Err(e) => return Err(e.into()),
         }
