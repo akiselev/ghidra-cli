@@ -525,9 +525,9 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
             // hang-proof cases (see docs/plans/prescript-fix.md §3.3):
             //   1. Bridge already running    -> TCP import into the live project.
             //   2. Project exists, no bridge -> fast launch (Project mode), TCP import.
-            //   3. Brand-new project         -> bootstrap via `-import -noanalysis`
-            //      (only `-import` can create a project; analysis is skipped at
-            //      launch and driven over TCP below).
+            //   3. Brand-new project         -> bootstrap via `-import`
+            //      (only `-import` can create a project; it analyzes and persists
+            //      the program durably, so query sessions see the functions).
             // The launch is bounded (the bridge binds its socket before analysis);
             // analysis afterwards runs as an unbounded TCP operation.
             let (client, program_name) =

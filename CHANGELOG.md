@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Imported programs are now durably analyzed** — the one-shot project
+  bootstrap (`analyzeHeadless -import`) no longer passes `-noanalysis`. The
+  import previously skipped analysis at launch and relied on the bridge's
+  best-effort `program.save()` after a TCP `analyze`; that save silently
+  swallows failures, so a fresh session saw the imported program as
+  un-analyzed (`analyzed:false`, `function_count:0`) even though import
+  reported "Analysis complete", and `function list`/`decompile` returned
+  nothing. Analyzing inside the one-shot import is persisted by
+  `analyzeHeadless` on exit, so query sessions see the functions.
+
 ## [0.2.2]
 
 ### Added
