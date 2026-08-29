@@ -310,9 +310,18 @@ fn apply_java_home(cmd: &mut Command, ghidra_install_dir: &Path) {
 /// the persistent bridge with `-import` (which holds the imported program inside
 /// HeadlessAnalyzer's transaction for the bridge's whole life and only commits
 /// it during teardown — a commit we then race by killing the JVM), this run
-/// imports, saves, commits the project, and exits on its own. The persistent
-/// bridge can then open the already-committed program in `-process` mode, where
-/// saves are durable and no teardown commit is required.
+/// imports, ANALYZES, saves, commits the project, and exits on its own. The
+/// persistent bridge can then open the already-committed, already-analyzed
+/// program in `-process` mode, where saves are durable and no teardown commit
+/// is required.
+///
+/// Analysis happens HERE — in the one-shot run — not over TCP after the bridge
+/// starts. Previously the run passed `-noanalysis` and relied on the bridge's
+/// `program.save()` after a TCP `analyze`; that save is best-effort and
+/// silently swallows failures, so a fresh session saw an un-analyzed program
+/// (0 functions) even though import reported "Analysis complete". Analyzing in
+/// the one-shot import is persisted by `analyzeHeadless` on exit and is immune
+/// to that failure mode.
 pub fn import_oneshot(
     project_path: &Path,
     binary_path: &Path,
@@ -340,7 +349,6 @@ pub fn import_oneshot(
         .arg(&ghidra_project_name)
         .arg("-import")
         .arg(binary_path)
-        .arg("-noanalysis")
         .arg("-overwrite");
 
     apply_java_home(&mut cmd, ghidra_install_dir);
