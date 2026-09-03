@@ -1,3 +1,19 @@
+ghidra-cli project attribution
+
+This repository is based on:
+  https://github.com/akiselev/ghidra-cli
+
+It incorporates modifications from:
+  https://github.com/electricazimuth/ghidra-cli
+
+The electricazimuth-derived changes incorporated here are based on the
+downstream work through commit b41a2458f4eab39aea4552db95173e4fafc7afc7.
+
+The project is distributed under the GNU General Public License, version 3.
+The GNU GPL v3 license text below is reproduced verbatim.
+
+===============================================================================
+
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007
 

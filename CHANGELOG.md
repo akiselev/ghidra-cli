@@ -22,6 +22,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `operands`) with any-element semantics: `tags ~ 'crypto'` matches if any
   element matches; `tags != 'x'` means NO element equals `x`. Previously such
   filters silently matched nothing.
+- `ghidra disasm-at ADDRESS [--count N]` — disassemble at an address,
+  disassembling first if no instruction is there yet, and report whether an
+  instruction actually landed there (`ok`/`landed`), since `disassemble()` can
+  report success with nothing landing at the target.
+- `ghidra function create ADDRESS [NAME]` now auto-disassembles at the target
+  first if no instruction exists there, instead of failing outright.
+- `ghidra clear START:END [--to-data] [--disasm-at ADDR]` — clear code units
+  overlapping a range (undoes auto-analysis that mis-disassembled through
+  inline data), optionally re-disassembling at a precise address in the same
+  call.
+- `ghidra function set-noreturn TARGET [--value true|false]` — mark a function
+  as never returning to its call site. `no_return` and `tags` are now included
+  in `function get`/`function list` output.
+- `ghidra function tag add/remove/list TARGET TAG_NAME` and
+  `ghidra function list --tag TAG_NAME` — native function tagging
+  (Ghidra's `FunctionTagManager`/`Function.addTag`), replacing the
+  `[subsys:name]` PLATE-comment convention some projects used as a workaround.
+- `ghidra script run -` reads Java source from stdin for one-off scripts
+  (staged to a temp file and compiled through the same path as a file on
+  disk), so a throwaway snippet no longer needs a checked-in file.
+  `ghidra doctor` now documents why `script python`/`script java` (inline
+  eval) stay disabled.
+- `ghidra type apply ADDRESS TYPE --force` (alias `--clear-conflicting`)
+  clears a conflicting data unit first instead of failing on it.
+- `ghidra comment set ADDRESS --stdin` / `--text-file PATH` read comment text
+  outside the shell argument, avoiding silent corruption from shell
+  metacharacter expansion (e.g. backticks) in free-form prose.
+- Structured error detail for three previously-opaque failures — `function
+  create` on an address already owned by another function (owner
+  name/entry/size), `function create` when `createFunction` returns `null` or
+  throws (diagnoses no-instruction vs. inside-existing-function vs.
+  mid-code-unit causes), and `type apply` "Conflicting data exists" (the
+  conflicting unit's kind/type/range). Printed as JSON with `-vv`/`--json`.
+- `ghidra program save` — flushes pending changes (rename/comment/patch/
+  type/symbol/tag ops, etc.) to disk so the Ghidra GUI or a fresh bridge can
+  see them. The bridge cannot save in place while running (Ghidra's headless
+  script-execution harness holds a transaction open for its whole lifetime),
+  so this stops and immediately restarts the bridge against the same
+  program. `ghidra stop` also persists (without restarting); `program close`
+  no longer attempts an in-place save it can't perform — a response `note`
+  now says so explicitly instead of silently discarding the intent.
 
 - **Responsive control plane with a real job queue.** Socket handling is now split
   from Ghidra program execution. `ping`, `status`, `bridge_info`, `jobs`, and
@@ -70,6 +111,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EOL`). The client sent the type under key `type` while the bridge read
   `comment_type`; the client now sends `comment_type` and the bridge still
   accepts the old key as a fallback.
+- `ghidra script run` no longer fails intermittently with "Failed to get OSGi
+  bundle containing script" for `.java` scripts. Two bugs compounded: the
+  bridge resolved the target script through `GhidraScriptUtil`'s ambiguous
+  "first registered ancestor directory" bundle lookup instead of the exact
+  bundle it had just registered, so an unrelated, broader script directory
+  registered earlier (e.g. from another project) could shadow it; and a
+  reflective `Class.forName()` call with a literal class-name string caused
+  the bnd OSGi analyzer to add an unwireable `Import-Package` to the bridge's
+  own bundle, breaking bridge startup outright. `script run` now builds and
+  loads the class from the exact bundle it resolved for the script's
+  directory.
+- `symbol rename`/`symbol delete NAME` no longer silently mutate every symbol
+  in the program sharing `NAME` (Ghidra reuses auto-generated names like
+  `caseD_XX`/`LAB_XXXX` across unrelated addresses). Both now require
+  `--address`/`--filter` to disambiguate a name shared by more than one
+  symbol, or `--all` to explicitly opt into affecting every match; `symbol
+  delete --filter` now actually scopes the deletion instead of being silently
+  ignored.
+- `type create` now rejects a value that isn't a bare identifier (e.g.
+  `type create "struct Foo {}"`) instead of silently creating a type
+  literally named after the whole unparsed string. It only ever creates an
+  empty struct — build fields afterward with `type add-field`.
+- `--filter "address = '0xADDR'"` (quoted, `0x`-prefixed) now matches the
+  same symbol as `--filter "address = 'ADDR'"`. Address-shaped filter fields
+  (`address`, `entry_point`, `from`, `to`, `min_address`, `max_address`)
+  tolerate an optional `0x`/`0X` prefix on the compared value.
+- `function rename OLD NEW --address ADDR` no longer silently ignores
+  `--address`. It now scopes the rename to the function whose entry point is
+  exactly `ADDR`, and errors loudly (instead of renaming an unrelated
+  function) if `OLD` doesn't match the function actually found there. Same
+  root cause as the `symbol rename` fix above: Ghidra reuses auto-generated
+  names across unrelated addresses, so a bare name isn't a safe rename target
+  without `--address`.
+- `memory read ADDR SIZE` no longer fails on overlay-qualified addresses
+  (e.g. `rom20::69f0`) with `Failed to read memory: For input string ...
+  under radix 16`. The address argument now goes through the same
+  `resolveAddress` helper `disasm-at`/`function get`/etc. already use instead
+  of a bare hex parse restricted to the default address space.
+- `clear RANGE` no longer fails to parse overlay-qualified ranges (e.g.
+  `rom1::5512:551d` or `rom1::5512:rom1::551d`) with `Invalid start address:
+  rom1`. `RANGE` was split on the first `:`, which took everything before the
+  `::` bank separator as the whole start address; it now splits on the `:`
+  that actually separates start from end, treating `::` as a unit, and a bare
+  end address inherits the start address's overlay space.
+- A `script run` job that outlives `GHIDRA_CLI_READ_TIMEOUT` no longer prints
+  an error indistinguishable from a real failure. The client giving up on the
+  read is now a distinct `Timeout:`-prefixed message with exit code 75
+  (`EX_TEMPFAIL`), separate from the generic `Error:`/exit 1 used when the
+  bridge actually reports failure — the job itself is unaffected and keeps
+  running server-side (poll it via `ghidra jobs <id>`).
 
 ## [0.2.1]
 

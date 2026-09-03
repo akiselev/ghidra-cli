@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 #[macro_use]
 mod common;
 use common::{
-    ensure_test_project, get_function_address, ghidra,
+    ensure_test_project, get_function_address, get_function_addresses, ghidra,
     helpers::matches_function_name,
     schemas::{DisasmResult, Function, GraphResult, MemoryBlock, StringData, Validate, XRef},
     DaemonTestHarness, GhidraCommand,
@@ -186,6 +186,64 @@ fn test_function_list_filter() {
         "All filtered results should contain 'main'. Got: {:?}",
         functions.iter().map(|f| &f.name).collect::<Vec<_>>()
     );
+}
+
+#[test]
+#[serial]
+fn test_function_list_address_range_filter() {
+    require_ghidra!();
+    let harness = harness();
+
+    // Regression: `address` comes back from the bridge as a hex string
+    // (e.g. "00401000"), never a JSON number. A numeric range filter
+    // against it used to fall through to the evaluator's catch-all
+    // `Ok(false)` for every row -- exit 0, empty result, no error -- instead
+    // of comparing addresses. Derive real bounds from the binary so this
+    // isn't tied to one platform's address layout.
+    let mut addrs: Vec<u64> = get_function_addresses(harness, TEST_PROJECT, TEST_PROGRAM, 50)
+        .iter()
+        .map(|a| {
+            let hex = a.rsplit(':').next().unwrap_or(a);
+            u64::from_str_radix(hex, 16).unwrap_or_else(|e| panic!("bad address {}: {}", a, e))
+        })
+        .collect();
+    addrs.sort_unstable();
+    let lo = addrs[0];
+    let hi = addrs[addrs.len() / 2];
+
+    let filter = format!("address >= 0x{:x} AND address <= 0x{:x}", lo, hi);
+    let result = ghidra(harness)
+        .arg("function")
+        .arg("list")
+        .with_project(TEST_PROJECT, TEST_PROGRAM)
+        .json_format()
+        .arg("--filter")
+        .arg(&filter)
+        .run();
+
+    result.assert_success();
+
+    let functions: Vec<Function> = result.json();
+    assert!(
+        !functions.is_empty(),
+        "Filter '{}' should match at least one function (addresses {}..={})",
+        filter,
+        lo,
+        hi
+    );
+    for f in &functions {
+        let hex = f.address.rsplit(':').next().unwrap_or(&f.address);
+        let addr = u64::from_str_radix(hex, 16)
+            .unwrap_or_else(|e| panic!("bad address {}: {}", f.address, e));
+        assert!(
+            addr >= lo && addr <= hi,
+            "Function {} at {} is outside the filtered range {}..={}",
+            f.name,
+            f.address,
+            lo,
+            hi
+        );
+    }
 }
 
 #[test]

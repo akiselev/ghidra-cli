@@ -60,6 +60,11 @@ fn main() {
         .with(stdout_layer)
         .init();
 
+    // Captured before `cli` is moved into whichever arm handles it below;
+    // needed after the match to decide how verbosely to print error detail.
+    let verbose = cli.verbose;
+    let json_requested = cli.json;
+
     let result = match &cli.command {
         Commands::Setup(_) => {
             // Setup needs async for downloading
@@ -80,7 +85,30 @@ fn main() {
     };
 
     if let Err(e) = result {
+        // A client-side read timeout means the CLI gave up waiting, not that
+        // the job actually failed -- it may still be running server-side and
+        // complete normally after this process exits (see `ghidra jobs`).
+        // Give it a distinguishable prefix and exit code (EX_TEMPFAIL, 75,
+        // from sysexits.h: "temporary failure; user is invited to retry") so
+        // a wrapper script can tell "poll `ghidra jobs` and keep going" apart
+        // from a genuine failure without string-matching stderr.
+        if let Some(timeout) = e.downcast_ref::<ipc::protocol::BridgeTimeoutError>() {
+            eprintln!("Timeout: {}", timeout);
+            std::process::exit(75);
+        }
         eprintln!("Error: {}", e);
+        // Bridge errors that carry structured detail (e.g. the containing
+        // function's name/entry/size on "function already exists", or the
+        // conflicting data unit's type/range on a `type apply` conflict) print
+        // it as JSON so callers can act on it without a follow-up round trip.
+        // Gated to -vv+/--json to keep the common-case error terse.
+        if let Some(bce) = e.downcast_ref::<ipc::protocol::BridgeCommandError>() {
+            if verbose >= 2 || json_requested {
+                if let Ok(pretty) = serde_json::to_string_pretty(&bce.detail) {
+                    eprintln!("Detail: {}", pretty);
+                }
+            }
+        }
         std::process::exit(1);
     }
 }
@@ -109,6 +137,10 @@ fn run_command(cli: Cli) -> anyhow::Result<()> {
         Commands::Config(cmd) => handle_config_command(cmd.clone()),
         Commands::SetDefault(args) => handle_set_default(args.clone()),
         Commands::Project(args) => handle_project_command(args.command.clone()),
+        // Saving means stopping and restarting the bridge, not a single
+        // request/response against an already-running one, so it's handled
+        // before the generic bridge dispatch below.
+        Commands::Program(cli::ProgramCommands::Save(_)) => handle_program_save(cli),
         // Commands requiring bridge
         _ if requires_bridge(&cli.command) => run_with_bridge(cli),
         _ => {
@@ -142,6 +174,8 @@ fn requires_bridge(command: &Commands) -> bool {
             | Commands::Patch(_)
             | Commands::Script(_)
             | Commands::Disasm(_)
+            | Commands::DisasmAt(_)
+            | Commands::Clear(_)
             | Commands::Batch(_)
             | Commands::Stats(_)
             | Commands::Program(_)
@@ -171,6 +205,12 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
             cli::FunctionCommands::SetReturnType(args) => args.project.clone(),
             cli::FunctionCommands::SetCallingConvention(args) => args.project.clone(),
             cli::FunctionCommands::SetVarType(args) => args.project.clone(),
+            cli::FunctionCommands::SetNoReturn(args) => args.project.clone(),
+            cli::FunctionCommands::Tag(cmd) => match cmd {
+                cli::FunctionTagCommands::Add(args) => args.project.clone(),
+                cli::FunctionTagCommands::Remove(args) => args.project.clone(),
+                cli::FunctionTagCommands::List(args) => args.options.project.clone(),
+            },
         },
         Commands::Strings(cmd) => match cmd {
             cli::StringsCommands::List(opts) => opts.project.clone(),
@@ -195,6 +235,8 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
         },
         Commands::Stats(args) => args.options.project.clone(),
         Commands::Disasm(args) => args.options.project.clone(),
+        Commands::DisasmAt(args) => args.project.clone(),
+        Commands::Clear(args) => args.project.clone(),
         Commands::Find(cmd) => match cmd {
             cli::FindCommands::String(args) => args.options.project.clone(),
             cli::FindCommands::Bytes(args) => args.options.project.clone(),
@@ -262,6 +304,7 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
             cli::ProgramCommands::Delete(args) => args.project.clone(),
             cli::ProgramCommands::Info(args) => args.project.clone(),
             cli::ProgramCommands::Export(args) => args.project.clone(),
+            cli::ProgramCommands::Save(args) => args.project.clone(),
         },
         Commands::Diff(cmd) => match cmd {
             cli::DiffCommands::Programs(args) => args.project.clone(),
@@ -296,6 +339,12 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
             cli::FunctionCommands::SetReturnType(args) => args.program.clone(),
             cli::FunctionCommands::SetCallingConvention(args) => args.program.clone(),
             cli::FunctionCommands::SetVarType(args) => args.program.clone(),
+            cli::FunctionCommands::SetNoReturn(args) => args.program.clone(),
+            cli::FunctionCommands::Tag(cmd) => match cmd {
+                cli::FunctionTagCommands::Add(args) => args.program.clone(),
+                cli::FunctionTagCommands::Remove(args) => args.program.clone(),
+                cli::FunctionTagCommands::List(args) => args.options.program.clone(),
+            },
         },
         Commands::Strings(cmd) => match cmd {
             cli::StringsCommands::List(opts) => opts.program.clone(),
@@ -320,6 +369,8 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
         },
         Commands::Stats(args) => args.options.program.clone(),
         Commands::Disasm(args) => args.options.program.clone(),
+        Commands::DisasmAt(args) => args.program.clone(),
+        Commands::Clear(args) => args.program.clone(),
         Commands::Find(cmd) => match cmd {
             cli::FindCommands::String(args) => args.options.program.clone(),
             cli::FindCommands::Bytes(args) => args.options.program.clone(),
@@ -387,6 +438,7 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
             cli::ProgramCommands::Delete(args) => args.program.clone(),
             cli::ProgramCommands::Info(args) => args.program.clone(),
             cli::ProgramCommands::Export(args) => args.program.clone(),
+            cli::ProgramCommands::Save(args) => args.program.clone(),
         },
         Commands::Batch(args) => args.program.clone(),
         Commands::Rename(args) => args.program.clone(),
@@ -421,6 +473,9 @@ fn extract_query_options(command: &Commands) -> Option<QueryOptions> {
             cli::FunctionCommands::Calls(args) => Some(args.options.clone()),
             cli::FunctionCommands::XRefs(args) => Some(args.options.clone()),
             cli::FunctionCommands::Delete(args) => Some(args.options.clone()),
+            cli::FunctionCommands::Tag(cli::FunctionTagCommands::List(args)) => {
+                Some(args.options.clone())
+            }
             _ => None,
         },
         Commands::Strings(cmd) => match cmd {
@@ -851,6 +906,27 @@ fn parse_expect_spec(spec: &str) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
+/// Resolve `comment set`'s text from `--stdin`, `--text-file`, or the TEXT
+/// positional (in that priority order; clap already rejects combining them).
+/// Reading from stdin/a file bypasses the shell entirely, so callers building
+/// comment text programmatically never risk the metacharacter-expansion
+/// corruption a shell argument is exposed to (e.g. backticks silently running
+/// as command substitution before ghidra-cli ever sees the string).
+fn resolve_comment_text(args: &cli::CommentSetArgs) -> anyhow::Result<String> {
+    if args.stdin {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+        Ok(buf)
+    } else if let Some(path) = &args.text_file {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read --text-file {}: {}", path.display(), e))
+    } else {
+        args.text
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("TEXT argument required (or use --stdin / --text-file)"))
+    }
+}
+
 /// The bridge's list handlers only support a literal substring match on the
 /// primary name field, not the full filter DSL implemented client-side in
 /// `query::Filter`. When a full filter expression, sort, or count is requested,
@@ -876,6 +952,89 @@ fn bridge_list_params(
         };
         (limit, filter)
     }
+}
+
+/// Resolve which address(es) a symbol mutation (`symbol rename`/`symbol
+/// delete`) should touch, given the caller's optional `--address`/`--filter`
+/// disambiguators and `--all` opt-in.
+///
+/// Ghidra auto-generates names (`caseD_XX`, `LAB_XXXX`, ...) that are
+/// routinely reused across unrelated addresses program-wide, so a bare name
+/// is never a safe mutation target on its own: without this, `symbol
+/// rename`/`symbol delete` would silently touch every symbol sharing that
+/// name, not just the one address the caller meant. Returns the exact
+/// addresses to pass to the bridge; the bridge enforces the same guard
+/// independently as a second line of defense.
+fn resolve_symbol_addresses(
+    client: &BridgeClient,
+    name: &str,
+    address: Option<&str>,
+    filter_expr: Option<&str>,
+    all: bool,
+) -> anyhow::Result<Vec<String>> {
+    let response = client.symbol_get(name)?;
+    let mut candidates: Vec<serde_json::Value> = response
+        .get("symbols")
+        .and_then(|s| s.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if candidates.is_empty() {
+        anyhow::bail!("Symbol not found: {}", name);
+    }
+
+    if let Some(addr) = address {
+        let normalized = addr
+            .trim()
+            .to_lowercase()
+            .trim_start_matches("0x")
+            .to_string();
+        candidates.retain(|s| {
+            s.get("address")
+                .and_then(|a| a.as_str())
+                .map(|a| a.trim_start_matches("0x").eq_ignore_ascii_case(&normalized))
+                .unwrap_or(false)
+        });
+        if candidates.is_empty() {
+            anyhow::bail!("No symbol named '{}' at address {}", name, addr);
+        }
+    }
+
+    if let Some(expr) = filter_expr {
+        let parsed = filter::Filter::parse(expr).map_err(describe_query_error)?;
+        candidates.retain(|s| parsed.evaluate(s).unwrap_or(false));
+        if candidates.is_empty() {
+            anyhow::bail!("No symbol named '{}' matches filter '{}'", name, expr);
+        }
+    }
+
+    if candidates.len() > 1 && !all {
+        let addrs: Vec<String> = candidates
+            .iter()
+            .map(|s| {
+                s.get("address")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect();
+        anyhow::bail!(
+            "'{}' matches {} symbols at addresses [{}] -- pass --address <ADDR> (or a narrower \
+             --filter) to pick one, or --all to affect every match",
+            name,
+            candidates.len(),
+            addrs.join(", ")
+        );
+    }
+
+    Ok(candidates
+        .into_iter()
+        .filter_map(|s| {
+            s.get("address")
+                .and_then(|a| a.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect())
 }
 
 /// Execute a command via the bridge client.
@@ -969,6 +1128,7 @@ fn execute_via_bridge(
                     Some(json!({
                         "old_name": args.old_name,
                         "new_name": args.new_name,
+                        "address": args.address,
                     })),
                 ),
                 FunctionCommands::Create(args) => client.send_command(
@@ -1013,6 +1173,23 @@ fn execute_via_bridge(
                         "type_name": args.type_name,
                     })),
                 ),
+                FunctionCommands::SetNoReturn(args) => {
+                    client.function_set_noreturn(args.resolved_target(), args.value)
+                }
+                FunctionCommands::Tag(cmd) => {
+                    use cli::FunctionTagCommands;
+                    match cmd {
+                        FunctionTagCommands::Add(args) => {
+                            client.function_tag_add(&args.target, &args.tag_name)
+                        }
+                        FunctionTagCommands::Remove(args) => {
+                            client.function_tag_remove(&args.target, &args.tag_name)
+                        }
+                        FunctionTagCommands::List(args) => {
+                            client.function_tag_list(args.target.as_deref())
+                        }
+                    }
+                }
             }
         }
         Commands::Strings(cmd) => {
@@ -1121,6 +1298,13 @@ fn execute_via_bridge(
                 ProgramCommands::Export(args) => {
                     client.program_export(&args.format, args.output.as_deref())
                 }
+                // ProgramCommands::Save is intercepted in `run_command` before
+                // reaching here: saving means stopping and restarting the
+                // bridge (see `handle_program_save`), not a single request to
+                // an already-running one.
+                ProgramCommands::Save(_) => unreachable!(
+                    "program save is handled by handle_program_save before run_with_bridge"
+                ),
             }
         }
         Commands::Symbol(cmd) => {
@@ -1139,9 +1323,25 @@ fn execute_via_bridge(
                 }
                 SymbolCommands::Get(args) => client.symbol_get(&args.name),
                 SymbolCommands::Create(args) => client.symbol_create(&args.address, &args.name),
-                SymbolCommands::Delete(args) => client.symbol_delete(&args.name),
+                SymbolCommands::Delete(args) => {
+                    let addresses = resolve_symbol_addresses(
+                        client,
+                        &args.name,
+                        args.address.as_deref(),
+                        args.options.filter.as_deref(),
+                        args.all,
+                    )?;
+                    client.symbol_delete(&args.name, &addresses)
+                }
                 SymbolCommands::Rename(args) => {
-                    client.symbol_rename(&args.old_name, &args.new_name)
+                    let addresses = resolve_symbol_addresses(
+                        client,
+                        &args.old_name,
+                        args.address.as_deref(),
+                        args.filter.as_deref(),
+                        args.all,
+                    )?;
+                    client.symbol_rename(&args.old_name, &args.new_name, &addresses)
                 }
             }
         }
@@ -1161,7 +1361,9 @@ fn execute_via_bridge(
                 }
                 TypeCommands::Get(args) => client.type_get(&args.name),
                 TypeCommands::Create(args) => client.type_create(&args.definition),
-                TypeCommands::Apply(args) => client.type_apply(&args.address, &args.type_name),
+                TypeCommands::Apply(args) => {
+                    client.type_apply_force(&args.address, &args.type_name, args.force)
+                }
                 TypeCommands::Delete(args) => {
                     client.send_command("type_delete", Some(json!({"name": args.name})))
                 }
@@ -1277,7 +1479,8 @@ fn execute_via_bridge(
                 }
                 CommentCommands::Get(args) => client.comment_get(&args.address),
                 CommentCommands::Set(args) => {
-                    client.comment_set(&args.address, &args.text, args.comment_type.as_deref())
+                    let text = resolve_comment_text(args)?;
+                    client.comment_set(&args.address, &text, args.comment_type.as_deref())
                 }
                 CommentCommands::Delete(args) => client.comment_delete(&args.address),
             }
@@ -1327,16 +1530,26 @@ fn execute_via_bridge(
             use cli::ScriptCommands;
             match cmd {
                 ScriptCommands::Run(args) => {
-                    // Canonicalize client-side so the bridge receives an absolute
-                    // path independent of the working directory its JVM inherited.
-                    // Fall back to the raw path if the file is missing; the bridge
-                    // then reports a clear "Script not found".
-                    let path = std::fs::canonicalize(&args.script_path)
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| args.script_path.clone());
                     let expect: Vec<serde_json::Value> =
                         args.expect.iter().map(|s| parse_expect_spec(s)).collect();
-                    client.script_run(&path, &args.args, &expect, args.allow_empty)
+                    if args.script_path == "-" {
+                        // Read a one-off script's Java source from stdin so a
+                        // throwaway snippet doesn't need a checked-in file; the
+                        // bridge stages it to a temp file and runs it through the
+                        // same compile/execute path as `script run PATH`.
+                        let mut source = String::new();
+                        std::io::Read::read_to_string(&mut std::io::stdin(), &mut source)?;
+                        client.script_run_source(&source, &args.args, &expect, args.allow_empty)
+                    } else {
+                        // Canonicalize client-side so the bridge receives an absolute
+                        // path independent of the working directory its JVM inherited.
+                        // Fall back to the raw path if the file is missing; the bridge
+                        // then reports a clear "Script not found".
+                        let path = std::fs::canonicalize(&args.script_path)
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| args.script_path.clone());
+                        client.script_run(&path, &args.args, &expect, args.allow_empty)
+                    }
                 }
                 ScriptCommands::Python(args) => client.script_python(&args.code),
                 ScriptCommands::Java(args) => client.script_java(&args.code),
@@ -1344,6 +1557,18 @@ fn execute_via_bridge(
             }
         }
         Commands::Disasm(args) => client.disasm(args.resolved_target(), args.num_instructions),
+        Commands::DisasmAt(args) => client.disasm_at(&args.address, args.count),
+        Commands::Clear(args) => {
+            let (start, end) = split_range(&args.range).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid range '{}': expected START:END, e.g. 0bf3:0bfa \
+                     (overlay addresses are supported, e.g. rom1::5512:551d or \
+                     rom1::5512:rom1::551d)",
+                    args.range
+                )
+            })?;
+            client.clear_range(&start, &end, args.disasm_at.as_deref())
+        }
         Commands::Batch(args) => {
             // Read batch file and execute each command locally
             let content = std::fs::read_to_string(&args.script_file)
@@ -1376,7 +1601,16 @@ fn execute_via_bridge(
             }))
         }
         Commands::Stats(_) => client.stats(),
-        Commands::Rename(args) => client.symbol_rename(&args.old_name, &args.new_name),
+        Commands::Rename(args) => {
+            let addresses = resolve_symbol_addresses(
+                client,
+                &args.old_name,
+                args.address.as_deref(),
+                args.filter.as_deref(),
+                args.all,
+            )?;
+            client.symbol_rename(&args.old_name, &args.new_name, &addresses)
+        }
         _ => anyhow::bail!("Command not supported"),
     }
 }
@@ -1486,6 +1720,144 @@ fn handle_bridge_stop(
     }
 
     Ok(())
+}
+
+/// `ghidra program save`: flush pending changes to disk.
+///
+/// The bridge cannot save in place while it keeps running: Ghidra's headless
+/// script-execution harness holds its own transaction open for the whole
+/// life of the postScript (confirmed empirically -- `currentProgram.save()`
+/// always fails with "Unable to lock due to active transaction", even with
+/// zero pending edits), so nothing short of the process actually exiting
+/// commits to disk. A clean `ghidra stop` already does that; this wraps
+/// exactly that stop with an immediate restart against the same program, so
+/// a "save" reads as a few seconds of downtime rather than losing the
+/// session. Every write command (rename, comment, patch, type/symbol/tag
+/// ops) is only visible to the Ghidra GUI, or a fresh bridge, after this
+/// (or `ghidra stop`) has run.
+fn handle_program_save(cli: Cli) -> anyhow::Result<()> {
+    let Commands::Program(cli::ProgramCommands::Save(args)) = &cli.command else {
+        unreachable!("handle_program_save dispatched for a non-Save Program command");
+    };
+    let project = args.project.clone().or_else(|| cli.project.clone());
+    let mut program = args.program.clone().or_else(|| cli.program.clone());
+    let projects_dir = cli.projects_dir.clone();
+
+    let config = load_config(&projects_dir)?;
+    let project_path = resolve_project_path(&project, &config)?;
+
+    let port = match bridge::is_bridge_running(&project_path) {
+        Some(port) => port,
+        None => {
+            println!(
+                "No bridge running for project: {} — nothing pending to save.",
+                project_path.display()
+            );
+            return Ok(());
+        }
+    };
+
+    // Reopen the same program on restart even if the caller didn't pass
+    // --program, by asking the (still-running, for a moment longer) bridge
+    // what it currently has open. While we're connected, also snapshot a
+    // cheap invariant (function count) so we can prove the save actually
+    // took, rather than trusting the restart to have worked.
+    let mut expected_function_count: Option<i64> = None;
+    {
+        let client = BridgeClient::new(port);
+        if program.is_none() {
+            if let Ok(info) = client.bridge_info() {
+                program = info
+                    .get("current_program")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+        }
+        if let Ok(info) = client.program_info() {
+            expected_function_count = info.get("function_count").and_then(|v| v.as_i64());
+        }
+    }
+
+    println!("Saving: stopping the bridge to flush pending changes to disk...");
+    handle_bridge_stop(project.clone(), &projects_dir)?;
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    handle_bridge_start(project.clone(), program, &projects_dir)?;
+
+    // Verify the restart actually reflects what was pending, instead of
+    // trusting a clean restart to mean a clean save. A mismatch here means
+    // the underlying Ghidra transaction was rolled back on shutdown (e.g. a
+    // handled error earlier in the session aborted a nested sub-transaction,
+    // which silently discards the whole session's changes) -- fail loudly
+    // rather than printing "Saved" over a reverted program.
+    if let Some(expected) = expected_function_count {
+        let new_port = bridge::is_bridge_running(&project_path);
+        let actual = new_port.and_then(|p| {
+            BridgeClient::new(p)
+                .program_info()
+                .ok()
+                .and_then(|info| info.get("function_count").and_then(|v| v.as_i64()))
+        });
+
+        match actual {
+            Some(actual) if actual == expected => {
+                println!("Saved (bridge restarted, function count verified: {}).", actual);
+            }
+            Some(actual) => {
+                anyhow::bail!(
+                    "Save verification FAILED: function count before save was {}, but is {} \
+                     after restart. The bridge restarted cleanly but Ghidra rolled back pending \
+                     changes on shutdown -- this save did NOT persist your edits. Re-check state \
+                     with `ghidra function list --count` and `ghidra program save` again; if this \
+                     persists, checkpoint in smaller batches.",
+                    expected,
+                    actual
+                );
+            }
+            None => {
+                anyhow::bail!(
+                    "Save verification FAILED: could not query the restarted bridge to confirm \
+                     the save took (expected function count was {}). Check `ghidra status` before \
+                     trusting this save.",
+                    expected
+                );
+            }
+        }
+    } else {
+        println!("Saved (bridge restarted).");
+    }
+    Ok(())
+}
+
+/// Split a `clear` RANGE argument into (start, end) addresses, treating `::`
+/// (the overlay-space separator, e.g. `rom20::69f0`) as a single unit rather
+/// than a split point -- a bare `split_once(':')` breaks on it, taking
+/// everything before the first `:` (just the overlay space name) as the
+/// whole start address.
+///
+/// If only the start address carries an overlay-space prefix and the end
+/// address is bare (e.g. `rom1::5512:551d`), the end address inherits the
+/// start's space (`rom1::551d`) rather than resolving in the default space.
+fn split_range(range: &str) -> Option<(String, String)> {
+    let bytes = range.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b':' {
+                i += 2;
+                continue;
+            }
+            let start = &range[..i];
+            let end = &range[i + 1..];
+            return Some(match start.split_once("::") {
+                Some((space, _)) if !end.contains("::") && !end.is_empty() => {
+                    (start.to_string(), format!("{}::{}", space, end))
+                }
+                _ => (start.to_string(), end.to_string()),
+            });
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Get bridge status for a project.
@@ -1930,6 +2302,15 @@ fn handle_doctor(projects_dir: &Option<PathBuf>) -> anyhow::Result<()> {
         }
     }
 
+    println!("\nScript execution modes:");
+    println!("  `ghidra script run PATH`  — compiles & runs a file on disk");
+    println!("  `ghidra script run -`     — reads Java source from stdin for one-offs;");
+    println!("                              staged to a temp file, same compile/execute path as PATH");
+    println!("  `ghidra script python/java <code>` — disabled by design, not a bug: every script,");
+    println!("                              including one-offs, is required to go through Ghidra's");
+    println!("                              normal script bundle/compile gate rather than a second,");
+    println!("                              less-sandboxed eval path. Use `script run -` instead.");
+
     println!("\nDone!");
     Ok(())
 }
@@ -2267,6 +2648,47 @@ fn resolve_project_path(project: &Option<String>, config: &Config) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_range_plain_addresses() {
+        assert_eq!(
+            split_range("0bf3:0bfa"),
+            Some(("0bf3".to_string(), "0bfa".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_range_overlay_start_bare_end_inherits_space() {
+        // ghidra-bug.md: naive split_once(':') took "rom1" as the whole start
+        // address; the correct split is on the ':' after the overlay prefix,
+        // and the bare end address inherits the start's overlay space.
+        assert_eq!(
+            split_range("rom1::5512:551d"),
+            Some(("rom1::5512".to_string(), "rom1::551d".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_range_overlay_both_sides_qualified() {
+        assert_eq!(
+            split_range("rom1::5512:rom1::551d"),
+            Some(("rom1::5512".to_string(), "rom1::551d".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_range_overlay_end_in_different_space() {
+        assert_eq!(
+            split_range("rom1::5512:rom2::551d"),
+            Some(("rom1::5512".to_string(), "rom2::551d".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_range_missing_colon_is_none() {
+        assert_eq!(split_range("rom1::5512"), None);
+        assert_eq!(split_range("0bf3"), None);
+    }
 
     #[test]
     fn bridge_list_params_limit_zero_means_unlimited() {

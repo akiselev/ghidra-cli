@@ -104,7 +104,16 @@ ghidra program close [--project P]
 ghidra program delete --program PROG [--project P]
 ghidra program info [--project P]
 ghidra program export FORMAT [--project P] [-o OUTPUT]   # FORMAT: json, xml, c/cpp, binary/bin, gzf, ascii/asm, hex, html
+ghidra program save [--program PROG] [--project P]
 ```
+
+**Persistence gotcha**: while the bridge is running, every write command (rename, comment, patch, type/symbol/tag ops, `function create`, etc.) only commits an in-memory Ghidra transaction — it is *not* written to the project's `.rep` folder on disk. The bridge auto-saves after `analyze` completes and when `program open` switches to a different program, but nothing else. This means the Ghidra GUI (which reads straight from disk) won't see pending CLI changes, and — more importantly — `program close` does **not** persist them either; only the bridge process actually exiting does (Ghidra's headless script-execution harness holds an outer transaction open for the bridge's whole lifetime, so an in-place save always fails with "Unable to lock due to active transaction", confirmed empirically). `ghidra program save` gets a real flush by stopping and immediately restarting the bridge against the same program (a few seconds of downtime); `ghidra stop` does the same without restarting. Run one of the two before opening the project in the GUI, or before relying on changes surviving a bridge crash.
+
+**`program save`'s reported success is not fully trustworthy at scale — verify, don't trust, and save incrementally.** Empirically (gb-tennis-cli recovery session): running ~700 uncommitted mutations (renames/comments/symbols) in one long unattended batch, then calling `ghidra program save` once at the end, printed `"Saved (bridge restarted)"` but the reopened project came back with the *original* pre-batch state (function count and comment count both reverted) — total silent data loss despite a success message. Immediately after, the exact same workflow but checkpointed every ~50-60 mutations (`program save` after each small batch, with a `function list --count` check right after each restart) held cleanly across 10+ consecutive checkpoints with zero loss. Root cause not confirmed (plausibly tied to an unrelated crashed process from the failed run rather than batch size itself, but not proven either way) — until it is, treat large uncommitted batches as risky and adopt this pattern for any bulk scripted editing session:
+1. Batch mutations in modest chunks (tens, not hundreds).
+2. Call `ghidra program save` after each chunk.
+3. Immediately re-check state after the restart (`ghidra function list --count`, spot-check a known comment/rename) — don't just trust the "Saved" message text.
+4. If a checkpoint's count doesn't match what's expected, stop and investigate before piling on more work over a possibly-reverted base.
 
 ### Function Operations
 
@@ -122,14 +131,39 @@ ghidra function set-signature TARGET --signature "int foo(int x, char *y)" [--pr
 ghidra function set-return-type TARGET --type TYPE [--project P] [--program PROG]
 ghidra function set-calling-convention TARGET --convention CC [--project P] [--program PROG]
 ghidra function set-var-type TARGET --var VARNAME --type TYPE [--project P] [--program PROG]
+ghidra function set-noreturn TARGET [--value true|false] [--project P] [--program PROG]
+ghidra function tag add TARGET TAG_NAME [--project P] [--program PROG]
+ghidra function tag remove TARGET TAG_NAME [--project P] [--program PROG]
+ghidra function tag list [TARGET] [QUERY_OPTS]   # tags on one function, or every tag definition
+ghidra function list --tag TAG_NAME [QUERY_OPTS] # filter by tag
 ```
+
+`function create` auto-disassembles at ADDRESS first if no instruction is there yet — no need to call `disasm-at` first in the common case. `function get`/`function list` output includes `no_return` and `tags` fields.
+
+If `function create` fails, the error carries structured detail (visible with `-vv` or `--json`): an "already exists" error includes the containing function's `name`/`entry_point`/`size`; a `createFunction` rejection includes `has_instruction_at_entry`, `containing_function`, `code_unit_range`, and (if Ghidra threw rather than returned null) `ghidra_exception`.
+
+**`function create`'s auto-disassemble path can still fail even when every precondition looks satisfied, and the failure can be intermittent rather than deterministic.** Confirmed on a completely untouched Game Boy ROM address (`0x3100`): the response showed `auto_disassembled_attempted: true`, `has_instruction_at_entry: true`, `code_unit_is_instruction: true` — a real, valid instruction was disassembled — yet `createFunction()` still threw "Function body must contain the entrypoint". This is not limited to one historically-cursed address either: it hit multiple fresh addresses in the same session. Retrying the *identical* call later (same address, no changes in between) sometimes succeeded on the second attempt with no intervention — so a single failure here does not reliably mean the address is permanently uncreatable. Two things worth doing before giving up on an address:
+- Retry the same `function create` call once or twice.
+- If it keeps failing, fall back to a `script run` script that calls Ghidra's `disassemble()`/`createFunction()` API directly (see `tools/ghidra-scripts/MakeFunctions.java` in this repo for a working example) — this workaround succeeded on every address tested where the native CLI command failed, including ones that had failed repeatedly via the CLI across multiple prior sessions.
+
+**`function rename OLD NEW` can silently rename the wrong function if `OLD` doesn't exist as an independent function's exact entry point.** When `OLD` (e.g. an address-derived name like `FUN_1234`) doesn't resolve to a function whose entry point is exactly that address — because the address is actually inside another function's body (the "shared/fallthrough code" pattern Ghidra's function-boundary model allows, where a `JP`/`JR` target lands mid-function rather than at a real boundary) — the command does not error. Instead it silently renamed the *containing* function to the new name, discarding its correct original name. This corrupted several real function names during a bulk recovery replay before being caught by an independent diff against expected names. Before renaming anything derived from an address rather than a known-good current name, verify first:
+```bash
+ghidra function get 0xADDR --json   # check the returned "entry_point" against ADDR
+```
+If `entry_point` matches `ADDR` exactly, `function rename` is safe. If it doesn't match (the address is inside a different, larger function), use `ghidra symbol create 0xADDR NAME` instead to label the address without touching the containing function's name.
 
 ### Top-level Shortcuts
 
 ```bash
 ghidra decompile TARGET [--with-vars] [--with-params] [QUERY_OPTS]   # aliases: decomp, dec
 ghidra disasm TARGET [-n COUNT] [QUERY_OPTS]   # TARGET = name or 0xADDRESS; aliases: disassemble, dis
+ghidra disasm-at ADDRESS [--count N] [--project P] [--program PROG]
+ghidra clear START:END [--to-data] [--disasm-at ADDR] [--project P] [--program PROG]
 ```
+
+`disasm-at` disassembles at ADDRESS if nothing is there yet (the common case for computed-jump targets static analysis never reached) and reports `ok`/`landed` booleans plus the resulting instructions — check `landed`, not just `ok`: `disassemble()` can report success with no instruction actually at the target.
+
+`clear` wraps `clearCodeUnits` for stale/wrong instructions (e.g. auto-analysis linearly disassembled through inline data): `clear START:END --to-data` clears and leaves the range as undefined data; `clear START:END --disasm-at ADDR` clears then immediately re-disassembles at a precise address in one call, reporting `ok`/`landed` the same way as `disasm-at`.
 
 `--with-vars` includes local variable details (name, type, storage) in the response.
 `--with-params` includes parameter details (name, type, storage) in the response.
@@ -148,9 +182,11 @@ ghidra strings refs STRING [QUERY_OPTS]     # xrefs to string
 ghidra symbol list [QUERY_OPTS]             # aliases: sym, symbols
 ghidra symbol get NAME [QUERY_OPTS]
 ghidra symbol create ADDRESS NAME [--project P] [--program PROG]
-ghidra symbol delete NAME [QUERY_OPTS]
-ghidra symbol rename OLD NEW [--project P] [--program PROG]
+ghidra symbol delete NAME [--address ADDR] [--all] [QUERY_OPTS]
+ghidra symbol rename OLD NEW [--address ADDR] [--all] [--filter EXPR] [--project P] [--program PROG]
 ```
+
+Ghidra auto-generates names (`caseD_XX`, `LAB_XXXX`, ...) that are commonly reused across unrelated addresses program-wide. Because of this, `symbol delete`/`symbol rename` refuse to guess when `NAME`/`OLD` matches more than one symbol: pass `--address 0xADDR` (or `--filter`, e.g. `--filter 'address=0xc200'`) to pick the one you mean, or `--all` to explicitly affect every match. A name matching exactly one symbol needs no disambiguation.
 
 ### Memory Operations
 
@@ -176,8 +212,8 @@ ghidra x-ref list TARGET [QUERY_OPTS]   # refs both to and from the target
 ```bash
 ghidra type list [QUERY_OPTS]               # alias: types  (includes "kind" field: struct/union/enum/typedef/pointer/array/other)
 ghidra type get NAME [QUERY_OPTS]           # shows struct fields, enum members, typedef base type, kind
-ghidra type create DEFINITION [--project P] [--program PROG]        # create empty struct
-ghidra type apply ADDRESS TYPE_NAME [--project P] [--program PROG]
+ghidra type create NAME [--project P] [--program PROG]              # create empty struct (bare identifier only, NOT a C struct definition -- use `type add-field` to build it)
+ghidra type apply ADDRESS TYPE_NAME [--force] [--project P] [--program PROG]  # --force/--clear-conflicting clears a conflicting data unit first
 ghidra type delete NAME [--project P] [--program PROG]              # alias: rm
 ghidra type rename OLD NEW [--project P] [--program PROG]           # alias: mv
 ghidra type create-enum NAME --values "A=0,B=1,C=2" [--size 4] [--project P] [--program PROG]
@@ -246,6 +282,7 @@ ghidra function list --tag network --filter "size > 200" --fields name,address,t
 ghidra function list --untagged --limit 20   # what's left to triage
 ghidra tag remove parse_packet wip
 ```
+A `type apply` "Conflicting data exists" error carries structured detail (`-vv`/`--json`): the conflicting unit's kind (instruction/data), type name, and address range. Pass `--force` to clear it and retry in one call instead of a manual `clear` first.
 
 ### Comment Operations
 
@@ -253,10 +290,14 @@ ghidra tag remove parse_packet wip
 ghidra comment list [QUERY_OPTS]            # alias: comments
 ghidra comment get ADDRESS [QUERY_OPTS]
 ghidra comment set ADDRESS TEXT [--comment-type TYPE] [--project P] [--program PROG]
+ghidra comment set ADDRESS --stdin [--comment-type TYPE] [--project P] [--program PROG]         # read text from stdin
+ghidra comment set ADDRESS --text-file PATH [--comment-type TYPE] [--project P] [--program PROG] # read text from a file
 ghidra comment delete ADDRESS [QUERY_OPTS]
 ```
 
 `--comment-type` takes `EOL` (default), `PRE`, `POST`, or `PLATE`.
+
+Prefer `--stdin`/`--text-file` over a TEXT shell argument for anything programmatically generated: a shell argument is subject to metacharacter expansion (backticks, `$…`) *before* ghidra-cli ever sees the string, which can silently corrupt the comment while `comment set` still reports success. `--stdin`/`--text-file` bypass the shell entirely.
 
 ### Search / Find
 
@@ -308,12 +349,17 @@ ghidra patch export -o OUTPUT [--project P] [--program PROG]
 
 ```bash
 ghidra script run PATH [--expect PATH[:MIN_ROWS]]... [--allow-empty] [--project P] [--program PROG] [-- ARGS...]
-ghidra script python CODE [--project P] [--program PROG]
-ghidra script java CODE [--project P] [--program PROG]
+ghidra script run - [-- ARGS...] < script.java   # read Java source from stdin for a one-off
+ghidra script python CODE [--project P] [--program PROG]   # disabled by design; use `script run -`
+ghidra script java CODE [--project P] [--program PROG]     # disabled by design; use `script run -`
 ghidra script list
 ```
 
 `script run` resolves PATH to an absolute location, forwards the args after `--` to the script as real positional arguments, and captures stdout in the response (`{script, path, stdout, args}`). `--expect PATH[:MIN_ROWS]` (repeatable) fails the job if that artifact is missing, empty, or below MIN_ROWS; `--allow-empty` lets an expected artifact exist while empty. Scripts run on the cancellable job lane, so `ghidra cancel` works on them.
+
+`script run -` reads a `public class <Name> extends GhidraScript { ... }` body from stdin for a throwaway one-off that doesn't warrant a checked-in file — it's staged to a temp file server-side and compiled through the exact same path as `script run PATH`. `script python`/`script java` (true inline eval) stay disabled on purpose (see `ghidra doctor`): every script is required to go through Ghidra's normal compile gate rather than a second, less-sandboxed eval path.
+
+**Put `--json`/`--pretty`/other global flags *before* the subcommand when using `script run -- ARGS`.** Everything after `--` is forwarded verbatim to the script as positional args — `ghidra script run PATH -- addr1 addr2 --json` passes the literal string `--json` as a third script argument, not as a CLI flag, which broke a script that tried to parse every arg as a hex address (`For input string: "--json" under radix 16`). Use `ghidra --json script run PATH -- addr1 addr2` instead.
 
 ### Batch
 
@@ -449,6 +495,12 @@ ghidra set-default project myproject
 ghidra set-default program mybinary
 # Now: ghidra function list  (no flags needed)
 ```
+
+### 5. Save Incrementally, Verify Don't Trust
+
+For any session doing more than a handful of write operations (bulk renames, scripted recovery/replay, batch comment annotation): checkpoint with `ghidra program save` every few dozen mutations rather than once at the end, and re-verify actual state after each save (`function list --count`, a spot-check `function get`/`comment get` on something just changed) instead of trusting the command's printed "Saved" status. See the Persistence gotcha note under Program Management — a single large uncommitted batch was silently lost in full despite a successful-looking save, while the same work checkpointed in small chunks was not. This matters most for scripted/agent-driven bulk edits, where nothing stops until someone checks.
+
+For any workflow that reconstructs known state programmatically (e.g. replaying a log of past commands, bulk-importing names from documentation), don't just trust that each individual command reported success — after the run, independently diff the *actual* resulting state (`function list --fields name,address`) against the expected mapping. `function rename`'s silent-mismatch failure mode (above) produces no error at the time it happens; it was only caught by this kind of after-the-fact diff.
 
 ## .NET Warning
 
