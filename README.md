@@ -8,6 +8,8 @@ A Rust CLI for automating Ghidra reverse engineering tasks. Usable directly by h
 - **Auto-start bridge** - Import/analyze commands automatically start the bridge
 - **Fast queries** - Sub-second response times with Ghidra kept in memory
 - **Program analysis** - Functions, symbols, types, strings, cross-references
+- **PCode access** - Inspect raw instruction PCode or decompiler High PCode from the CLI
+- **Analyzer control** - List, enable/disable, and re-run Ghidra analyzers
 - **Type system** - Create/edit structs, enums, typedefs; add/remove struct fields
 - **Function signatures** - Edit return types, calling conventions, full C signatures; retype variables
 - **Binary patching** - Modify bytes, NOP instructions, export patches
@@ -141,6 +143,17 @@ number of seconds to impose a Ghidra-side limit; `0` means unbounded. The socket
 wait follows the long-operation policy controlled by `GHIDRA_CLI_OP_TIMEOUT`,
 which is also unbounded by default.
 
+### PCode & Analyzer Control
+```bash
+ghidra pcode at <address>              # Raw PCode for one instruction
+ghidra pcode function <func>           # Raw PCode for an entire function
+ghidra pcode function <func> --high    # Decompiler High PCode
+ghidra analyzer list                   # Analyzer names and enabled status
+ghidra analyzer set <name> true        # Enable an analyzer
+ghidra analyzer set <name> false       # Disable an analyzer
+ghidra analyzer run                    # Mark analyzers for re-analysis and run them
+```
+
 ### Symbols & Types
 ```bash
 ghidra symbol list                     # List symbols
@@ -180,6 +193,7 @@ work too.
 ```bash
 ghidra x-ref to <address>              # References TO address
 ghidra x-ref from <address>            # References FROM address
+ghidra strings refs <pattern>          # References to defined strings matching a pattern
 ```
 
 ### Search
@@ -353,7 +367,7 @@ decompile isn't cut off. Set them when you'd rather fail fast:
 | Variable | Purpose (default) |
 |----------|-------------------|
 | `GHIDRA_CLI_LAUNCH_TIMEOUT` | Cap on bridge launch readiness (180s) |
-| `GHIDRA_CLI_OP_TIMEOUT` | Cap on long `analyze`/`import` ops (unbounded) |
+| `GHIDRA_CLI_OP_TIMEOUT` | Cap on long `analyze`/`analyzer run`/`import` ops (unbounded) |
 | `GHIDRA_CLI_DECOMPILE_TIMEOUT` | Ghidra-side decompiler limit in seconds; `0` = unbounded (unbounded) |
 | `GHIDRA_CLI_READ_TIMEOUT` | Per-request socket read timeout; `0` = indefinite (300s) |
 | `GHIDRA_CLI_CONNECT_DEADLINE` | How long to retry connecting to a (re)starting bridge (60s) |

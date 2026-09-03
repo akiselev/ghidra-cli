@@ -90,6 +90,14 @@ pub enum Commands {
     #[command(subcommand, alias = "tags")]
     Tag(TagCommands),
 
+    /// PCode operations (intermediate representation)
+    #[command(subcommand)]
+    Pcode(PcodeCommands),
+
+    /// Analysis control (list/enable/disable analyzers, re-analyze)
+    #[command(subcommand, alias = "analysis-control")]
+    Analyzer(AnalyzerCommands),
+
     /// Comment operations
     #[command(subcommand, alias = "comments")]
     Comment(CommentCommands),
@@ -923,6 +931,76 @@ pub struct TypeDelFieldArgs {
     /// Field name to remove
     #[arg(long)]
     pub name: String,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
+pub enum PcodeCommands {
+    /// Get raw PCode at an address
+    At(PcodeAtArgs),
+    /// Get PCode for an entire function
+    Function(PcodeFunctionArgs),
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct PcodeAtArgs {
+    /// Address (hex, e.g. "0x401000")
+    pub address: String,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct PcodeFunctionArgs {
+    /// Function name or address
+    pub function: String,
+    /// Use high PCode from decompiler (vs raw from listing)
+    #[arg(long)]
+    pub high: bool,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
+pub enum AnalyzerCommands {
+    /// List all analyzers and their enabled status
+    #[command(alias = "ls")]
+    List(AnalyzerListArgs),
+    /// Enable or disable an analyzer
+    Set(AnalyzerSetArgs),
+    /// Re-run analysis on the program
+    Run(AnalyzerRunArgs),
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct AnalyzerListArgs {
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct AnalyzerSetArgs {
+    /// Analyzer name
+    pub name: String,
+    /// Enable (true) or disable (false)
+    pub enabled: bool,
+    #[arg(long)]
+    pub program: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct AnalyzerRunArgs {
     #[arg(long)]
     pub program: Option<String>,
     #[arg(long)]

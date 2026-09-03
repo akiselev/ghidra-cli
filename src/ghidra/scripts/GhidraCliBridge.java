@@ -25,6 +25,10 @@ import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.cmd.function.ApplyFunctionSignatureCmd;
 import ghidra.program.model.pcode.HighFunction;
 import ghidra.program.model.pcode.HighSymbol;
+import ghidra.program.model.pcode.PcodeOp;
+import ghidra.program.model.pcode.PcodeOpAST;
+import ghidra.program.model.pcode.Varnode;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.pcode.LocalSymbolMap;
 import ghidra.program.model.pcode.HighFunctionDBUtil;
 import ghidra.app.util.importer.AutoImporter;
@@ -732,8 +736,8 @@ public class GhidraCliBridge extends GhidraScript {
             case "delete_function": return handleDeleteFunction(args);
             case "decompile":       return handleDecompile(args);
             case "list_strings":    return handleListStrings(args);
-            case "list_imports":    return handleListImports();
-            case "list_exports":    return handleListExports();
+            case "list_imports":    return handleListImports(args);
+            case "list_exports":    return handleListExports(args);
             case "memory_map":      return handleMemoryMap();
             case "xrefs_to":        return handleXrefsTo(args);
             case "xrefs_from":      return handleXrefsFrom(args);
@@ -747,6 +751,7 @@ public class GhidraCliBridge extends GhidraScript {
             case "program_export":  return handleProgramExport(args);
             // Find commands
             case "find_string":     return handleFindString(args);
+            case "string_refs":     return handleStringRefs(args);
             case "find_bytes":      return handleFindBytes(args);
             case "find_function":   return handleFindFunction(args);
             case "find_calls":      return handleFindCalls(args);
@@ -787,6 +792,13 @@ public class GhidraCliBridge extends GhidraScript {
             case "function_tag_remove": return handleFunctionTagRemove(args);
             case "function_tag_list":   return handleFunctionTagList(args);
             case "set_var_type":    return handleSetVarType(args);
+            // PCode commands
+            case "pcode_at":        return handlePcodeAt(args);
+            case "pcode_function":  return handlePcodeFunction(args);
+            // Analysis control
+            case "analyzer_list":   return handleAnalyzerList(args);
+            case "analyzer_set":    return handleAnalyzerSet(args);
+            case "analyze_run":     return handleAnalyzeRun(args);
             // Comment commands
             case "comment_list":    return handleCommentList(args);
             case "comment_get":     return handleCommentGet(args);
@@ -1814,17 +1826,20 @@ public class GhidraCliBridge extends GhidraScript {
         return result;
     }
 
-    private JsonObject handleListImports() {
+    private JsonObject handleListImports(JsonObject args) {
         if (currentProgram == null) {
             return errorResult("No program loaded");
         }
 
+        int limit = getArgInt(args, "limit", 0);
         JsonArray imports = new JsonArray();
         SymbolTable symbolTable = currentProgram.getSymbolTable();
         ExternalManager extMgr = currentProgram.getExternalManager();
 
         SymbolIterator extSymbols = symbolTable.getExternalSymbols();
+        int count = 0;
         while (extSymbols.hasNext()) {
+            if (limit > 0 && count >= limit) break;
             Symbol symbol = extSymbols.next();
             ExternalLocation extLoc = extMgr.getExternalLocation(symbol);
             if (extLoc != null) {
@@ -1833,6 +1848,7 @@ public class GhidraCliBridge extends GhidraScript {
                 importData.addProperty("address", symbol.getAddress().toString());
                 importData.addProperty("library", extLoc.getLibraryName());
                 imports.add(importData);
+                count++;
             }
         }
 
@@ -1842,22 +1858,26 @@ public class GhidraCliBridge extends GhidraScript {
         return result;
     }
 
-    private JsonObject handleListExports() {
+    private JsonObject handleListExports(JsonObject args) {
         if (currentProgram == null) {
             return errorResult("No program loaded");
         }
 
+        int limit = getArgInt(args, "limit", 0);
         JsonArray exports = new JsonArray();
         SymbolTable symbolTable = currentProgram.getSymbolTable();
 
         SymbolIterator symIter = symbolTable.getSymbolIterator();
+        int count = 0;
         while (symIter.hasNext()) {
+            if (limit > 0 && count >= limit) break;
             Symbol symbol = symIter.next();
             if (symbol.isExternalEntryPoint()) {
                 JsonObject exportData = new JsonObject();
                 exportData.addProperty("name", symbol.getName());
                 exportData.addProperty("address", symbol.getAddress().toString());
                 exports.add(exportData);
+                count++;
             }
         }
 
@@ -2689,6 +2709,56 @@ public class GhidraCliBridge extends GhidraScript {
         }
     }
 
+    private JsonObject handleStringRefs(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+
+        String pattern = getArgString(args, "string");
+        if (pattern == null || pattern.isEmpty()) return errorResult("String pattern required");
+
+        try {
+            Listing listing = currentProgram.getListing();
+            ReferenceManager refMgr = currentProgram.getReferenceManager();
+            FunctionManager fm = currentProgram.getFunctionManager();
+            JsonArray results = new JsonArray();
+
+            DataIterator dataIter = listing.getDefinedData(true);
+            while (dataIter.hasNext()) {
+                Data data = dataIter.next();
+                if (!data.hasStringValue()) continue;
+
+                String val = data.getDefaultValueRepresentation();
+                if (val != null && val.length() >= 2 && val.startsWith("\"") && val.endsWith("\"")) {
+                    val = val.substring(1, val.length() - 1);
+                }
+                if (val == null || !val.toLowerCase().contains(pattern.toLowerCase())) continue;
+
+                Address strAddr = data.getAddress();
+                for (Reference ref : refMgr.getReferencesTo(strAddr)) {
+                    JsonObject item = new JsonObject();
+                    item.addProperty("string_address", strAddr.toString());
+                    item.addProperty("string_value", val);
+                    item.addProperty("from", ref.getFromAddress().toString());
+                    item.addProperty("ref_type", ref.getReferenceType().toString());
+                    Function fn = fm.getFunctionContaining(ref.getFromAddress());
+                    if (fn != null) {
+                        item.addProperty("from_function", fn.getName());
+                    } else {
+                        item.add("from_function", JsonNull.INSTANCE);
+                    }
+                    results.add(item);
+                }
+            }
+
+            JsonObject result = new JsonObject();
+            result.add("results", results);
+            result.addProperty("count", results.size());
+            result.addProperty("pattern", pattern);
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to find string refs: " + e.getMessage());
+        }
+    }
+
     private JsonObject handleFindBytes(JsonObject args) {
         if (currentProgram == null) return errorResult("No program loaded");
 
@@ -2780,22 +2850,27 @@ public class GhidraCliBridge extends GhidraScript {
         try {
             FunctionManager fm = currentProgram.getFunctionManager();
             Function targetFunc = findFunctionByNameOrAddress(functionTarget);
-
             if (targetFunc == null) {
                 return errorResult(buildFunctionTargetHint(functionTarget));
             }
 
             ReferenceManager refMgr = currentProgram.getReferenceManager();
-            Address targetAddr = targetFunc.getEntryPoint();
             JsonArray results = new JsonArray();
+            ghidra.program.model.address.AddressIterator srcIter =
+                refMgr.getReferenceSourceIterator(targetFunc.getBody(), true);
+            while (srcIter.hasNext()) {
+                Address fromAddr = srcIter.next();
+                for (Reference ref : refMgr.getReferencesFrom(fromAddr)) {
+                    if (!ref.getReferenceType().isCall()) continue;
+                    Address toAddr = ref.getToAddress();
+                    Function calleeFunc = fm.getFunctionAt(toAddr);
+                    if (calleeFunc == null) calleeFunc = fm.getFunctionContaining(toAddr);
 
-            for (Reference ref : refMgr.getReferencesTo(targetAddr)) {
-                if (ref.getReferenceType().isCall()) {
-                    Address fromAddr = ref.getFromAddress();
-                    Function callerFunc = fm.getFunctionContaining(fromAddr);
                     JsonObject item = new JsonObject();
-                    item.addProperty("address", fromAddr.toString());
-                    item.addProperty("caller", callerFunc != null ? callerFunc.getName() : "unknown");
+                    item.addProperty("call_site", fromAddr.toString());
+                    item.addProperty("callee",
+                        calleeFunc != null ? calleeFunc.getName() : toAddr.toString());
+                    item.addProperty("callee_address", toAddr.toString());
                     item.addProperty("type", ref.getReferenceType().toString());
                     results.add(item);
                 }
@@ -4476,6 +4551,223 @@ public class GhidraCliBridge extends GhidraScript {
         }
     }
 
+    // --- PCode Handlers ---
+
+    private JsonObject handlePcodeAt(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+
+        String addrStr = getArgString(args, "address");
+        if (addrStr == null || addrStr.isEmpty()) return errorResult("address required");
+
+        try {
+            Address addr = resolveAddress(addrStr);
+            if (addr == null) return errorResult("Invalid address: " + addrStr);
+
+            Instruction inst = currentProgram.getListing().getInstructionAt(addr);
+            if (inst == null) return errorResult("No instruction at address: " + addrStr);
+
+            JsonArray ops = new JsonArray();
+            for (PcodeOp op : inst.getPcode()) ops.add(pcodeOpToJson(op));
+
+            JsonObject result = new JsonObject();
+            result.addProperty("address", addr.toString());
+            result.addProperty("mnemonic", inst.getMnemonicString());
+            result.addProperty("instruction", inst.toString());
+            result.addProperty("count", ops.size());
+            result.add("pcode", ops);
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to get PCode: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handlePcodeFunction(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+
+        String target = getArgString(args, "function");
+        boolean highPcode = args.has("high") && args.get("high").getAsBoolean();
+        if (target == null || target.isEmpty()) return errorResult("function name or address required");
+
+        try {
+            Function func = findFunctionByNameOrAddress(target);
+            if (func == null) return errorResult(buildFunctionTargetHint(target));
+
+            JsonArray ops = new JsonArray();
+            if (highPcode) {
+                DecompInterface decomp = new DecompInterface();
+                try {
+                    if (!decomp.openProgram(currentProgram)) {
+                        return errorResult("Decompilation failed: openProgram failed: " + decomp.getLastMessage());
+                    }
+                    DecompileResults results = decomp.decompileFunction(func, 30, TaskMonitor.DUMMY);
+                    if (!results.decompileCompleted()) {
+                        String reason = results.getErrorMessage();
+                        if (reason == null || reason.isEmpty()) reason = "unknown failure";
+                        return errorResult("Decompilation failed for " + func.getName() + ": " + reason);
+                    }
+
+                    HighFunction highFunction = results.getHighFunction();
+                    if (highFunction == null) {
+                        return errorResult("Decompiler returned no HighFunction for " + func.getName());
+                    }
+                    Iterator<PcodeOpAST> it = highFunction.getPcodeOps();
+                    while (it.hasNext()) ops.add(pcodeOpToJson(it.next()));
+                } finally {
+                    decomp.dispose();
+                }
+            } else {
+                InstructionIterator instructions =
+                    currentProgram.getListing().getInstructions(func.getBody(), true);
+                while (instructions.hasNext()) {
+                    Instruction inst = instructions.next();
+                    for (PcodeOp op : inst.getPcode()) {
+                        JsonObject opJson = pcodeOpToJson(op);
+                        opJson.addProperty("instruction_address", inst.getAddress().toString());
+                        ops.add(opJson);
+                    }
+                }
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("function", func.getName());
+            result.addProperty("address", func.getEntryPoint().toString());
+            result.addProperty("level", highPcode ? "high" : "raw");
+            result.addProperty("count", ops.size());
+            result.add("pcode", ops);
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to get function PCode: " + e.getMessage());
+        }
+    }
+
+    private JsonObject pcodeOpToJson(PcodeOp op) {
+        JsonObject obj = new JsonObject();
+        obj.addProperty("mnemonic", op.getMnemonic());
+        obj.addProperty("opcode", op.getOpcode());
+
+        Varnode output = op.getOutput();
+        if (output != null) obj.add("output", varnodeToJson(output));
+        else obj.add("output", JsonNull.INSTANCE);
+
+        JsonArray inputs = new JsonArray();
+        for (int i = 0; i < op.getNumInputs(); i++) inputs.add(varnodeToJson(op.getInput(i)));
+        obj.add("inputs", inputs);
+        return obj;
+    }
+
+    private JsonObject varnodeToJson(Varnode vn) {
+        JsonObject obj = new JsonObject();
+        obj.addProperty("space", vn.getAddress().getAddressSpace().getName());
+        obj.addProperty("offset", "0x" + Long.toHexString(vn.getOffset()));
+        obj.addProperty("size", vn.getSize());
+        if (vn.isConstant()) {
+            obj.addProperty("type", "constant");
+        } else if (vn.isRegister()) {
+            obj.addProperty("type", "register");
+            Register reg = currentProgram.getRegister(vn);
+            if (reg != null) obj.addProperty("register", reg.getName());
+        } else if (vn.isUnique()) {
+            obj.addProperty("type", "unique");
+        } else if (vn.getAddress().isStackAddress()) {
+            obj.addProperty("type", "stack");
+        } else {
+            obj.addProperty("type", "ram");
+        }
+        return obj;
+    }
+
+    // --- Analyzer Control Handlers ---
+
+    private JsonObject handleAnalyzerList(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+
+        try {
+            ghidra.framework.options.Options analysisOptions = currentProgram.getOptions("Analyzers");
+            JsonArray analyzers = new JsonArray();
+            for (String optionName : analysisOptions.getOptionNames()) {
+                if (optionName.contains(".")) continue;
+                try {
+                    boolean enabled = analysisOptions.getBoolean(optionName, false);
+                    JsonObject entry = new JsonObject();
+                    entry.addProperty("name", optionName);
+                    entry.addProperty("enabled", enabled);
+                    String description = analysisOptions.getDescription(optionName);
+                    if (description != null && !description.isEmpty()) {
+                        entry.addProperty("description", description);
+                    }
+                    analyzers.add(entry);
+                } catch (Exception ignored) {
+                    // Non-boolean analyzer options are not enable/disable switches.
+                }
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("count", analyzers.size());
+            result.add("analyzers", analyzers);
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to list analyzers: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleAnalyzerSet(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+
+        String name = getArgString(args, "name");
+        if (name == null || name.isEmpty()) return errorResult("analyzer name required");
+        if (!args.has("enabled")) return errorResult("enabled (true/false) required");
+        boolean enabled = args.get("enabled").getAsBoolean();
+
+        try {
+            ghidra.framework.options.Options analysisOptions = currentProgram.getOptions("Analyzers");
+            if (!analysisOptions.getOptionNames().contains(name)) {
+                return errorResult("Unknown analyzer: " + name);
+            }
+
+            int txId = currentProgram.startTransaction("Set analyzer");
+            try {
+                analysisOptions.setBoolean(name, enabled);
+                currentProgram.endTransaction(txId, true);
+            } catch (Exception e) {
+                currentProgram.endTransaction(txId, false);
+                throw e;
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("status", "set");
+            result.addProperty("name", name);
+            result.addProperty("enabled", enabled);
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to set analyzer: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleAnalyzeRun(JsonObject args) {
+        if (currentProgram == null) return errorResult("No program loaded");
+
+        try {
+            ghidra.app.plugin.core.analysis.AutoAnalysisManager manager =
+                ghidra.app.plugin.core.analysis.AutoAnalysisManager.getAnalysisManager(currentProgram);
+            manager.reAnalyzeAll(null);
+            // Use the same cross-version GhidraScript entry point as the normal
+            // `analyze` command after marking all analyzers for re-analysis.
+            analyzeAll(currentProgram);
+            try {
+                currentProgram.save("Re-analysis complete", monitor);
+            } catch (Exception ignored) {
+                // Best effort; clean bridge shutdown also persists changes.
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("status", "analysis_complete");
+            result.addProperty("program", currentProgram.getName());
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to run analysis: " + e.getMessage());
+        }
+    }
+
     // --- Comment Handlers ---
 
     private int resolveCommentType(String typeStr) {
@@ -4772,7 +5064,8 @@ public class GhidraCliBridge extends GhidraScript {
         visited.add(funcAddrStr);
 
         for (Reference ref : refMgr.getReferencesTo(func.getEntryPoint())) {
-            if (ref.getReferenceType().isCall()) {
+            RefType refType = ref.getReferenceType();
+            if (refType.isCall() || refType == RefType.PARAM || refType == RefType.INDIRECTION) {
                 Address fromAddr = ref.getFromAddress();
                 Function callerFunc = fm.getFunctionContaining(fromAddr);
                 if (callerFunc != null) {
@@ -5023,7 +5316,7 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         try {
-            Address addr = currentProgram.getAddressFactory().getAddress(addressStr);
+            Address addr = resolveAddress(addressStr);
             if (addr == null) return errorResult("Invalid address: " + addressStr);
 
             String hexClean = hexData.replace("0x", "").replace(" ", "");
@@ -5034,17 +5327,19 @@ public class GhidraCliBridge extends GhidraScript {
 
             Memory memory = currentProgram.getMemory();
             Listing listing = currentProgram.getListing();
+            MemoryBlock block = memory.getBlock(addr);
+            boolean restoreReadOnly = block != null && !block.isWrite();
             int txId = currentProgram.startTransaction("Patch bytes");
+            boolean commit = false;
             try {
-                // Clear any existing instructions/data at the target range
-                // so memory.setBytes doesn't conflict
+                if (restoreReadOnly) block.setWrite(true);
                 Address endAddr = addr.add(patchData.length - 1);
                 listing.clearCodeUnits(addr, endAddr, false);
                 memory.setBytes(addr, patchData);
-                currentProgram.endTransaction(txId, true);
-            } catch (Exception e) {
-                currentProgram.endTransaction(txId, true);
-                throw e;
+                commit = true;
+            } finally {
+                if (restoreReadOnly) block.setWrite(false);
+                currentProgram.endTransaction(txId, commit);
             }
 
             JsonObject result = new JsonObject();
@@ -5067,32 +5362,34 @@ public class GhidraCliBridge extends GhidraScript {
         if (count < 1) return errorResult("count must be >= 1");
 
         try {
-            Address addr = currentProgram.getAddressFactory().getAddress(addressStr);
+            Address addr = resolveAddress(addressStr);
             if (addr == null) return errorResult("Invalid address: " + addressStr);
 
             Listing listing = currentProgram.getListing();
             Memory memory = currentProgram.getMemory();
+            MemoryBlock block = memory.getBlock(addr);
+            boolean restoreReadOnly = block != null && !block.isWrite();
             String processor = currentProgram.getLanguage().getProcessor().toString();
             byte nopByte = processor.toLowerCase().contains("x86") ? (byte) 0x90 : (byte) 0x00;
 
             JsonArray nopped = new JsonArray();
             int totalBytes = 0;
             int txId = currentProgram.startTransaction("NOP instructions");
+            boolean commit = false;
             try {
+                if (restoreReadOnly) block.setWrite(true);
                 Address cur = addr;
                 for (int i = 0; i < count; i++) {
                     Instruction instruction = listing.getInstructionAt(cur);
                     if (instruction == null) {
-                        // Roll back partial work so the program is left untouched.
-                        currentProgram.endTransaction(txId, true);
-                        return errorResult("No instruction at address: " + cur.toString()
-                            + " (NOP'd " + nopped.size() + " of " + count + ")");
+                        if (i == 0) {
+                            return errorResult("No instruction at address: " + cur.toString());
+                        }
+                        break;
                     }
 
                     int instrLength = instruction.getLength();
-                    // Capture the next instruction's address before we clear this one.
                     Address next = cur.add(instrLength);
-
                     byte[] nopBytes = new byte[instrLength];
                     Arrays.fill(nopBytes, nopByte);
                     listing.clearCodeUnits(cur, cur.add(instrLength - 1), false);
@@ -5105,10 +5402,10 @@ public class GhidraCliBridge extends GhidraScript {
                     totalBytes += instrLength;
                     cur = next;
                 }
-                currentProgram.endTransaction(txId, true);
-            } catch (Exception e) {
-                currentProgram.endTransaction(txId, true);
-                throw e;
+                commit = true;
+            } finally {
+                if (restoreReadOnly) block.setWrite(false);
+                currentProgram.endTransaction(txId, commit);
             }
 
             JsonObject result = new JsonObject();

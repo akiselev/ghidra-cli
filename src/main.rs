@@ -167,6 +167,8 @@ fn requires_bridge(command: &Commands) -> bool {
             | Commands::Symbol(_)
             | Commands::Type(_)
             | Commands::Tag(_)
+            | Commands::Pcode(_)
+            | Commands::Analyzer(_)
             | Commands::Comment(_)
             | Commands::Graph(_)
             | Commands::Find(_)
@@ -285,6 +287,15 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
             cli::TagCommands::SetComment(args) => args.project.clone(),
             cli::TagCommands::Add(args) => args.project.clone(),
             cli::TagCommands::Remove(args) => args.project.clone(),
+        },
+        Commands::Pcode(cmd) => match cmd {
+            cli::PcodeCommands::At(args) => args.project.clone(),
+            cli::PcodeCommands::Function(args) => args.project.clone(),
+        },
+        Commands::Analyzer(cmd) => match cmd {
+            cli::AnalyzerCommands::List(args) => args.project.clone(),
+            cli::AnalyzerCommands::Set(args) => args.project.clone(),
+            cli::AnalyzerCommands::Run(args) => args.project.clone(),
         },
         Commands::Patch(cmd) => match cmd {
             cli::PatchCommands::Bytes(args) => args.project.clone(),
@@ -419,6 +430,15 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
             cli::TagCommands::SetComment(args) => args.program.clone(),
             cli::TagCommands::Add(args) => args.program.clone(),
             cli::TagCommands::Remove(args) => args.program.clone(),
+        },
+        Commands::Pcode(cmd) => match cmd {
+            cli::PcodeCommands::At(args) => args.program.clone(),
+            cli::PcodeCommands::Function(args) => args.program.clone(),
+        },
+        Commands::Analyzer(cmd) => match cmd {
+            cli::AnalyzerCommands::List(args) => args.program.clone(),
+            cli::AnalyzerCommands::Set(args) => args.program.clone(),
+            cli::AnalyzerCommands::Run(args) => args.program.clone(),
         },
         Commands::Patch(cmd) => match cmd {
             cli::PatchCommands::Bytes(args) => args.program.clone(),
@@ -1085,8 +1105,8 @@ fn execute_via_bridge(
                 );
                 client.list_strings(lim, filt)
             }
-            "imports" => client.list_imports(),
-            "exports" => client.list_exports(),
+            "imports" => client.list_imports(args.limit.or(default_limit)),
+            "exports" => client.list_exports(args.limit.or(default_limit)),
             "memory" => client.memory_map(),
             other => anyhow::bail!("Query type '{}' not supported", other),
         },
@@ -1206,7 +1226,7 @@ fn execute_via_bridge(
                     );
                     client.list_strings(lim, filt)
                 }
-                StringsCommands::Refs(args) => client.xrefs_to(args.string.clone()),
+                StringsCommands::Refs(args) => client.string_refs(args.string.clone()),
             }
         }
         Commands::Memory(cmd) => {
@@ -1238,8 +1258,8 @@ fn execute_via_bridge(
         Commands::Dump(cmd) => {
             use cli::DumpCommands;
             match cmd {
-                DumpCommands::Imports(_) => client.list_imports(),
-                DumpCommands::Exports(_) => client.list_exports(),
+                DumpCommands::Imports(opts) => client.list_imports(opts.limit.or(default_limit)),
+                DumpCommands::Exports(opts) => client.list_exports(opts.limit.or(default_limit)),
                 DumpCommands::Functions(opts) => {
                     let (lim, filt) = bridge_list_params(
                         opts.limit,
@@ -1601,6 +1621,21 @@ fn execute_via_bridge(
             }))
         }
         Commands::Stats(_) => client.stats(),
+        Commands::Pcode(cmd) => {
+            use cli::PcodeCommands;
+            match cmd {
+                PcodeCommands::At(args) => client.pcode_at(&args.address),
+                PcodeCommands::Function(args) => client.pcode_function(&args.function, args.high),
+            }
+        }
+        Commands::Analyzer(cmd) => {
+            use cli::AnalyzerCommands;
+            match cmd {
+                AnalyzerCommands::List(_) => client.analyzer_list(),
+                AnalyzerCommands::Set(args) => client.analyzer_set(&args.name, args.enabled),
+                AnalyzerCommands::Run(_) => client.analyze_run(),
+            }
+        }
         Commands::Rename(args) => {
             let addresses = resolve_symbol_addresses(
                 client,

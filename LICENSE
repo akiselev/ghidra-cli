@@ -9,6 +9,13 @@ It incorporates modifications from:
 The electricazimuth-derived changes incorporated here are based on the
 downstream work through commit b41a2458f4eab39aea4552db95173e4fafc7afc7.
 
+It also incorporates selected modifications from:
+  https://github.com/nonsleepr/ghidra-cli
+
+The nonsleepr-derived changes include PCode access, analyzer control, and
+selected bug fixes, based on downstream work through commit
+3d1c7cd7d632919b51543d6514d85b90bdd46bca.
+
 The project is distributed under the GNU General Public License, version 3.
 The GNU GPL v3 license text below is reproduced verbatim.
 

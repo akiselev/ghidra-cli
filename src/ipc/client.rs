@@ -330,13 +330,13 @@ impl BridgeClient {
     }
 
     /// List imports.
-    pub fn list_imports(&self) -> Result<serde_json::Value> {
-        self.send_command("list_imports", None)
+    pub fn list_imports(&self, limit: Option<usize>) -> Result<serde_json::Value> {
+        self.send_command("list_imports", Some(json!({"limit": limit})))
     }
 
     /// List exports.
-    pub fn list_exports(&self) -> Result<serde_json::Value> {
-        self.send_command("list_exports", None)
+    pub fn list_exports(&self, limit: Option<usize>) -> Result<serde_json::Value> {
+        self.send_command("list_exports", Some(json!({"limit": limit})))
     }
 
     /// Get memory map.
@@ -352,6 +352,11 @@ impl BridgeClient {
     /// Get cross-references to an address.
     pub fn xrefs_to(&self, address: String) -> Result<serde_json::Value> {
         self.send_command("xrefs_to", Some(json!({"address": address})))
+    }
+
+    /// Get cross-references to all defined strings matching a pattern.
+    pub fn string_refs(&self, pattern: String) -> Result<serde_json::Value> {
+        self.send_command("string_refs", Some(json!({"string": pattern})))
     }
 
     /// Get cross-references from an address.
@@ -377,6 +382,32 @@ impl BridgeClient {
     /// can exceed any fixed cap on large/complex binaries.
     pub fn analyze(&self) -> Result<serde_json::Value> {
         self.send_command_with_timeout("analyze", None, long_op_timeout())
+    }
+
+    pub fn pcode_at(&self, address: &str) -> Result<serde_json::Value> {
+        self.send_command("pcode_at", Some(json!({"address": address})))
+    }
+
+    pub fn pcode_function(&self, function: &str, high: bool) -> Result<serde_json::Value> {
+        self.send_command(
+            "pcode_function",
+            Some(json!({"function": function, "high": high})),
+        )
+    }
+
+    pub fn analyzer_list(&self) -> Result<serde_json::Value> {
+        self.send_command("analyzer_list", None)
+    }
+
+    pub fn analyzer_set(&self, name: &str, enabled: bool) -> Result<serde_json::Value> {
+        self.send_command(
+            "analyzer_set",
+            Some(json!({"name": name, "enabled": enabled})),
+        )
+    }
+
+    pub fn analyze_run(&self) -> Result<serde_json::Value> {
+        self.send_command_with_timeout("analyze_run", None, long_op_timeout())
     }
 
     /// List programs in the project.
