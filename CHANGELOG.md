@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Program edits are now persisted to the project database after every mutating
+  command. Previously, commands such as `comment set`, `symbol rename`, `patch
+  bytes`, `type` edits, `tag` edits and script/batch runs only ended their Ghidra
+  transaction, which commits into the bridge JVM's in-memory program; nothing
+  flushed to the `.rep` store until an `analyze`/program switch/`import`. Since
+  `bridge stop` kills the JVM without a teardown save, those edits were lost on
+  teardown and never showed up when the project was opened in the Ghidra GUI.
+  Read-only queries are unaffected, and a failed save is logged without failing
+  the command.
+
 ## [0.2.2]
 
 ### Added
