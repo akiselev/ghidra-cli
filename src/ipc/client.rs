@@ -5,6 +5,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -131,12 +132,28 @@ fn connect_with_retry(addr: &std::net::SocketAddr) -> Result<TcpStream> {
 /// Client for communicating with the Ghidra Java bridge.
 pub struct BridgeClient {
     port: u16,
+    /// Context needed to restart the bridge if it crashes.
+    restart_ctx: Option<(PathBuf, PathBuf)>,
 }
 
 impl BridgeClient {
     /// Create a client for a known port.
     pub fn new(port: u16) -> Self {
-        Self { port }
+        Self { port, restart_ctx: None }
+    }
+
+    /// Create a client with crash-recovery context. On bridge crash, the client
+    /// will attempt to restart the bridge (via `ensure_bridge_running`) so the
+    /// next command works without manual `ghidra restart`.
+    pub fn new_with_restart(
+        port: u16,
+        project_path: &std::path::Path,
+        ghidra_install_dir: &std::path::Path,
+    ) -> Self {
+        Self {
+            port,
+            restart_ctx: Some((project_path.to_path_buf(), ghidra_install_dir.to_path_buf())),
+        }
     }
 
     /// Get the port this client connects to.
@@ -193,11 +210,42 @@ impl BridgeClient {
         let mut response_line = String::new();
         match reader.read_line(&mut response_line) {
             // EOF before any response: bridge closed the socket without replying.
-            Ok(0) => anyhow::bail!(
-                "Bridge closed the connection without responding to '{}' \
-                 (it may have crashed or been restarted). Retry, or check `ghidra status`.",
-                command
-            ),
+            Ok(0) => {
+                // If we have restart context, try to bring the bridge back up so
+                // the user's next command works without manual `ghidra restart`.
+                match &self.restart_ctx {
+                    Some((project_path, ghidra_dir)) => {
+                        eprintln!(
+                            "Bridge crashed during '{}'. Restarting bridge...",
+                            command
+                        );
+                        match crate::ghidra::bridge::ensure_bridge_running(
+                            project_path,
+                            ghidra_dir,
+                            crate::ghidra::bridge::BridgeStartMode::Project,
+                        ) {
+                            Ok(new_port) => {
+                                eprintln!(
+                                    "Bridge restarted on port {}. Re-run your command.",
+                                    new_port
+                                );
+                            }
+                            Err(restart_err) => {
+                                eprintln!(
+                                    "Bridge restart failed: {}. Run `ghidra restart` manually.",
+                                    restart_err
+                                );
+                            }
+                        }
+                    }
+                    None => {}
+                }
+                return Err(anyhow::anyhow!(
+                    "Bridge closed the connection without responding to '{}' \
+                     (it may have crashed). The bridge has been restarted; re-run your command.",
+                    command
+                ));
+            }
             Ok(_) => {}
             // A read timeout here means the bridge is up (we connected) but hasn't
             // reached our queued request in time — almost always because it is busy

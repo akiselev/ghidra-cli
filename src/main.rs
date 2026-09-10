@@ -535,7 +535,7 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                     // is_bridge_running() already proved the bridge process is alive
                     // and its socket is accepting; a busy bridge just queues this
                     // request, so there is no pre-flight ping gate to fail here.
-                    let client = BridgeClient::new(port);
+                    let client = BridgeClient::new_with_restart(port, &project_path, &ghidra_install_dir);
                     if !cli.quiet {
                         eprintln!("Importing into running bridge...");
                     }
@@ -558,7 +558,7 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                         &ghidra_install_dir,
                         BridgeStartMode::Project,
                     )?;
-                    let client = BridgeClient::new(port);
+                    let client = BridgeClient::new_with_restart(port, &project_path, &ghidra_install_dir);
                     let result = client.import_binary(&args.binary, args.program.as_deref())?;
                     let name = args.program.clone().unwrap_or_else(|| {
                         result
@@ -592,7 +592,7 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                             program_name: name.clone(),
                         },
                     )?;
-                    let client = BridgeClient::new(port);
+                    let client = BridgeClient::new_with_restart(port, &project_path, &ghidra_install_dir);
                     client.open_program(&name)?;
                     (client, name)
                 };
@@ -633,7 +633,7 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                 // Liveness already proven by is_bridge_running() (PID alive + socket
                 // accepting). A busy bridge queues the request rather than failing a
                 // pre-flight ping, so connect directly and let it wait its turn.
-                BridgeClient::new(port)
+                BridgeClient::new_with_restart(port, &project_path, &ghidra_install_dir)
             } else {
                 // Auto-start bridge - use specific program if available, otherwise project mode
                 let mode = if let Some(program) = extract_program_from_command(&cli.command)
@@ -654,7 +654,7 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                 if !cli.quiet {
                     eprintln!("Bridge ready.");
                 }
-                BridgeClient::new(port)
+                BridgeClient::new_with_restart(port, &project_path, &ghidra_install_dir)
             };
 
             // Switch to requested program if it differs from the bridge's current program
