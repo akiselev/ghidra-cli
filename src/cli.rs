@@ -126,6 +126,9 @@ pub enum Commands {
     #[command(subcommand, alias = "scripts")]
     Script(ScriptCommands),
 
+    /// Agent skill guide (self-learnable CLI usage)
+    Skills,
+
     /// Batch operations
     Batch(BatchArgs),
 
@@ -1107,7 +1110,7 @@ pub struct DisasmArgs {
     /// Disassembly target (name | 0xaddr | FUN_<hex>)
     #[arg(long = "target", value_name = "TARGET")]
     pub target: Option<String>,
-    /// Number of instructions to disassemble
+    /// Number of instructions to disassemble (default: entire function)
     #[arg(long = "instructions", short = 'n')]
     pub num_instructions: Option<usize>,
     #[command(flatten)]
@@ -1208,14 +1211,15 @@ pub struct PatchExportArgs {
 
 #[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
 pub enum ScriptCommands {
-    /// Run a script file
+    /// Run a script file (uses cached compilation if available)
     Run(ScriptRunArgs),
-    /// Execute inline Python code
-    Python(ScriptInlineArgs),
-    /// Execute inline Java code
-    Java(ScriptInlineArgs),
+    /// Run a script file with a guaranteed fresh compilation
+    #[command(name = "run-once")]
+    RunOnce(ScriptRunArgs),
     /// List available scripts
     List,
+    /// Invalidate cached compilation (force recompile on next run)
+    Delete(ScriptRunArgs),
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -1235,15 +1239,6 @@ pub struct ScriptRunArgs {
     /// Script arguments (after --)
     #[arg(last = true)]
     pub args: Vec<String>,
-}
-
-#[derive(Args, Clone, Serialize, Deserialize, Debug)]
-pub struct ScriptInlineArgs {
-    pub code: String,
-    #[arg(long)]
-    pub program: Option<String>,
-    #[arg(long)]
-    pub project: Option<String>,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]

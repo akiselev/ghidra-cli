@@ -761,6 +761,7 @@ public class GhidraCliBridge extends GhidraScript {
             case "script_java":     return handleScriptJava(args);
             case "script_python":   return handleScriptPython(args);
             case "script_list":     return handleScriptList();
+            case "script_delete":   return handleScriptDelete(args);
             // Batch
             case "batch":           return handleBatch(args);
             // Memory read
@@ -2247,6 +2248,40 @@ public class GhidraCliBridge extends GhidraScript {
 
             if (programFile == null) {
                 return errorResult("Program not found: " + programName);
+            }
+
+            // If the program to delete is the current one, release it first.
+            if (currentProgram != null && currentProgram.getName().equals(programFile.getName())) {
+                try {
+                    currentProgram.release(project);
+                } catch (Exception e) {
+                    // Best effort
+                }
+                currentProgram = null;
+                currentProgramNameSnapshot = null;
+            }
+
+            // Release the domain object if it's still open.
+            Object domObj = programFile.getOpenedDomainObject(project);
+            if (domObj != null) {
+                try {
+                    domObj.getClass().getMethod("release", Object.class).invoke(domObj, project);
+                } catch (Exception e) {
+                    // Best effort
+                }
+            }
+
+            // Terminate ALL checkouts on this file (may belong to other consumers
+            // from previous sessions or the import process).
+            try {
+                Object[] statuses = (Object[]) programFile.getCheckouts();
+                for (Object st : statuses) {
+                    long checkoutId = (Long) st.getClass().getMethod("getCheckoutID").invoke(st);
+                    programFile.terminateCheckout(checkoutId);
+                }
+            } catch (Exception e) {
+                // If getCheckouts fails, fall back to undoCheckout
+                try { programFile.undoCheckout(true); } catch (Exception ignored) {}
             }
 
             programFile.delete();
@@ -5028,6 +5063,44 @@ public class GhidraCliBridge extends GhidraScript {
             return result;
         } catch (Exception e) {
             return errorResult("Failed to list scripts: " + e.getMessage());
+        }
+    }
+
+    private JsonObject handleScriptDelete(JsonObject args) {
+        String scriptPath = getArgString(args, "path");
+        if (scriptPath == null) return errorResult("Script path required");
+
+        File scriptFile = new File(scriptPath).getAbsoluteFile();
+        if (!scriptFile.exists()) {
+            return errorResult("Script not found: " + scriptFile.getPath());
+        }
+
+        // Remove the script's parent directory from the BundleHost so the next
+        // run recompiles from source rather than using the cached class.
+        ResourceFile source = new ResourceFile(scriptFile);
+        ResourceFile sourceDir = source.getParentFile();
+        try {
+            Object bundleHost = GhidraScriptUtil.class
+                .getMethod("getBundleHost").invoke(null);
+            if (bundleHost == null) return errorResult("Bundle host unavailable");
+            Class<?> bhClass = bundleHost.getClass();
+            Object existing = bhClass
+                .getMethod("getExistingGhidraBundle", ResourceFile.class)
+                .invoke(bundleHost, sourceDir);
+            if (existing == null) {
+                JsonObject ok = new JsonObject();
+                ok.addProperty("status", "not_registered");
+                ok.addProperty("path", sourceDir.getAbsolutePath());
+                return ok;
+            }
+            bhClass.getMethod("remove", ResourceFile.class)
+                .invoke(bundleHost, sourceDir);
+            JsonObject result = new JsonObject();
+            result.addProperty("status", "cleared");
+            result.addProperty("path", sourceDir.getAbsolutePath());
+            return result;
+        } catch (Exception e) {
+            return errorResult("Failed to clear script cache: " + e.getMessage());
         }
     }
 

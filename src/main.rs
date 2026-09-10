@@ -106,6 +106,7 @@ fn run_command(cli: Cli) -> anyhow::Result<()> {
         Commands::Init => handle_init(),
         Commands::Doctor => handle_doctor(&cli.projects_dir),
         Commands::Version => handle_version(),
+        Commands::Skills => handle_skills(),
         Commands::Config(cmd) => handle_config_command(cmd.clone()),
         Commands::SetDefault(args) => handle_set_default(args.clone()),
         Commands::Project(args) => handle_project_command(args.command.clone()),
@@ -251,9 +252,9 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
         },
         Commands::Script(cmd) => match cmd {
             cli::ScriptCommands::Run(args) => args.project.clone(),
-            cli::ScriptCommands::Python(args) => args.project.clone(),
-            cli::ScriptCommands::Java(args) => args.project.clone(),
+            cli::ScriptCommands::RunOnce(args) => args.project.clone(),
             cli::ScriptCommands::List => None,
+            cli::ScriptCommands::Delete(args) => args.project.clone(),
         },
         Commands::Program(cmd) => match cmd {
             cli::ProgramCommands::List(args) => args.project.clone(),
@@ -376,9 +377,9 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
         },
         Commands::Script(cmd) => match cmd {
             cli::ScriptCommands::Run(args) => args.program.clone(),
-            cli::ScriptCommands::Python(args) => args.program.clone(),
-            cli::ScriptCommands::Java(args) => args.program.clone(),
+            cli::ScriptCommands::RunOnce(args) => args.program.clone(),
             cli::ScriptCommands::List => None,
+            cli::ScriptCommands::Delete(args) => args.program.clone(),
         },
         Commands::Program(cmd) => match cmd {
             cli::ProgramCommands::List(args) => args.program.clone(),
@@ -1327,10 +1328,6 @@ fn execute_via_bridge(
             use cli::ScriptCommands;
             match cmd {
                 ScriptCommands::Run(args) => {
-                    // Canonicalize client-side so the bridge receives an absolute
-                    // path independent of the working directory its JVM inherited.
-                    // Fall back to the raw path if the file is missing; the bridge
-                    // then reports a clear "Script not found".
                     let path = std::fs::canonicalize(&args.script_path)
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_else(|_| args.script_path.clone());
@@ -1338,9 +1335,23 @@ fn execute_via_bridge(
                         args.expect.iter().map(|s| parse_expect_spec(s)).collect();
                     client.script_run(&path, &args.args, &expect, args.allow_empty)
                 }
-                ScriptCommands::Python(args) => client.script_python(&args.code),
-                ScriptCommands::Java(args) => client.script_java(&args.code),
+                ScriptCommands::RunOnce(args) => {
+                    let path = std::fs::canonicalize(&args.script_path)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| args.script_path.clone());
+                    let expect: Vec<serde_json::Value> =
+                        args.expect.iter().map(|s| parse_expect_spec(s)).collect();
+                    let result = client.script_run(&path, &args.args, &expect, args.allow_empty)?;
+                    client.script_delete(&path).ok();
+                    Ok(result)
+                }
                 ScriptCommands::List => client.script_list(),
+                ScriptCommands::Delete(args) => {
+                    let path = std::fs::canonicalize(&args.script_path)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| args.script_path.clone());
+                    client.script_delete(&path)
+                }
             }
         }
         Commands::Disasm(args) => client.disasm(args.resolved_target(), args.num_instructions),
@@ -1937,6 +1948,62 @@ fn handle_doctor(projects_dir: &Option<PathBuf>) -> anyhow::Result<()> {
 fn handle_version() -> anyhow::Result<()> {
     println!("ghidra-cli {}", env!("CARGO_PKG_VERSION"));
     println!("Rust CLI for Ghidra reverse engineering");
+    Ok(())
+}
+
+fn handle_skills() -> anyhow::Result<()> {
+    println!("ghidra-cli: Agent Skill Guide");
+    println!();
+    println!("== Core Workflow ==");
+    println!("  1. ghidra import /path/to/binary --project myproj");
+    println!("  2. ghidra decompile main --project myproj");
+    println!("  3. ghidra function list --project myproj");
+    println!("  4. ghidra disasm main -n 50 --project myproj");
+    println!();
+    println!("== Decompile ==");
+    println!("  ghidra decompile <target> [--with-vars] [--with-params] [--timeout-secs N]");
+    println!("  Target: function name, 0xaddress, or FUN_<hex>");
+    println!();
+    println!("== Disassembly ==");
+    println!("  ghidra disasm <target> [-n COUNT]");
+    println!("  -n COUNT: disassemble COUNT instructions from function start");
+    println!("           (omit for entire function; use small N for overview)");
+    println!();
+    println!("== Functions ==");
+    println!("  ghidra function list [--filter 'name ~ \"foo\"']");
+    println!("  ghidra function rename <old> <new>");
+    println!("  ghidra function get <target>");
+    println!("  ghidra function set-signature <target> --return-type int --params 'int,int'");
+    println!();
+    println!("== Query ==");
+    println!("  ghidra query functions [--limit N] [--filter EXPR]");
+    println!("  ghidra query strings [--limit N]");
+    println!("  ghidra query imports");
+    println!("  ghidra query exports");
+    println!();
+    println!("== Bridge Lifecycle ==");
+    println!("  ghidra status        # check if bridge is running");
+    println!("  ghidra restart      # kill + restart the bridge");
+    println!("  ghidra jobs         # list queued/running jobs");
+    println!("  ghidra cancel JOB   # cancel a queued job");
+    println!();
+    println!("== Script Execution ==");
+    println!("  ghidra script run /path/to/Script.java [-- ARGS...]");
+    println!("      Fast: uses cached compilation (repeated runs)");
+    println!("  ghidra script run-once /path/to/Script.java [-- ARGS...]");
+    println!("      Always fresh: runs then clears the cache");
+    println!("  ghidra script delete /path/to/Script.java");
+    println!("      Invalidate cached compilation (next run recompiles)");
+    println!("  ghidra script list");
+    println!("  NOTE: 'run' caches the compiled class in the JVM. Use");
+    println!("        'run-once' or 'delete' + 'run' after editing a script.");
+    println!();
+    println!("== Tips ==");
+    println!("  - Use --project <name> or set a default with 'ghidra set-default'");
+    println!("  - Use --json for machine-readable output");
+    println!("  - --limit 0 means 'all rows'");
+    println!("  - --filter uses expressions: 'name ~ \"crypt\" AND size > 100'");
+    println!("  - Large functions: use 'disasm -n 50' before full decompile");
     Ok(())
 }
 
