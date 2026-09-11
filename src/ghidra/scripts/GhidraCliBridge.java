@@ -16,6 +16,7 @@ import ghidra.app.script.GhidraState;
 import ghidra.util.exception.CancelledException;
 import generic.jar.ResourceFile;
 import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileOptions;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.cmd.function.ApplyFunctionSignatureCmd;
 import ghidra.program.model.pcode.HighFunction;
@@ -1489,6 +1490,7 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         DecompInterface decompiler = new DecompInterface();
+        decompiler.setOptions(new DecompileOptions());
         try {
             decompiler.openProgram(currentProgram);
 
@@ -3890,6 +3892,7 @@ public class GhidraCliBridge extends GhidraScript {
             if (newType == null) return errorResult("Type not found: " + typeName);
 
             DecompInterface decompiler = new DecompInterface();
+            decompiler.setOptions(new DecompileOptions());
             try {
                 decompiler.openProgram(currentProgram);
                 TaskMonitor mon = monitor;
@@ -4419,6 +4422,7 @@ public class GhidraCliBridge extends GhidraScript {
             if (func2 == null) return errorResult(buildFunctionTargetHint(func2Target));
 
             DecompInterface decompiler = new DecompInterface();
+            decompiler.setOptions(new DecompileOptions());
             try {
                 decompiler.openProgram(currentProgram);
                 TaskMonitor mon = monitor;
