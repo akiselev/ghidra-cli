@@ -16,6 +16,7 @@ import ghidra.app.script.GhidraState;
 import ghidra.util.exception.CancelledException;
 import generic.jar.ResourceFile;
 import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileOptions;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.cmd.function.ApplyFunctionSignatureCmd;
 import ghidra.program.model.pcode.HighFunction;
@@ -665,7 +666,7 @@ public class GhidraCliBridge extends GhidraScript {
             }
 
             if (result.has("error")) {
-                return new HandleResult(errorResponse(result.get("error").getAsString()), false);
+                return new HandleResult(errorResponse(result), false);
             }
 
             return new HandleResult(successResponse(result), false);
@@ -789,6 +790,66 @@ public class GhidraCliBridge extends GhidraScript {
         JsonObject result = new JsonObject();
         result.addProperty("error", message);
         return result;
+    }
+
+    /**
+     * Error result carrying a stable machine-readable code. The dispatcher
+     * forwards it as the response's {@code code} field so clients can branch on
+     * it instead of matching message text.
+     */
+    private JsonObject errorResult(String message, String code) {
+        JsonObject result = errorResult(message);
+        result.addProperty("error_code", code);
+        return result;
+    }
+
+    private JsonObject errorResponse(JsonObject result) {
+        JsonObject resp = errorResponse(result.get("error").getAsString());
+        if (result.has("error_code")) {
+            resp.addProperty("code", result.get("error_code").getAsString());
+        }
+        return resp;
+    }
+
+    // --- Decompiler setup ---
+
+    /**
+     * Default cap, in MB, on one decompiler response. Ghidra's own default
+     * (DecompileOptions.SUGGESTED_MAX_PAYLOAD_BYTES) is 50 MB, which large
+     * switch-heavy functions exceed with "Response buffer size exceeded".
+     * Must match DEFAULT_DECOMPILE_MAX_PAYLOAD_MB in src/ipc/client.rs.
+     */
+    private static final int DEFAULT_DECOMPILE_MAX_PAYLOAD_MB = 512;
+
+    /** Ghidra converts the limit to bytes with {@code mb << 20} in an int. */
+    private static final int MAX_DECOMPILE_PAYLOAD_MB = 2047;
+
+    static final String ERR_DECOMPILE_PAYLOAD_EXCEEDED = "decompile_payload_exceeded";
+
+    /**
+     * Create a decompiler whose response-size limit is {@code payloadMBytes}.
+     * The limit can only be changed through setOptions(); without it Ghidra
+     * keeps its 50 MB default. DecompileOptions always sends the read-only
+     * flag, and its Java default (on) differs from the native default the
+     * bridge ran with before options were set (off), which changes output
+     * (constant propagation from read-only memory, parameter types). Keep it
+     * off so the payload knob is the only behavioural change.
+     */
+    private DecompInterface newDecompiler(int payloadMBytes) {
+        DecompileOptions opts = new DecompileOptions();
+        opts.setMaxPayloadMBytes(payloadMBytes);
+        opts.setRespectReadOnly(false);
+        DecompInterface decompiler = new DecompInterface();
+        decompiler.setOptions(opts);
+        return decompiler;
+    }
+
+    private static int clampPayloadMBytes(int mb) {
+        return Math.max(1, Math.min(MAX_DECOMPILE_PAYLOAD_MB, mb));
+    }
+
+    private static boolean isPayloadExceeded(String detail) {
+        return detail != null && detail.contains("Response buffer size exceeded");
     }
 
     // --- Address Resolution ---
@@ -1488,7 +1549,9 @@ public class GhidraCliBridge extends GhidraScript {
             return errorResult("No function at address " + addrStr);
         }
 
-        DecompInterface decompiler = new DecompInterface();
+        int payloadMBytes = clampPayloadMBytes(
+            getArgInt(args, "max_payload_mb", DEFAULT_DECOMPILE_MAX_PAYLOAD_MB));
+        DecompInterface decompiler = newDecompiler(payloadMBytes);
         try {
             decompiler.openProgram(currentProgram);
 
@@ -1578,8 +1641,15 @@ public class GhidraCliBridge extends GhidraScript {
                 } else {
                     prefix = "Decompilation failed";
                 }
-                return errorResult(prefix + " for " + func.getName() + " at " +
-                    func.getEntryPoint() + ": " + detail.trim());
+                String message = prefix + " for " + func.getName() + " at " +
+                    func.getEntryPoint() + ": " + detail.trim();
+                if (isPayloadExceeded(detail)) {
+                    return errorResult(message + " (decompiler output exceeded the " +
+                        payloadMBytes + " MB payload limit; retry with --max-payload-mb <MB> or " +
+                        "GHIDRA_CLI_DECOMPILE_MAX_PAYLOAD_MB, maximum " +
+                        MAX_DECOMPILE_PAYLOAD_MB + ")", ERR_DECOMPILE_PAYLOAD_EXCEEDED);
+                }
+                return errorResult(message);
             }
         } finally {
             decompiler.dispose();
@@ -3889,7 +3959,7 @@ public class GhidraCliBridge extends GhidraScript {
             DataType newType = resolveDataType(typeName);
             if (newType == null) return errorResult("Type not found: " + typeName);
 
-            DecompInterface decompiler = new DecompInterface();
+            DecompInterface decompiler = newDecompiler(DEFAULT_DECOMPILE_MAX_PAYLOAD_MB);
             try {
                 decompiler.openProgram(currentProgram);
                 TaskMonitor mon = monitor;
@@ -4418,7 +4488,7 @@ public class GhidraCliBridge extends GhidraScript {
             if (func1 == null) return errorResult(buildFunctionTargetHint(func1Target));
             if (func2 == null) return errorResult(buildFunctionTargetHint(func2Target));
 
-            DecompInterface decompiler = new DecompInterface();
+            DecompInterface decompiler = newDecompiler(DEFAULT_DECOMPILE_MAX_PAYLOAD_MB);
             try {
                 decompiler.openProgram(currentProgram);
                 TaskMonitor mon = monitor;

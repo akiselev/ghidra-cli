@@ -384,6 +384,30 @@ fn test_decompile_by_fun_style_target() {
 
 #[test]
 #[serial]
+fn test_decompile_with_max_payload_flag() {
+    require_ghidra!();
+    let harness = harness();
+
+    // Exercises the CLI flag -> bridge -> DecompileOptions.setMaxPayloadMBytes path
+    // for both the top-level and `function decompile` spellings.
+    for args in [
+        vec!["decompile", "main", "--max-payload-mb", "64"],
+        vec!["function", "decompile", "main", "--max-payload-mb", "2047"],
+    ] {
+        let result = ghidra(harness)
+            .args(args.clone())
+            .with_project(TEST_PROJECT, TEST_PROGRAM)
+            .run();
+        result.assert_success();
+        assert!(
+            !result.stdout.trim().is_empty(),
+            "{args:?} should produce decompiled output"
+        );
+    }
+}
+
+#[test]
+#[serial]
 fn test_decompile_nonexistent_function() {
     require_ghidra!();
     let harness = harness();

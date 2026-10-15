@@ -432,6 +432,10 @@ pub struct FunctionDecompileArgs {
     /// Include parameter details (name, type, storage)
     #[arg(long)]
     pub with_params: bool,
+    /// Max decompiler response size in MB (1-2047; default 512, Ghidra's own is 50).
+    /// Overrides GHIDRA_CLI_DECOMPILE_MAX_PAYLOAD_MB.
+    #[arg(long, value_name = "MB", value_parser = clap::value_parser!(u32).range(1..=2047))]
+    pub max_payload_mb: Option<u32>,
     #[command(flatten)]
     pub options: QueryOptions,
 }
@@ -1086,6 +1090,10 @@ pub struct DecompileArgs {
     /// Include parameter details (name, type, storage)
     #[arg(long)]
     pub with_params: bool,
+    /// Max decompiler response size in MB (1-2047; default 512, Ghidra's own is 50).
+    /// Overrides GHIDRA_CLI_DECOMPILE_MAX_PAYLOAD_MB.
+    #[arg(long, value_name = "MB", value_parser = clap::value_parser!(u32).range(1..=2047))]
+    pub max_payload_mb: Option<u32>,
     #[command(flatten)]
     pub options: QueryOptions,
 }
@@ -1370,6 +1378,35 @@ pub struct SetupArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_decompile_max_payload_flag() {
+        let cli = Cli::try_parse_from(["ghidra", "decompile", "main", "--max-payload-mb", "1024"])
+            .expect("decompile --max-payload-mb should parse");
+        match cli.command {
+            Commands::Decompile(args) => assert_eq!(args.max_payload_mb, Some(1024)),
+            _ => panic!("expected decompile command"),
+        }
+        let cli = Cli::try_parse_from(["ghidra", "function", "decompile", "main"])
+            .expect("function decompile should parse");
+        match cli.command {
+            Commands::Function(FunctionCommands::Decompile(args)) => {
+                assert_eq!(args.max_payload_mb, None)
+            }
+            _ => panic!("expected function decompile command"),
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_max_payload() {
+        for bad in ["0", "2048", "-5", "big"] {
+            assert!(
+                Cli::try_parse_from(["ghidra", "decompile", "main", "--max-payload-mb", bad])
+                    .is_err(),
+                "--max-payload-mb {bad} should be rejected"
+            );
+        }
+    }
 
     #[test]
     fn parses_decompile_target_flag() {

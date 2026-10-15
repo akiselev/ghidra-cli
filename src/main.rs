@@ -80,7 +80,10 @@ fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("Error: {}", e);
+        match e.downcast_ref::<ipc::protocol::BridgeError>() {
+            Some(be) => eprintln!("Error [{}]: {}", be.code, be.message),
+            None => eprintln!("Error: {}", e),
+        }
         std::process::exit(1);
     }
 }
@@ -935,6 +938,7 @@ fn execute_via_bridge(
             args.resolved_target().to_string(),
             args.with_vars,
             args.with_params,
+            args.max_payload_mb,
         ),
         Commands::Function(cmd) => {
             use cli::FunctionCommands;
@@ -954,6 +958,7 @@ fn execute_via_bridge(
                     args.resolved_target().to_string(),
                     args.with_vars,
                     args.with_params,
+                    args.max_payload_mb,
                 ),
                 FunctionCommands::Get(args) => client.send_command(
                     "get_function",

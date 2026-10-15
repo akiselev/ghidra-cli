@@ -11,7 +11,7 @@ use anyhow::Result;
 use serde_json::json;
 use tracing::debug;
 
-use super::protocol::{BridgeRequest, BridgeResponse};
+use super::protocol::{BridgeError, BridgeRequest, BridgeResponse};
 
 /// Default socket read timeout for short, interactive commands, in seconds.
 ///
@@ -70,6 +70,32 @@ fn decompile_timeout_secs() -> u32 {
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(0)
+}
+
+/// Default cap, in MB, on a single decompiler response. Ghidra's own default
+/// is 50 MB, which large switch-heavy functions exceed ("Response buffer size
+/// exceeded"). Must match `DEFAULT_DECOMPILE_MAX_PAYLOAD_MB` in the Java bridge.
+pub const DEFAULT_DECOMPILE_MAX_PAYLOAD_MB: u32 = 512;
+
+/// Largest accepted payload limit: Ghidra computes `mb << 20` in a Java `int`.
+pub const MAX_DECOMPILE_PAYLOAD_MB: u32 = 2047;
+
+/// Resolve the decompiler payload limit: an explicit flag wins, then the
+/// `GHIDRA_CLI_DECOMPILE_MAX_PAYLOAD_MB` value, then the default. Values are
+/// clamped to `1..=MAX_DECOMPILE_PAYLOAD_MB`; an unparseable env value is ignored.
+fn resolve_max_payload_mb(flag: Option<u32>, env: Option<&str>) -> u32 {
+    flag.or_else(|| env.and_then(|s| s.trim().parse::<u32>().ok()))
+        .unwrap_or(DEFAULT_DECOMPILE_MAX_PAYLOAD_MB)
+        .clamp(1, MAX_DECOMPILE_PAYLOAD_MB)
+}
+
+fn decompile_max_payload_mb(flag: Option<u32>) -> u32 {
+    resolve_max_payload_mb(
+        flag,
+        std::env::var("GHIDRA_CLI_DECOMPILE_MAX_PAYLOAD_MB")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Overall connect budget, from `GHIDRA_CLI_CONNECT_DEADLINE` (min 1s).
@@ -230,6 +256,9 @@ impl BridgeClient {
                 let msg = response
                     .message
                     .unwrap_or_else(|| "Unknown error".to_string());
+                if let Some(code) = response.code {
+                    return Err(BridgeError { code, message: msg }.into());
+                }
                 anyhow::bail!("{}", msg)
             }
             "shutdown" => Ok(json!({"status": "shutdown"})),
@@ -295,11 +324,15 @@ impl BridgeClient {
     }
 
     /// Decompile a function.
+    ///
+    /// `max_payload_mb` overrides the decompiler response-size limit; `None`
+    /// falls back to `GHIDRA_CLI_DECOMPILE_MAX_PAYLOAD_MB`, then the default.
     pub fn decompile(
         &self,
         address: String,
         with_vars: bool,
         with_params: bool,
+        max_payload_mb: Option<u32>,
     ) -> Result<serde_json::Value> {
         self.send_command_with_timeout(
             "decompile",
@@ -308,6 +341,7 @@ impl BridgeClient {
                 "with_vars": with_vars,
                 "with_params": with_params,
                 "timeout_secs": decompile_timeout_secs(),
+                "max_payload_mb": decompile_max_payload_mb(max_payload_mb),
             })),
             long_op_timeout(),
         )
@@ -630,7 +664,10 @@ impl BridgeClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{decompile_timeout_secs, is_transient_connect_error, parse_secs};
+    use super::{
+        decompile_timeout_secs, is_transient_connect_error, parse_secs, resolve_max_payload_mb,
+        DEFAULT_DECOMPILE_MAX_PAYLOAD_MB, MAX_DECOMPILE_PAYLOAD_MB,
+    };
     use std::io::{Error, ErrorKind};
     use std::time::Duration;
 
@@ -660,6 +697,39 @@ mod tests {
         if std::env::var_os("GHIDRA_CLI_DECOMPILE_TIMEOUT").is_none() {
             assert_eq!(decompile_timeout_secs(), 0);
         }
+    }
+
+    #[test]
+    fn max_payload_defaults_above_ghidra_default() {
+        assert_eq!(
+            resolve_max_payload_mb(None, None),
+            DEFAULT_DECOMPILE_MAX_PAYLOAD_MB
+        );
+        // Ghidra's own default is 50 MB; ours must be larger to be useful.
+        const { assert!(DEFAULT_DECOMPILE_MAX_PAYLOAD_MB > 50) };
+    }
+
+    #[test]
+    fn max_payload_flag_overrides_env() {
+        assert_eq!(resolve_max_payload_mb(Some(1024), Some("64")), 1024);
+        assert_eq!(resolve_max_payload_mb(None, Some(" 64 ")), 64);
+        assert_eq!(
+            resolve_max_payload_mb(None, Some("lots")),
+            DEFAULT_DECOMPILE_MAX_PAYLOAD_MB
+        );
+    }
+
+    #[test]
+    fn max_payload_is_clamped_to_ghidra_int_range() {
+        assert_eq!(resolve_max_payload_mb(None, Some("0")), 1);
+        assert_eq!(
+            resolve_max_payload_mb(None, Some("4096")),
+            MAX_DECOMPILE_PAYLOAD_MB
+        );
+        assert_eq!(
+            resolve_max_payload_mb(Some(9999), None),
+            MAX_DECOMPILE_PAYLOAD_MB
+        );
     }
 
     #[test]
