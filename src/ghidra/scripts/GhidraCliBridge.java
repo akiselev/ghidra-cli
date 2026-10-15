@@ -77,6 +77,10 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.ArrayDeque;
+import java.util.Map;
+import java.net.SocketTimeoutException;
 
 public class GhidraCliBridge extends GhidraScript {
 
@@ -103,8 +107,111 @@ public class GhidraCliBridge extends GhidraScript {
     private volatile ServerSocket serverSocket;
     private volatile ExecutorService connectionExecutor;
     private volatile ExecutorService responseExecutor;
-    private volatile JobRecord activeJob;
     private volatile Thread programThread;
+
+    // --- Read/write split (bug 006) ---
+    //
+    // Exclusive jobs (writes, open_program/program_close/analyze/import, and
+    // script_run unless --read-only) run on the original GhidraScript thread
+    // under the write side of a fair ReentrantReadWriteLock. Read-only jobs run
+    // on a bounded worker pool under the read side. Fairness means a waiting
+    // writer stops new readers from entering, so writers are never starved.
+    //
+    // Readers only dereference currentProgram/state while holding the read
+    // lock; writers only change them while holding the write lock, which gives
+    // readers the happens-before edge they need.
+    private static final String LANE_EXCLUSIVE = "exclusive";
+    private static final String LANE_READ = "read";
+    private static final String LANE_READ_HEAVY = "read-heavy";
+    private static final int MAX_READ_QUEUE = 256;
+    private static final int PROTOCOL_VERSION = 3;
+    private static final long WATCHDOG_INTERVAL_MS = 2000;
+
+    /** Commands that only read the program. Everything else is exclusive. */
+    private static final Set<String> READ_COMMANDS = new HashSet<>(Arrays.asList(
+        "program_info", "list_functions", "get_function", "decompile",
+        "list_strings", "list_imports", "list_exports", "memory_map",
+        "xrefs_to", "xrefs_from", "xrefs_list", "list_programs",
+        "find_string", "find_bytes", "find_function", "find_calls",
+        "find_crypto", "find_interesting",
+        "symbol_list", "symbol_get", "type_list", "type_get",
+        "tag_list", "tag_get", "comment_list", "comment_get",
+        "graph_calls", "graph_callers", "graph_callees", "graph_export",
+        "diff_programs", "diff_functions", "patch_export",
+        "disasm", "stats", "script_list", "script_java", "script_python",
+        "batch", "read_memory"));
+
+    /**
+     * Read commands that can run for a long time. At most heavyReadLimit of
+     * them run at once (one fewer than the pool), so a worker always remains
+     * for cheap reads; cheap reads are also dequeued first.
+     */
+    private static final Set<String> HEAVY_READ_COMMANDS = new HashSet<>(Arrays.asList(
+        "decompile", "script_run", "stats", "list_strings",
+        "find_string", "find_bytes", "find_function", "find_calls",
+        "find_crypto", "find_interesting",
+        "graph_calls", "graph_callers", "graph_callees", "graph_export",
+        "diff_programs", "diff_functions", "patch_export"));
+
+    /** Every command dispatchCommand() knows; unknown ones fail fast, unqueued. */
+    private static final Set<String> KNOWN_COMMANDS = new HashSet<>(Arrays.asList(
+        "program_info", "list_functions", "get_function", "rename_function",
+        "create_function", "delete_function", "decompile", "list_strings",
+        "list_imports", "list_exports", "memory_map", "xrefs_to", "xrefs_from",
+        "xrefs_list", "import", "analyze", "list_programs", "open_program",
+        "program_close", "program_delete", "program_export",
+        "find_string", "find_bytes", "find_function", "find_calls",
+        "find_crypto", "find_interesting",
+        "symbol_list", "symbol_get", "symbol_create", "symbol_delete", "symbol_rename",
+        "type_list", "type_get", "type_create", "type_apply", "type_delete",
+        "type_rename", "type_create_enum", "type_typedef", "type_add_field",
+        "type_del_field",
+        "tag_list", "tag_get", "tag_create", "tag_delete", "tag_rename",
+        "tag_set_comment", "tag_add", "tag_remove",
+        "function_set_signature", "function_set_return_type",
+        "function_set_calling_convention", "set_var_type",
+        "comment_list", "comment_get", "comment_set", "comment_delete",
+        "graph_calls", "graph_callers", "graph_callees", "graph_export",
+        "diff_programs", "diff_functions",
+        "patch_bytes", "patch_nop", "patch_export",
+        "disasm", "stats", "script_run", "script_java", "script_python",
+        "script_list", "batch", "read_memory"));
+
+    private final ReentrantReadWriteLock programLock = new ReentrantReadWriteLock(true);
+    private final Object readLaneLock = new Object();
+    // Both deques are guarded by readLaneLock.
+    private final ArrayDeque<ProgramJob> readQueue = new ArrayDeque<>();
+    private final ArrayDeque<ProgramJob> heavyQueue = new ArrayDeque<>();
+    private int heavyRunning; // guarded by readLaneLock
+    private boolean readersStopping; // guarded by readLaneLock
+    private final List<Thread> readWorkers = new ArrayList<>();
+    private volatile int readThreadCount;
+    private volatile int heavyReadLimit;
+    private volatile Thread watchdogThread;
+
+    /** Jobs that have left their queue: waiting for the lock, or running. */
+    private final ConcurrentHashMap<Long, JobRecord> activeJobs = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> jobIdsByRequest = new ConcurrentHashMap<>();
+    private final AtomicLong abandonedJobCount = new AtomicLong();
+
+    /**
+     * The running job's cancellable monitor, per thread. Handlers must use
+     * jobMonitor() rather than GhidraScript's single shared `monitor` field,
+     * which concurrent readers would otherwise overwrite.
+     */
+    private final ThreadLocal<TaskMonitor> jobMonitorLocal = new ThreadLocal<>();
+
+    /** One decompiler per read worker thread; never shared between threads. */
+    private static final class ThreadDecompiler {
+        DecompInterface decompiler;
+        Program program;
+        int payloadMBytes;
+        long modificationNumber;
+    }
+    private final ThreadLocal<ThreadDecompiler> threadDecompiler = new ThreadLocal<>();
+
+    /** Script compilation goes through Ghidra's shared OSGi bundle host. */
+    private final Object scriptLoadLock = new Object();
 
     // Immutable bridge-info values published by the program execution thread.
     // Control-plane threads read these instead of dereferencing Ghidra objects.
@@ -186,6 +293,9 @@ public class GhidraCliBridge extends GhidraScript {
     private static class JobRecord {
         final long id;
         final String command;
+        final String lane;
+        final String requestId;
+        final Socket client;
         final long enqueuedAt;
         final JobTaskMonitor monitor = new JobTaskMonitor();
         final CompletableFuture<HandleResult> completion = new CompletableFuture<>();
@@ -194,31 +304,42 @@ public class GhidraCliBridge extends GhidraScript {
         volatile long startedAt;
         volatile long finishedAt;
         volatile String error;
+        /** The client went away; the job was skipped or cancelled because of it. */
+        volatile boolean abandoned;
 
-        JobRecord(long id, String command) {
+        JobRecord(long id, String command, String lane, String requestId, Socket client) {
             this.id = id;
             this.command = command;
+            this.lane = lane;
+            this.requestId = requestId;
+            this.client = client;
             this.enqueuedAt = System.currentTimeMillis();
+        }
+
+        boolean isFinished() {
+            return finishedAt > 0;
         }
     }
 
     private static class ProgramJob {
         final JobRecord record;
         final JsonObject args;
+        final String expectProgram;
         final boolean poison;
 
-        ProgramJob(JobRecord record, JsonObject args) {
-            this(record, args, false);
+        ProgramJob(JobRecord record, JsonObject args, String expectProgram) {
+            this(record, args, expectProgram, false);
         }
 
-        private ProgramJob(JobRecord record, JsonObject args, boolean poison) {
+        private ProgramJob(JobRecord record, JsonObject args, String expectProgram, boolean poison) {
             this.record = record;
             this.args = args;
+            this.expectProgram = expectProgram;
             this.poison = poison;
         }
 
         static ProgramJob poison() {
-            return new ProgramJob(null, null, true);
+            return new ProgramJob(null, null, null, true);
         }
     }
 
@@ -273,6 +394,8 @@ public class GhidraCliBridge extends GhidraScript {
         shutdownRequested = false;
         programThread = Thread.currentThread();
         refreshBridgeSnapshot();
+        startReadWorkers();
+        startWatchdog();
 
         // Write port file
         File portFile = new File(portFilePath);
@@ -302,11 +425,19 @@ public class GhidraCliBridge extends GhidraScript {
         acceptor.start();
 
         try {
-            // Deliberately run program jobs on the original GhidraScript thread.
-            // Communications remain responsive while Ghidra access stays serialized.
+            // Exclusive jobs run on the original GhidraScript thread; read-only
+            // jobs run on the read worker pool. Communications stay responsive.
             runProgramJobs();
         } finally {
             beginShutdown();
+            // Drain every read job accepted before shutdown, then let the
+            // workers exit. This must finish before run() returns, because
+            // Ghidra closes the program once the script ends.
+            stopReadWorkers();
+            Thread watchdog = watchdogThread;
+            if (watchdog != null) {
+                watchdog.interrupt();
+            }
             try {
                 acceptor.join(5000);
             } catch (InterruptedException e) {
@@ -377,7 +508,9 @@ public class GhidraCliBridge extends GhidraScript {
         try {
             // The wire protocol is one JSON request per connection. Parse and
             // enqueue here, but never occupy a connection thread while waiting
-            // for serialized Ghidra work to finish.
+            // for program work to finish. The socket stays open until the
+            // response is written; the watchdog uses it to notice clients that
+            // have gone away (bug 005).
             client.setSoTimeout(30000);
             BufferedReader in = new BufferedReader(
                 new InputStreamReader(client.getInputStream()));
@@ -386,8 +519,9 @@ public class GhidraCliBridge extends GhidraScript {
                 client.close();
                 return;
             }
+            client.setSoTimeout(0);
 
-            CompletableFuture<HandleResult> completion = handleRequest(line.trim());
+            CompletableFuture<HandleResult> completion = handleRequest(line.trim(), client);
             if (completion.isDone()) {
                 respondAndClose(client, completion.join());
                 return;
@@ -424,6 +558,15 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private void respondAndClose(Socket client, HandleResult result) {
+        if (result != null && result.abandoned) {
+            // Nobody is listening; writing would only log a broken-pipe error.
+            try {
+                client.close();
+            } catch (IOException ignored) {
+                // Already closed.
+            }
+            return;
+        }
         try (
             Socket closeableClient = client;
             PrintWriter out = new PrintWriter(
@@ -464,27 +607,161 @@ public class GhidraCliBridge extends GhidraScript {
             if (job.poison) {
                 return;
             }
-            executeProgramJob(job);
+            runWithLock(job, true);
         }
     }
 
-    private void executeProgramJob(ProgramJob job) {
+    /**
+     * Run one job under the program lock: the write side for exclusive jobs,
+     * the read side for reads. Jobs whose client has gone away, or that were
+     * cancelled while waiting, are skipped without touching the program.
+     */
+    private void runWithLock(ProgramJob job, boolean exclusive) {
         JobRecord record = job.record;
-        TaskMonitor bridgeMonitor = monitor;
-        activeJob = record;
+        if (skipIfAbandoned(record)) {
+            return;
+        }
+        record.state = "waiting_lock";
+        activeJobs.put(record.id, record);
+        java.util.concurrent.locks.Lock lock = exclusive
+            ? programLock.writeLock()
+            : programLock.readLock();
+        lock.lock();
+        try {
+            if (skipIfCancelled(record) || skipIfAbandoned(record)) {
+                return;
+            }
+            // A cancel or the watchdog may have finished this job while it
+            // waited for the lock; claim it atomically before running.
+            synchronized (record) {
+                if (record.isFinished()) {
+                    return;
+                }
+                record.state = "running";
+            }
+            executeProgramJob(job, exclusive);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private boolean skipIfCancelled(JobRecord record) {
+        if (!record.monitor.isCancelled()) {
+            return false;
+        }
+        finishWithoutRunning(record, "cancelled", "Cancelled before execution", false);
+        return true;
+    }
+
+    /** Probe the client socket; if it is gone, mark the job abandoned and skip it. */
+    private boolean skipIfAbandoned(JobRecord record) {
+        if (!isPeerGone(record.client)) {
+            return false;
+        }
+        finishWithoutRunning(record, "abandoned",
+            "Client disconnected before the job started; skipped", true);
+        return true;
+    }
+
+    private void finishWithoutRunning(
+            JobRecord record, String state, String message, boolean abandoned) {
+        synchronized (record) {
+            if (record.isFinished() || "running".equals(record.state)
+                    || "cancel_requested".equals(record.state)) {
+                return;
+            }
+            record.finishedAt = System.currentTimeMillis();
+        }
+        record.abandoned = record.abandoned || abandoned;
+        if (record.abandoned) {
+            abandonedJobCount.incrementAndGet();
+            state = "abandoned";
+        }
+        record.monitor.cancel();
+        record.state = state;
+        record.error = message;
+        activeJobs.remove(record.id);
+        JsonObject response = errorResponse(message);
+        response.addProperty("job_id", record.id);
+        HandleResult result = new HandleResult(response, false);
+        result.abandoned = record.abandoned;
+        record.completion.complete(result);
+        retainCompletedJob(record);
+    }
+
+    /**
+     * True when the client that sent this job has closed its connection. The
+     * client sends one request line and then only reads, so EOF on our side
+     * means it exited, was killed, or timed out. A 1 ms read either times out
+     * (still connected) or returns EOF/an error (gone).
+     */
+    private boolean isPeerGone(Socket socket) {
+        if (socket == null) {
+            return false;
+        }
+        synchronized (socket) {
+            if (socket.isClosed() || socket.isInputShutdown()) {
+                return true;
+            }
+            int previous = 0;
+            try {
+                previous = socket.getSoTimeout();
+                socket.setSoTimeout(1);
+                int b = socket.getInputStream().read();
+                // Unexpected extra bytes still mean the peer is alive.
+                return b < 0;
+            } catch (SocketTimeoutException e) {
+                return false;
+            } catch (IOException e) {
+                return true;
+            } finally {
+                try {
+                    if (!socket.isClosed()) {
+                        socket.setSoTimeout(previous);
+                    }
+                } catch (IOException ignored) {
+                    // Closed concurrently; nothing to restore.
+                }
+            }
+        }
+    }
+
+    private void executeProgramJob(ProgramJob job, boolean exclusive) {
+        JobRecord record = job.record;
+        TaskMonitor bridgeMonitor = exclusive ? monitor : null;
         record.state = "running";
         record.startedAt = System.currentTimeMillis();
-        monitor = record.monitor;
+        activeJobs.put(record.id, record);
+        jobMonitorLocal.set(record.monitor);
+        if (exclusive) {
+            // Scripts and legacy code may still read GhidraScript's field.
+            monitor = record.monitor;
+        }
 
         HandleResult result;
         try {
-            result = executeProgramRequest(record.command, job.args);
+            if (job.expectProgram != null && !job.expectProgram.isEmpty()
+                    && (currentProgram == null
+                        || !job.expectProgram.equals(currentProgram.getName()))) {
+                JsonObject mismatch = errorResult(
+                    "Program mismatch: the request expects '" + job.expectProgram
+                    + "' but the bridge's current program is "
+                    + (currentProgram == null ? "none" : "'" + currentProgram.getName() + "'")
+                    + " (another client switched programs)", "program_mismatch");
+                mismatch.addProperty("current_program",
+                    currentProgram == null ? null : currentProgram.getName());
+                result = new HandleResult(errorResponse(mismatch), false);
+            } else {
+                result = executeProgramRequest(record.command, job.args);
+            }
             result.response.addProperty("job_id", record.id);
 
             String responseStatus = result.response.has("status")
                 ? result.response.get("status").getAsString()
                 : "error";
-            if (record.monitor.isCancelled()) {
+            if (record.abandoned) {
+                record.state = "abandoned";
+            } else if (record.monitor.isCancelled()) {
                 record.state = "error".equals(responseStatus)
                     ? "cancelled"
                     : "completed_after_cancel";
@@ -494,20 +771,202 @@ public class GhidraCliBridge extends GhidraScript {
             if ("error".equals(responseStatus) && result.response.has("message")) {
                 record.error = result.response.get("message").getAsString();
             }
-        } catch (Exception e) {
-            record.state = record.monitor.isCancelled() ? "cancelled" : "failed";
-            record.error = e.getMessage();
-            result = new HandleResult(errorResponse(e.getMessage()), false);
+        } catch (Throwable e) {
+            record.state = record.abandoned
+                ? "abandoned"
+                : record.monitor.isCancelled() ? "cancelled" : "failed";
+            record.error = e.getMessage() == null ? e.toString() : e.getMessage();
+            result = new HandleResult(errorResponse(record.error), false);
             result.response.addProperty("job_id", record.id);
         } finally {
-            monitor = bridgeMonitor;
+            jobMonitorLocal.remove();
+            if (exclusive) {
+                monitor = bridgeMonitor;
+                // Only exclusive jobs can change the open program or project.
+                refreshBridgeSnapshot();
+            }
+            if (record.abandoned) {
+                abandonedJobCount.incrementAndGet();
+            }
             record.finishedAt = System.currentTimeMillis();
-            activeJob = null;
-            refreshBridgeSnapshot();
+            activeJobs.remove(record.id);
         }
 
+        result.abandoned = record.abandoned;
         record.completion.complete(result);
-        retainCompletedJob(record.id);
+        retainCompletedJob(record);
+    }
+
+    // --- Read worker pool ---
+
+    /**
+     * Size of the read pool: GHIDRA_CLI_READ_THREADS if set (0 disables the
+     * pool, so every job runs exclusively as in older bridges), otherwise
+     * min(8, cores / 2) with a floor of 2 so one worker always stays free for
+     * cheap reads.
+     */
+    private static int configuredReadThreads() {
+        String raw = System.getenv("GHIDRA_CLI_READ_THREADS");
+        if (raw != null && !raw.trim().isEmpty()) {
+            try {
+                return Math.max(0, Math.min(64, Integer.parseInt(raw.trim())));
+            } catch (NumberFormatException ignored) {
+                // Fall through to the default.
+            }
+        }
+        int cores = Runtime.getRuntime().availableProcessors();
+        return Math.max(2, Math.min(8, cores / 2));
+    }
+
+    private void startReadWorkers() {
+        int count = configuredReadThreads();
+        readThreadCount = count;
+        heavyReadLimit = Math.max(1, count - 1);
+        for (int i = 0; i < count; i++) {
+            Thread worker = new Thread(this::readWorkerLoop, "ghidra-cli-reader-" + (i + 1));
+            worker.setDaemon(true);
+            readWorkers.add(worker);
+            worker.start();
+        }
+    }
+
+    private void stopReadWorkers() {
+        synchronized (readLaneLock) {
+            readersStopping = true;
+            readLaneLock.notifyAll();
+        }
+        for (Thread worker : readWorkers) {
+            try {
+                worker.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    private void readWorkerLoop() {
+        try {
+            while (true) {
+                ProgramJob job = null;
+                boolean heavy = false;
+                synchronized (readLaneLock) {
+                    while (job == null) {
+                        job = readQueue.pollFirst();
+                        if (job == null && heavyRunning < heavyReadLimit) {
+                            job = heavyQueue.pollFirst();
+                            if (job != null) {
+                                heavy = true;
+                                heavyRunning++;
+                            }
+                        }
+                        if (job == null) {
+                            if (readersStopping && readQueue.isEmpty() && heavyQueue.isEmpty()) {
+                                return;
+                            }
+                            try {
+                                readLaneLock.wait();
+                            } catch (InterruptedException e) {
+                                if (readersStopping) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                try {
+                    runWithLock(job, false);
+                } catch (Throwable t) {
+                    // Never lose a worker thread to one bad job.
+                    finishWithoutRunning(job.record, "failed",
+                        "Read worker error: " + t, false);
+                } finally {
+                    if (heavy) {
+                        synchronized (readLaneLock) {
+                            heavyRunning--;
+                            readLaneLock.notifyAll();
+                        }
+                    }
+                }
+            }
+        } finally {
+            discardThreadDecompiler();
+        }
+    }
+
+    // --- Abandoned-job watchdog (bug 005) ---
+
+    private void startWatchdog() {
+        Thread watchdog = new Thread(() -> {
+            while (!shutdownRequested) {
+                try {
+                    Thread.sleep(WATCHDOG_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                try {
+                    sweepAbandonedJobs();
+                } catch (Throwable t) {
+                    printerr("Watchdog error: " + t);
+                }
+            }
+        }, "ghidra-cli-watchdog");
+        watchdog.setDaemon(true);
+        watchdogThread = watchdog;
+        watchdog.start();
+    }
+
+    /**
+     * Drop queued jobs whose client is gone, and cooperatively cancel running
+     * reads and scripts whose client is gone (decompiles and scripts honour
+     * the job monitor). Other running exclusive jobs are left to finish, so a
+     * killed client never leaves a write half-applied by cancellation.
+     */
+    private void sweepAbandonedJobs() {
+        for (ProgramJob job : programQueue.toArray(new ProgramJob[0])) {
+            if (job.poison || job.record == null) continue;
+            if (isPeerGone(job.record.client) && programQueue.remove(job)) {
+                finishWithoutRunning(job.record, "abandoned",
+                    "Client disconnected while the job was queued; skipped", true);
+            }
+        }
+        List<ProgramJob> readJobs = new ArrayList<>();
+        synchronized (readLaneLock) {
+            readJobs.addAll(readQueue);
+            readJobs.addAll(heavyQueue);
+        }
+        for (ProgramJob job : readJobs) {
+            if (!isPeerGone(job.record.client)) continue;
+            boolean removed;
+            synchronized (readLaneLock) {
+                removed = readQueue.remove(job) || heavyQueue.remove(job);
+            }
+            if (removed) {
+                finishWithoutRunning(job.record, "abandoned",
+                    "Client disconnected while the job was queued; skipped", true);
+            }
+        }
+        for (JobRecord record : activeJobs.values()) {
+            if (record.abandoned || record.isFinished()) continue;
+            if ("waiting_lock".equals(record.state)) {
+                if (isPeerGone(record.client)) {
+                    finishWithoutRunning(record, "abandoned",
+                        "Client disconnected while the job waited for the program lock; skipped",
+                        true);
+                }
+                continue;
+            }
+            if (!"running".equals(record.state)) continue;
+            boolean cancellable = !LANE_EXCLUSIVE.equals(record.lane)
+                || "script_run".equals(record.command);
+            if (!cancellable) continue;
+            if (isPeerGone(record.client) && !record.isFinished()) {
+                record.abandoned = true;
+                record.monitor.cancel();
+                printerr("Job " + record.id + " (" + record.command
+                    + "): client disconnected; cancellation requested");
+            }
+        }
     }
 
     private void beginShutdown() {
@@ -568,6 +1027,8 @@ public class GhidraCliBridge extends GhidraScript {
     private static class HandleResult {
         JsonObject response;
         boolean shouldShutdown;
+        /** Set when the requesting client is gone; the response is discarded. */
+        boolean abandoned;
 
         HandleResult(JsonObject response, boolean shouldShutdown) {
             this.response = response;
@@ -575,12 +1036,16 @@ public class GhidraCliBridge extends GhidraScript {
         }
     }
 
-    private CompletableFuture<HandleResult> handleRequest(String line) {
+    private CompletableFuture<HandleResult> handleRequest(String line, Socket client) {
         try {
             JsonObject req = JsonParser.parseString(line).getAsJsonObject();
             String command = req.has("command") ? req.get("command").getAsString() : null;
             JsonObject args = req.has("args") && !req.get("args").isJsonNull()
                 ? req.getAsJsonObject("args") : new JsonObject();
+            String requestId = req.has("request_id") && !req.get("request_id").isJsonNull()
+                ? req.get("request_id").getAsString() : null;
+            String expectProgram = req.has("expect_program") && !req.get("expect_program").isJsonNull()
+                ? req.get("expect_program").getAsString() : null;
 
             if (command == null || command.isEmpty()) {
                 return CompletableFuture.completedFuture(
@@ -591,8 +1056,17 @@ public class GhidraCliBridge extends GhidraScript {
                 return CompletableFuture.completedFuture(handleControlCommand(command, args));
             }
 
-            JobRecord record = new JobRecord(nextJobId.getAndIncrement(), command);
-            ProgramJob job = new ProgramJob(record, args.deepCopy());
+            if (!KNOWN_COMMANDS.contains(command)) {
+                // Fail fast instead of queueing a job that can only fail.
+                JsonObject response = errorResponse("Unknown command: " + command);
+                response.addProperty("code", "unknown_command");
+                return CompletableFuture.completedFuture(new HandleResult(response, false));
+            }
+
+            String lane = laneFor(command, args);
+            JobRecord record = new JobRecord(
+                nextJobId.getAndIncrement(), command, lane, requestId, client);
+            ProgramJob job = new ProgramJob(record, args.deepCopy(), expectProgram);
 
             synchronized (lifecycleLock) {
                 if (!acceptingJobs) {
@@ -601,10 +1075,29 @@ public class GhidraCliBridge extends GhidraScript {
                         false));
                 }
                 jobs.put(record.id, record);
-                if (!programQueue.offer(job)) {
+                if (requestId != null) {
+                    jobIdsByRequest.put(requestId, record.id);
+                }
+                boolean queued;
+                if (LANE_EXCLUSIVE.equals(lane)) {
+                    queued = programQueue.offer(job);
+                } else {
+                    synchronized (readLaneLock) {
+                        ArrayDeque<ProgramJob> queue =
+                            LANE_READ.equals(lane) ? readQueue : heavyQueue;
+                        queued = queue.size() < MAX_READ_QUEUE && queue.offerLast(job);
+                        if (queued) {
+                            readLaneLock.notifyAll();
+                        }
+                    }
+                }
+                if (!queued) {
                     jobs.remove(record.id);
+                    if (requestId != null) {
+                        jobIdsByRequest.remove(requestId);
+                    }
                     return CompletableFuture.completedFuture(new HandleResult(
-                        errorResponse("Bridge program queue is full; retry shortly"), false));
+                        errorResponse("Bridge " + lane + " queue is full; retry shortly"), false));
                 }
             }
             return record.completion;
@@ -612,6 +1105,20 @@ public class GhidraCliBridge extends GhidraScript {
             return CompletableFuture.completedFuture(
                 new HandleResult(errorResponse(e.getMessage()), false));
         }
+    }
+
+    /** Which lane a command runs in; see READ_COMMANDS. */
+    private String laneFor(String command, JsonObject args) {
+        if (readThreadCount <= 0) {
+            return LANE_EXCLUSIVE;
+        }
+        if ("script_run".equals(command)) {
+            return getArgBool(args, "read_only", false) ? LANE_READ_HEAVY : LANE_EXCLUSIVE;
+        }
+        if (!READ_COMMANDS.contains(command)) {
+            return LANE_EXCLUSIVE;
+        }
+        return HEAVY_READ_COMMANDS.contains(command) ? LANE_READ_HEAVY : LANE_READ;
     }
 
     private boolean isControlCommand(String command) {
@@ -844,6 +1351,63 @@ public class GhidraCliBridge extends GhidraScript {
         return decompiler;
     }
 
+    /** The current job's cancellable monitor on this thread (DUMMY outside a job). */
+    private TaskMonitor jobMonitor() {
+        TaskMonitor m = jobMonitorLocal.get();
+        return m == null ? TaskMonitor.DUMMY : m;
+    }
+
+    /**
+     * This read worker's decompiler, created on first use and reused for later
+     * decompiles on the same thread. It is rebuilt when the program or payload
+     * limit changes, and its cache is flushed when the program has been
+     * modified since its last use. Returns null on the exclusive program
+     * thread, where callers create (and dispose) a decompiler per call.
+     */
+    private DecompInterface acquireThreadDecompiler(int payloadMBytes) {
+        if (Thread.currentThread() == programThread || currentProgram == null) {
+            return null;
+        }
+        ThreadDecompiler cached = threadDecompiler.get();
+        if (cached != null && (cached.program != currentProgram
+                || cached.payloadMBytes != payloadMBytes)) {
+            discardThreadDecompiler();
+            cached = null;
+        }
+        long modification = currentProgram.getModificationNumber();
+        if (cached == null) {
+            DecompInterface decompiler = newDecompiler(payloadMBytes);
+            if (!decompiler.openProgram(currentProgram)) {
+                String reason = decompiler.getLastMessage();
+                decompiler.dispose();
+                throw new IllegalStateException("Decompiler failed to open program"
+                    + (reason == null ? "" : ": " + reason));
+            }
+            cached = new ThreadDecompiler();
+            cached.decompiler = decompiler;
+            cached.program = currentProgram;
+            cached.payloadMBytes = payloadMBytes;
+            threadDecompiler.set(cached);
+        } else if (cached.modificationNumber != modification) {
+            cached.decompiler.flushCache();
+        }
+        cached.modificationNumber = modification;
+        return cached.decompiler;
+    }
+
+    /** Dispose this thread's cached decompiler (after a failure, or on exit). */
+    private void discardThreadDecompiler() {
+        ThreadDecompiler cached = threadDecompiler.get();
+        threadDecompiler.remove();
+        if (cached != null && cached.decompiler != null) {
+            try {
+                cached.decompiler.dispose();
+            } catch (Throwable ignored) {
+                // Best effort; the native process may already be gone.
+            }
+        }
+    }
+
     private static int clampPayloadMBytes(int mb) {
         return Math.max(1, Math.min(MAX_DECOMPILE_PAYLOAD_MB, mb));
     }
@@ -958,19 +1522,20 @@ public class GhidraCliBridge extends GhidraScript {
         JsonObject result = new JsonObject();
         result.addProperty("message", "pong");
         result.addProperty("bridge_state", acceptingJobs ? "running" : "draining");
-        result.addProperty("queue_depth", programQueue.size());
-        JobRecord active = activeJob;
+        result.addProperty("queue_depth", queuedJobCount());
+        JobRecord active = primaryActiveJob();
         if (active != null) {
             result.addProperty("active_job_id", active.id);
             result.addProperty("active_command", active.command);
         }
+        result.addProperty("active_job_count", activeJobs.size());
         return result;
     }
 
     private JsonObject handleBridgeInfo() {
         JsonObject result = new JsonObject();
         String programName = currentProgramNameSnapshot;
-        result.addProperty("protocol_version", 2);
+        result.addProperty("protocol_version", PROTOCOL_VERSION);
         result.addProperty("has_current_program", programName != null);
         if (programName != null) {
             result.addProperty("current_program", programName);
@@ -980,21 +1545,48 @@ public class GhidraCliBridge extends GhidraScript {
             result.addProperty("project_name", projectNameSnapshot);
         }
         result.addProperty("program_count", programCountSnapshot);
+        result.add("capabilities", capabilities());
         addQueueSummary(result, false);
         return result;
     }
 
+    /** Feature flags the CLI checks before relying on newer behaviour. */
+    private JsonArray capabilities() {
+        JsonArray caps = new JsonArray();
+        caps.add("read_pool");
+        caps.add("request_id");
+        caps.add("abandon_on_disconnect");
+        caps.add("read_only_scripts");
+        caps.add("expect_program");
+        caps.add("disasm_function_body");
+        caps.add("unknown_command_code");
+        return caps;
+    }
+
     private JsonObject handleStatus() {
         JsonObject result = new JsonObject();
-        result.addProperty("protocol_version", 2);
+        result.addProperty("protocol_version", PROTOCOL_VERSION);
         result.addProperty("uptime_ms", System.currentTimeMillis() - startTime);
         addQueueSummary(result, true);
         return result;
     }
 
+    /** Resolve a job from {"job_id": n} or {"request_id": "..."}; null if neither given. */
+    private Long requestedJobId(JsonObject args) {
+        if (args == null) return null;
+        if (args.has("job_id") && !args.get("job_id").isJsonNull()) {
+            return args.get("job_id").getAsLong();
+        }
+        if (args.has("request_id") && !args.get("request_id").isJsonNull()) {
+            Long id = jobIdsByRequest.get(args.get("request_id").getAsString());
+            return id == null ? -1L : id;
+        }
+        return null;
+    }
+
     private JsonObject handleJobStatus(JsonObject args) {
-        if (args != null && args.has("job_id") && !args.get("job_id").isJsonNull()) {
-            long id = args.get("job_id").getAsLong();
+        Long id = requestedJobId(args);
+        if (id != null) {
             JobRecord record = jobs.get(id);
             if (record == null) {
                 JsonObject result = new JsonObject();
@@ -1004,7 +1596,8 @@ public class GhidraCliBridge extends GhidraScript {
             }
             JsonObject result = new JsonObject();
             result.addProperty("found", true);
-            result.add("job", jobToJson(record, queuePosition(id)));
+            result.add("job", jobToJson(record, true));
+            addQueueSummary(result, false);
             return result;
         }
         return handleStatus();
@@ -1012,38 +1605,25 @@ public class GhidraCliBridge extends GhidraScript {
 
     private JsonObject handleJobCancel(JsonObject args) {
         JobRecord target;
-        if (args != null && args.has("job_id") && !args.get("job_id").isJsonNull()) {
-            target = jobs.get(args.get("job_id").getAsLong());
+        Long id = requestedJobId(args);
+        if (id != null) {
+            target = jobs.get(id);
         } else {
-            target = activeJob;
+            // No ID: cancel "the" active job, as older bridges did, but only
+            // when that is unambiguous now that reads run concurrently.
+            if (activeJobs.size() > 1) {
+                return errorResult("Several jobs are active ("
+                    + activeJobIds() + "); pass a job id");
+            }
+            target = primaryActiveJob();
         }
 
         if (target == null) {
             return errorResult("No matching active or queued job");
         }
 
-        JobRecord active = activeJob;
-        if (active != null && active.id == target.id) {
-            target.state = "cancel_requested";
-            target.monitor.cancel();
-            JsonObject result = new JsonObject();
-            result.addProperty("job_id", target.id);
-            result.addProperty("state", target.state);
-            result.addProperty("message", "Cancellation requested; completion is cooperative");
-            return result;
-        }
-
-        ProgramJob queued = findQueuedJob(target.id);
-        if (queued != null && programQueue.remove(queued)) {
-            target.monitor.cancel();
-            target.state = "cancelled";
-            target.finishedAt = System.currentTimeMillis();
-            target.error = "Cancelled before execution";
-            JsonObject response = errorResponse(target.error);
-            response.addProperty("job_id", target.id);
-            target.completion.complete(new HandleResult(response, false));
-            retainCompletedJob(target.id);
-
+        if (removeQueuedJob(target)) {
+            finishWithoutRunning(target, "cancelled", "Cancelled before execution", false);
             JsonObject result = new JsonObject();
             result.addProperty("job_id", target.id);
             result.addProperty("state", target.state);
@@ -1051,15 +1631,31 @@ public class GhidraCliBridge extends GhidraScript {
             return result;
         }
 
-        // It may have moved from the queue to active between the checks above.
-        active = activeJob;
-        if (active != null && active.id == target.id) {
-            target.state = "cancel_requested";
+        if ("waiting_lock".equals(target.state)) {
+            // It has not started: answer its client now instead of when the
+            // lock frees up. The waiting thread skips it once it gets the lock.
+            finishWithoutRunning(target, "cancelled", "Cancelled before execution", false);
+            if (target.isFinished()) {
+                JsonObject result = new JsonObject();
+                result.addProperty("job_id", target.id);
+                result.addProperty("state", target.state);
+                result.addProperty("message", target.error);
+                return result;
+            }
+        }
+
+        if (activeJobs.containsKey(target.id) && !target.isFinished()) {
             target.monitor.cancel();
+            if ("running".equals(target.state)) {
+                target.state = "cancel_requested";
+            }
             JsonObject result = new JsonObject();
             result.addProperty("job_id", target.id);
             result.addProperty("state", target.state);
-            result.addProperty("message", "Cancellation requested; completion is cooperative");
+            result.addProperty("message", "running".equals(target.state)
+                || "cancel_requested".equals(target.state)
+                ? "Cancellation requested; completion is cooperative"
+                : "Cancellation requested; the job will be skipped when it gets the lock");
             return result;
         }
 
@@ -1070,25 +1666,114 @@ public class GhidraCliBridge extends GhidraScript {
         return result;
     }
 
-    private ProgramJob findQueuedJob(long id) {
-        for (ProgramJob job : programQueue) {
-            if (!job.poison && job.record != null && job.record.id == id) {
-                return job;
+    /** Remove a still-queued job from whichever lane holds it. */
+    private boolean removeQueuedJob(JobRecord record) {
+        if (LANE_EXCLUSIVE.equals(record.lane)) {
+            for (ProgramJob job : programQueue) {
+                if (!job.poison && job.record == record) {
+                    return programQueue.remove(job);
+                }
+            }
+            return false;
+        }
+        synchronized (readLaneLock) {
+            ArrayDeque<ProgramJob> queue = LANE_READ.equals(record.lane) ? readQueue : heavyQueue;
+            Iterator<ProgramJob> it = queue.iterator();
+            while (it.hasNext()) {
+                if (it.next().record == record) {
+                    it.remove();
+                    return true;
+                }
             }
         }
-        return null;
+        return false;
     }
 
-    private int queuePosition(long id) {
+    /** The exclusive job if one is active, else the oldest active read. */
+    private JobRecord primaryActiveJob() {
+        JobRecord best = null;
+        for (JobRecord record : activeJobs.values()) {
+            if (LANE_EXCLUSIVE.equals(record.lane)) return record;
+            if (best == null || record.id < best.id) best = record;
+        }
+        return best;
+    }
+
+    private String activeJobIds() {
+        List<Long> ids = new ArrayList<>(activeJobs.keySet());
+        Collections.sort(ids);
+        return ids.toString();
+    }
+
+    /** Position (0 = next) of a queued job within its lane, or -1. */
+    private int queuePosition(JobRecord record) {
         int position = 0;
-        for (ProgramJob job : programQueue) {
-            if (job.poison) continue;
-            if (job.record != null && job.record.id == id) {
-                return position;
+        if (LANE_EXCLUSIVE.equals(record.lane)) {
+            for (ProgramJob job : programQueue) {
+                if (job.poison) continue;
+                if (job.record == record) return position;
+                position++;
             }
-            position++;
+            return -1;
+        }
+        synchronized (readLaneLock) {
+            ArrayDeque<ProgramJob> queue = LANE_READ.equals(record.lane) ? readQueue : heavyQueue;
+            for (ProgramJob job : queue) {
+                if (job.record == record) return position;
+                position++;
+            }
         }
         return -1;
+    }
+
+    /**
+     * IDs of the active jobs this job is waiting for. A queued or lock-waiting
+     * exclusive job waits for every active job; a read waits for an active or
+     * lock-waiting exclusive job (the lock is fair), and for the active reads
+     * of its lane when that lane has no free worker.
+     */
+    private JsonArray blockedBy(JobRecord record) {
+        JsonArray blockers = new JsonArray();
+        if (record.isFinished() || "running".equals(record.state)
+                || "cancel_requested".equals(record.state)) {
+            return blockers;
+        }
+        List<JobRecord> active = new ArrayList<>(activeJobs.values());
+        active.sort(Comparator.comparingLong(r -> r.id));
+        if (LANE_EXCLUSIVE.equals(record.lane)) {
+            for (JobRecord other : active) {
+                if (other.id == record.id) continue;
+                // Jobs that hold the lock, or wait for it ahead of us. A read
+                // waiting for the lock after us is queued behind us (fair lock).
+                if (!"waiting_lock".equals(other.state) || other.id < record.id
+                        || "queued".equals(record.state)) {
+                    blockers.add(other.id);
+                }
+            }
+            return blockers;
+        }
+        int activeReads = 0;
+        int activeHeavy = 0;
+        for (JobRecord other : active) {
+            if (LANE_READ.equals(other.lane)) activeReads++;
+            if (LANE_READ_HEAVY.equals(other.lane)) activeHeavy++;
+        }
+        boolean poolFull = activeReads + activeHeavy >= readThreadCount;
+        boolean heavyFull = LANE_READ_HEAVY.equals(record.lane) && activeHeavy >= heavyReadLimit;
+        for (JobRecord other : active) {
+            if (other.id == record.id) continue;
+            if (LANE_EXCLUSIVE.equals(other.lane)) {
+                // A writer that holds or waits for the lock blocks new readers
+                // (fair lock); one that only queued behind us does not.
+                if ("queued".equals(record.state) || other.id < record.id
+                        || "running".equals(other.state)) {
+                    blockers.add(other.id);
+                }
+            } else if (poolFull || (heavyFull && LANE_READ_HEAVY.equals(other.lane))) {
+                if ("queued".equals(record.state)) blockers.add(other.id);
+            }
+        }
+        return blockers;
     }
 
     private void addQueueSummary(JsonObject result, boolean includeJobs) {
@@ -1096,22 +1781,52 @@ public class GhidraCliBridge extends GhidraScript {
         result.addProperty("accepting_jobs", acceptingJobs);
         result.addProperty("shutdown_requested", shutdownRequested);
         result.addProperty("queue_depth", queuedJobCount());
+        result.addProperty("read_threads", readThreadCount);
+        result.addProperty("heavy_read_limit", heavyReadLimit);
+        result.addProperty("abandoned_jobs_total", abandonedJobCount.get());
 
-        JobRecord active = activeJob;
-        if (active == null) {
+        JsonObject byLane = new JsonObject();
+        byLane.addProperty(LANE_EXCLUSIVE, exclusiveQueuedCount());
+        synchronized (readLaneLock) {
+            byLane.addProperty(LANE_READ, readQueue.size());
+            byLane.addProperty(LANE_READ_HEAVY, heavyQueue.size());
+        }
+        result.add("queue_depth_by_lane", byLane);
+
+        // `active_job` is kept for older CLIs; `active_jobs` lists all of them.
+        JobRecord primary = primaryActiveJob();
+        if (primary == null) {
             result.add("active_job", JsonNull.INSTANCE);
         } else {
-            result.add("active_job", jobToJson(active, -1));
+            result.add("active_job", jobToJson(primary, false));
         }
 
-        if (!includeJobs) return;
+        if (!includeJobs) {
+            result.addProperty("active_job_count", activeJobs.size());
+            return;
+        }
 
-        JsonArray queued = new JsonArray();
-        int position = 0;
+        List<JobRecord> active = new ArrayList<>(activeJobs.values());
+        active.sort(Comparator.comparingLong(r -> r.id));
+        JsonArray activeArray = new JsonArray();
+        for (JobRecord record : active) {
+            activeArray.add(jobToJson(record, true));
+        }
+        result.add("active_jobs", activeArray);
+
+        List<JobRecord> queuedRecords = new ArrayList<>();
         for (ProgramJob job : programQueue) {
-            if (job.poison || job.record == null) continue;
+            if (!job.poison && job.record != null) queuedRecords.add(job.record);
+        }
+        synchronized (readLaneLock) {
+            for (ProgramJob job : readQueue) queuedRecords.add(job.record);
+            for (ProgramJob job : heavyQueue) queuedRecords.add(job.record);
+        }
+        queuedRecords.sort(Comparator.comparingLong(r -> r.id));
+        JsonArray queued = new JsonArray();
+        for (JobRecord record : queuedRecords) {
             if (queued.size() >= MAX_STATUS_JOBS) break;
-            queued.add(jobToJson(job.record, position++));
+            queued.add(jobToJson(record, true));
         }
         result.add("queued_jobs", queued);
 
@@ -1120,13 +1835,13 @@ public class GhidraCliBridge extends GhidraScript {
         while (ids.hasNext() && recent.size() < MAX_STATUS_JOBS) {
             JobRecord record = jobs.get(ids.next());
             if (record != null) {
-                recent.add(jobToJson(record, -1));
+                recent.add(jobToJson(record, false));
             }
         }
         result.add("recent_jobs", recent);
     }
 
-    private int queuedJobCount() {
+    private int exclusiveQueuedCount() {
         int count = 0;
         for (ProgramJob job : programQueue) {
             if (!job.poison) count++;
@@ -1134,18 +1849,32 @@ public class GhidraCliBridge extends GhidraScript {
         return count;
     }
 
-    private JsonObject jobToJson(JobRecord record, int queuePosition) {
+    private int queuedJobCount() {
+        int count = exclusiveQueuedCount();
+        synchronized (readLaneLock) {
+            count += readQueue.size() + heavyQueue.size();
+        }
+        return count;
+    }
+
+    private JsonObject jobToJson(JobRecord record, boolean withScheduling) {
         JsonObject result = new JsonObject();
         result.addProperty("id", record.id);
         result.addProperty("command", record.command);
         result.addProperty("state", record.state);
+        result.addProperty("lane", record.lane);
         result.addProperty("enqueued_at_ms", record.enqueuedAt);
         if (record.startedAt > 0) result.addProperty("started_at_ms", record.startedAt);
         if (record.finishedAt > 0) result.addProperty("finished_at_ms", record.finishedAt);
         long end = record.finishedAt > 0 ? record.finishedAt : System.currentTimeMillis();
         long start = record.startedAt > 0 ? record.startedAt : record.enqueuedAt;
         result.addProperty("elapsed_ms", Math.max(0, end - start));
-        if (queuePosition >= 0) result.addProperty("queue_position", queuePosition);
+        if (withScheduling && !record.isFinished()) {
+            int position = "queued".equals(record.state) ? queuePosition(record) : -1;
+            if (position >= 0) result.addProperty("queue_position", position);
+            result.add("blocked_by", blockedBy(record));
+        }
+        if (record.abandoned) result.addProperty("abandoned", true);
         result.addProperty("cancel_requested", record.monitor.isCancelled());
         result.addProperty("cancel_enabled", record.monitor.isCancelEnabled());
         result.addProperty("progress", record.monitor.getProgress());
@@ -1157,11 +1886,16 @@ public class GhidraCliBridge extends GhidraScript {
         return result;
     }
 
-    private void retainCompletedJob(long id) {
-        completedJobIds.addLast(id);
+    private void retainCompletedJob(JobRecord record) {
+        completedJobIds.addLast(record.id);
         while (completedJobIds.size() > MAX_RETAINED_JOBS) {
             Long expired = completedJobIds.pollFirst();
-            if (expired != null) jobs.remove(expired);
+            if (expired != null) {
+                JobRecord old = jobs.remove(expired);
+                if (old != null && old.requestId != null) {
+                    jobIdsByRequest.remove(old.requestId, old.id);
+                }
+            }
         }
     }
 
@@ -1551,11 +2285,17 @@ public class GhidraCliBridge extends GhidraScript {
 
         int payloadMBytes = clampPayloadMBytes(
             getArgInt(args, "max_payload_mb", DEFAULT_DECOMPILE_MAX_PAYLOAD_MB));
-        DecompInterface decompiler = newDecompiler(payloadMBytes);
+        // Read workers reuse their own per-thread decompiler; the exclusive
+        // program thread (and legacy no-pool mode) uses one per call.
+        DecompInterface pooled = acquireThreadDecompiler(payloadMBytes);
+        DecompInterface decompiler = pooled != null ? pooled : newDecompiler(payloadMBytes);
+        boolean healthy = false;
         try {
-            decompiler.openProgram(currentProgram);
+            if (pooled == null) {
+                decompiler.openProgram(currentProgram);
+            }
 
-            TaskMonitor mon = monitor;
+            TaskMonitor mon = jobMonitor();
             // Ghidra defines zero as no native decompiler timeout. Large but
             // valid functions can exceed the historical hard-coded 30 seconds,
             // so default to unbounded and let callers opt into a ceiling.
@@ -1563,6 +2303,7 @@ public class GhidraCliBridge extends GhidraScript {
             DecompileResults results = decompiler.decompileFunction(func, timeoutSecs, mon);
 
             if (results.decompileCompleted()) {
+                healthy = true;
                 String code = results.getDecompiledFunction().getC();
                 JsonObject result = new JsonObject();
                 result.addProperty("name", func.getName());
@@ -1652,7 +2393,13 @@ public class GhidraCliBridge extends GhidraScript {
                 return errorResult(message);
             }
         } finally {
-            decompiler.dispose();
+            if (pooled == null) {
+                decompiler.dispose();
+            } else if (!healthy) {
+                // A timeout, cancel or crash can leave the native process in a
+                // bad state; start this thread's next decompile from scratch.
+                discardThreadDecompiler();
+            }
         }
     }
 
@@ -2030,7 +2777,7 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         try {
-            TaskMonitor mon = monitor;
+            TaskMonitor mon = jobMonitor();
             MessageLog log = new MessageLog();
             Object consumer = project;
 
@@ -2096,7 +2843,7 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         try {
-            TaskMonitor mon = monitor;
+            TaskMonitor mon = jobMonitor();
 
             // Use GhidraScript's built-in analyzeAll which works across Ghidra versions
             analyzeAll(currentProgram);
@@ -2242,7 +2989,7 @@ public class GhidraCliBridge extends GhidraScript {
             }
 
             Object consumer = project;
-            TaskMonitor mon = monitor;
+            TaskMonitor mon = jobMonitor();
 
             // Release current program if one is open
             if (currentProgram != null) {
@@ -2422,7 +3169,7 @@ public class GhidraCliBridge extends GhidraScript {
                     return errorResult("Exporter has no 4-arg export method: " + exportFormat);
                 }
 
-                TaskMonitor mon = monitor;
+                TaskMonitor mon = jobMonitor();
                 exportMethod.invoke(exporter, new File(outputPath), currentProgram, null, mon);
 
                 JsonObject result = new JsonObject();
@@ -2489,7 +3236,7 @@ public class GhidraCliBridge extends GhidraScript {
 
                 Address addr = memory.getMinAddress();
                 while (addr != null && results.size() < 100) {
-                    Address found = memory.findBytes(addr, searchBytes, null, true, monitor);
+                    Address found = memory.findBytes(addr, searchBytes, null, true, jobMonitor());
                     if (found == null) break;
 
                     // Walk back to the start of the printable run so the result
@@ -2584,7 +3331,7 @@ public class GhidraCliBridge extends GhidraScript {
 
             Address addr = memory.getMinAddress();
             while (addr != null && results.size() < 100) {
-                Address found = memory.findBytes(addr, searchBytes, null, true, monitor);
+                Address found = memory.findBytes(addr, searchBytes, null, true, jobMonitor());
                 if (found == null) break;
                 JsonObject item = new JsonObject();
                 item.addProperty("address", found.toString());
@@ -2708,7 +3455,7 @@ public class GhidraCliBridge extends GhidraScript {
                 }
 
                 Address addr = memory.getMinAddress();
-                Address found = memory.findBytes(addr, searchBytes, null, true, monitor);
+                Address found = memory.findBytes(addr, searchBytes, null, true, jobMonitor());
                 if (found != null) {
                     JsonObject item = new JsonObject();
                     item.addProperty("type", name);
@@ -3226,7 +3973,7 @@ public class GhidraCliBridge extends GhidraScript {
             DataTypeManager dtm = currentProgram.getDataTypeManager();
             int txId = currentProgram.startTransaction("Delete type");
             try {
-                boolean removed = dtm.remove(dataType, monitor);
+                boolean removed = dtm.remove(dataType, jobMonitor());
                 currentProgram.endTransaction(txId, true);
                 if (!removed) {
                     return errorResult("Failed to remove type: " + typeName + " (may be in use or built-in)");
@@ -3962,7 +4709,7 @@ public class GhidraCliBridge extends GhidraScript {
             DecompInterface decompiler = newDecompiler(DEFAULT_DECOMPILE_MAX_PAYLOAD_MB);
             try {
                 decompiler.openProgram(currentProgram);
-                TaskMonitor mon = monitor;
+                TaskMonitor mon = jobMonitor();
                 DecompileResults results = decompiler.decompileFunction(func, 30, mon);
                 if (!results.decompileCompleted())
                     return errorResult("Decompilation failed for " + funcTarget);
@@ -4491,7 +5238,7 @@ public class GhidraCliBridge extends GhidraScript {
             DecompInterface decompiler = newDecompiler(DEFAULT_DECOMPILE_MAX_PAYLOAD_MB);
             try {
                 decompiler.openProgram(currentProgram);
-                TaskMonitor mon = monitor;
+                TaskMonitor mon = jobMonitor();
 
                 DecompileResults res1 = decompiler.decompileFunction(func1, 30, mon);
                 DecompileResults res2 = decompiler.decompileFunction(func2, 30, mon);
@@ -4686,7 +5433,7 @@ public class GhidraCliBridge extends GhidraScript {
             }
 
             File outputFile = new File(outputPath);
-            TaskMonitor mon = monitor;
+            TaskMonitor mon = jobMonitor();
             exportMethod.invoke(exporter, outputFile, currentProgram, null, mon);
 
             JsonObject result = new JsonObject();
@@ -4716,6 +5463,9 @@ public class GhidraCliBridge extends GhidraScript {
             if (addr == null) return errorResult("Invalid address: " + addressStr);
 
             Listing listing = currentProgram.getListing();
+            if (getArgBool(args, "function_body", false)) {
+                return disasmFunctionBody(addr, addressStr, getArgInt(args, "limit", 0));
+            }
             Instruction instruction = listing.getInstructionAt(addr);
 
             // If no instruction at exact address, try containing instruction (mid-instruction)
@@ -4771,6 +5521,61 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to disassemble: " + e.getMessage());
         }
+    }
+
+    /**
+     * Disassemble a whole function body in address order (bug 004). `limit`
+     * <= 0 means no limit. The result says whether it was truncated and how
+     * many instructions the body holds in total.
+     */
+    private JsonObject disasmFunctionBody(Address addr, String target, int limit) {
+        Function func = currentProgram.getFunctionManager().getFunctionContaining(addr);
+        if (func == null) {
+            return errorResult("No function contains " + target
+                + "; use `ghidra disasm` for raw addresses");
+        }
+        Listing listing = currentProgram.getListing();
+        InstructionIterator it = listing.getInstructions(func.getBody(), true);
+        JsonArray results = new JsonArray();
+        long total = 0;
+        TaskMonitor mon = jobMonitor();
+        while (it.hasNext()) {
+            if (mon.isCancelled()) {
+                return errorResult("Disassembly cancelled");
+            }
+            Instruction current = it.next();
+            total++;
+            if (limit > 0 && results.size() >= limit) {
+                continue; // keep counting so the total is exact
+            }
+            byte[] byteArray;
+            try {
+                byteArray = current.getBytes();
+            } catch (Exception e) {
+                byteArray = new byte[0];
+            }
+            StringBuilder bytesHex = new StringBuilder();
+            for (byte b : byteArray) {
+                bytesHex.append(String.format("%02x", b & 0xff));
+            }
+            JsonArray operands = new JsonArray();
+            for (int j = 0; j < current.getNumOperands(); j++) {
+                operands.add(new JsonPrimitive(current.getDefaultOperandRepresentation(j)));
+            }
+            JsonObject instrData = new JsonObject();
+            instrData.addProperty("address", current.getAddress().toString());
+            instrData.addProperty("bytes", bytesHex.toString());
+            instrData.addProperty("mnemonic", current.getMnemonicString());
+            instrData.add("operands", operands);
+            results.add(instrData);
+        }
+        JsonObject result = new JsonObject();
+        result.add("instructions", results);
+        result.addProperty("count", results.size());
+        result.addProperty("function", func.getName());
+        result.addProperty("total_instructions", total);
+        result.addProperty("truncated", results.size() < total);
+        return result;
     }
 
     // --- Stats Handler ---
@@ -4857,74 +5662,235 @@ public class GhidraCliBridge extends GhidraScript {
         ResourceFile source = new ResourceFile(scriptFile);
         ResourceFile sourceDir = source.getParentFile();
 
+        boolean readOnly = getArgBool(args, "read_only", false);
         StringWriter buffer = new StringWriter();
         PrintWriter out = new PrintWriter(buffer);
+        // Compiler/bundle diagnostics go to their own buffer so a build failure
+        // can report them instead of only "class could not be found".
+        StringWriter buildBuffer = new StringWriter();
+        PrintWriter buildOut = new PrintWriter(buildBuffer);
+        GhidraScript script;
         try {
-            // A script only resolves if its parent directory is a registered
-            // bundle/source directory (GhidraScriptUtil.findSourceDirectoryContaining
-            // scans BundleHost.getBundleFiles()). Register it if it is not already.
-            //
-            // Done via reflection on purpose: referencing BundleHost directly would
-            // add an OSGi Import-Package on ghidra.app.plugin.core.osgi, which the
-            // bridge's own script bundle cannot wire, so the whole bridge fails to
-            // load. handleScriptList() uses the same reflection pattern.
-            Object bundleHost = GhidraScriptUtil.class
-                .getMethod("getBundleHost").invoke(null);
-            if (bundleHost == null) return errorResult("Ghidra script bundle host unavailable");
-            Class<?> bhClass = bundleHost.getClass();
-            Object existing = bhClass
-                .getMethod("getExistingGhidraBundle", ResourceFile.class)
-                .invoke(bundleHost, sourceDir);
-            if (existing == null) {
-                bhClass.getMethod("add", ResourceFile.class, boolean.class, boolean.class)
-                    .invoke(bundleHost, sourceDir, true, false);
+            // Ghidra's OSGi bundle host is shared, process-wide state; two
+            // read-only scripts starting at once must not build bundles
+            // concurrently. Execution below runs outside this lock.
+            synchronized (scriptLoadLock) {
+                script = loadScriptInstance(source, sourceDir, scriptFile, buildOut);
             }
+        } catch (ScriptLoadFailure e) {
+            return e.result;
+        } catch (GhidraScriptLoadException e) {
+            return scriptCompileError(scriptFile, e, buildBuffer, source, sourceDir);
+        } catch (Exception e) {
+            buildOut.flush();
+            JsonObject err = errorResult("Script failed to load: " + e);
+            String diag = buildBuffer.toString().trim();
+            if (!diag.isEmpty()) err.addProperty("diagnostics", diag);
+            return err;
+        }
 
-            GhidraScriptProvider provider = GhidraScriptUtil.getProvider(source);
-            if (provider == null) {
-                return errorResult("No script provider for " + scriptFile.getName()
-                    + " (unsupported script type)");
-            }
-
-            // getScriptInstance compiles the source via the bundle host.
-            GhidraScript script = provider.getScriptInstance(source, out);
+        long modificationBefore = currentProgram == null ? -1 : currentProgram.getModificationNumber();
+        try {
             script.setScriptArgs(scriptArgs);
 
-            // Run on the program executor's exclusive objects. `monitor` is the
-            // per-job cancellable JobTaskMonitor installed in executeProgramJob,
-            // so cancel/status work for scripts with no extra machinery.
-            //
             // Use the copy constructor rather than the 6-arg form: it only
             // references ghidra.app.script, avoiding OSGi Import-Package entries
             // on ghidra.framework.plugintool / ghidra.program.util that the bridge
-            // bundle may not be able to wire.
+            // bundle may not be able to wire. Each run gets its own state copy,
+            // and the per-job cancellable monitor, so cancel/status work for
+            // scripts (including concurrent --read-only ones).
             if (state == null) return errorResult("Bridge script state unavailable");
             GhidraState scriptState = new GhidraState(state);
             scriptState.setCurrentProgram(currentProgram);
-            script.execute(scriptState, monitor, out);
+            script.execute(scriptState, jobMonitor(), out);
             out.flush();
+
+            JsonObject violation = readOnlyViolation(readOnly, modificationBefore, scriptFile);
+            if (violation != null) {
+                violation.addProperty("stdout", buffer.toString());
+                return violation;
+            }
 
             JsonObject result = new JsonObject();
             result.addProperty("script", scriptFile.getName());
             result.addProperty("path", scriptFile.getAbsolutePath());
             result.addProperty("stdout", buffer.toString());
             result.add("args", toJsonArray(scriptArgs));
+            result.addProperty("read_only", readOnly);
 
             // Artifact contract: validate declared outputs and fail closed on a
             // missing/empty/under-count artifact, so callers can trust the job
             // succeeded only when its expected records actually exist.
             return validateArtifacts(result, args, buffer.toString());
-        } catch (GhidraScriptLoadException e) {
-            return errorResult("Script failed to compile: " + e.getMessage());
         } catch (CancelledException e) {
-            return errorResult("Script cancelled");
+            out.flush();
+            JsonObject err = errorResult("Script cancelled");
+            err.addProperty("stdout", buffer.toString());
+            return err;
         } catch (Exception e) {
             // Preserve any output the script produced before it threw.
             out.flush();
-            JsonObject err = errorResult("Script threw: " + e.getMessage());
+            JsonObject violation = readOnlyViolation(readOnly, modificationBefore, scriptFile);
+            JsonObject err = violation != null
+                ? violation
+                : errorResult("Script threw: " + e.getMessage());
             err.addProperty("stdout", buffer.toString());
             return err;
         }
+    }
+
+    /** Thrown by loadScriptInstance for a plain error result. */
+    private static final class ScriptLoadFailure extends Exception {
+        final JsonObject result;
+
+        ScriptLoadFailure(JsonObject result) {
+            super(result.has("error") ? result.get("error").getAsString() : "script load failed");
+            this.result = result;
+        }
+    }
+
+    private GhidraScript loadScriptInstance(
+            ResourceFile source, ResourceFile sourceDir, File scriptFile, PrintWriter buildOut)
+            throws Exception {
+        // A script only resolves if its parent directory is a registered
+        // bundle/source directory (GhidraScriptUtil.findSourceDirectoryContaining
+        // scans BundleHost.getBundleFiles()). Register it if it is not already.
+        //
+        // Done via reflection on purpose: referencing BundleHost directly would
+        // add an OSGi Import-Package on ghidra.app.plugin.core.osgi, which the
+        // bridge's own script bundle cannot wire, so the whole bridge fails to
+        // load. handleScriptList() uses the same reflection pattern.
+        Object bundleHost = GhidraScriptUtil.class
+            .getMethod("getBundleHost").invoke(null);
+        if (bundleHost == null) {
+            throw new ScriptLoadFailure(errorResult("Ghidra script bundle host unavailable"));
+        }
+        Class<?> bhClass = bundleHost.getClass();
+        Object existing = bhClass
+            .getMethod("getExistingGhidraBundle", ResourceFile.class)
+            .invoke(bundleHost, sourceDir);
+        if (existing == null) {
+            bhClass.getMethod("add", ResourceFile.class, boolean.class, boolean.class)
+                .invoke(bundleHost, sourceDir, true, false);
+        }
+
+        GhidraScriptProvider provider = GhidraScriptUtil.getProvider(source);
+        if (provider == null) {
+            throw new ScriptLoadFailure(errorResult("No script provider for "
+                + scriptFile.getName() + " (unsupported script type)"));
+        }
+
+        // getScriptInstance compiles the source via the bundle host; javac
+        // errors are written to buildOut.
+        GhidraScript script = provider.getScriptInstance(source, buildOut);
+        buildOut.flush();
+        if (script == null) {
+            throw new ScriptLoadFailure(errorResult("Script provider returned no instance for "
+                + scriptFile.getName()));
+        }
+
+        // Never run anything but the requested, freshly built class. Ghidra
+        // builds the whole source directory as one bundle and skips files that
+        // fail to compile, so a failed rebuild could otherwise leave an older
+        // class of the same name in place.
+        String buildError = bundleBuildError(source, sourceDir);
+        if (buildError != null) {
+            JsonObject err = errorResult("Script failed to compile: " + scriptFile.getName()
+                + "\n" + buildError + "\n(the previously built class was NOT run)",
+                "script_compile_error");
+            err.addProperty("diagnostics", buildError);
+            throw new ScriptLoadFailure(err);
+        }
+        String fileName = scriptFile.getName();
+        int dot = fileName.lastIndexOf('.');
+        String expectedClass = dot > 0 ? fileName.substring(0, dot) : fileName;
+        if (fileName.endsWith(".java")
+                && !script.getClass().getSimpleName().equals(expectedClass)) {
+            throw new ScriptLoadFailure(errorResult("Refusing to run " + script.getClass().getName()
+                + ": " + fileName + " must define public class " + expectedClass,
+                "script_class_mismatch"));
+        }
+        return script;
+    }
+
+    /** The bundle's recorded build error for one source file, or null. */
+    private String bundleBuildError(ResourceFile source, ResourceFile sourceDir) {
+        try {
+            Object bundleHost = GhidraScriptUtil.class.getMethod("getBundleHost").invoke(null);
+            Object bundle = bundleHost == null ? null : bundleHost.getClass()
+                .getMethod("getExistingGhidraBundle", ResourceFile.class)
+                .invoke(bundleHost, sourceDir);
+            if (bundle == null) return null;
+            for (java.lang.reflect.Method m : bundle.getClass().getMethods()) {
+                if (m.getName().equals("getBuildErrors") && m.getParameterCount() == 1) {
+                    Object err = m.invoke(bundle, source);
+                    if (err == null) return null;
+                    String text = err.toString();
+                    try {
+                        Object msg = err.getClass().getMethod("getMessage").invoke(err);
+                        if (msg != null) text = msg.toString();
+                    } catch (NoSuchMethodException ignored) {
+                        // Use toString().
+                    }
+                    text = text.trim();
+                    return text.isEmpty() ? null : text;
+                }
+            }
+        } catch (Throwable ignored) {
+            // Diagnostics are best effort.
+        }
+        return null;
+    }
+
+    /**
+     * A compile failure surfaces in Ghidra as "The class could not be found";
+     * the javac messages go to the console writer and to the bundle's build
+     * errors. Report both, so the caller sees the real error.
+     */
+    private JsonObject scriptCompileError(File scriptFile, Exception e, StringWriter buildBuffer,
+            ResourceFile source, ResourceFile sourceDir) {
+        StringBuilder diag = new StringBuilder(buildBuffer.toString().trim());
+        String recorded = bundleBuildError(source, sourceDir);
+        if (recorded != null && diag.indexOf(recorded) < 0) {
+            if (diag.length() > 0) diag.append('\n');
+            diag.append(recorded);
+        }
+        String diagnostics = diag.toString().trim();
+        String message = "Script failed to compile: " + scriptFile.getName();
+        if (!diagnostics.isEmpty()) {
+            message += "\n" + diagnostics;
+        } else {
+            message += ": " + e.getMessage();
+        }
+        JsonObject err = errorResult(message, "script_compile_error");
+        err.addProperty("diagnostics", diagnostics);
+        err.addProperty("loader_message", e.getMessage());
+        return err;
+    }
+
+    /**
+     * For a --read-only script, an error if the program's modification number
+     * changed while it ran. Writers are excluded while it holds the read lock,
+     * so a change came from this script (or a concurrent misbehaving
+     * read-only script). Null when nothing changed or the run was not read-only.
+     */
+    private JsonObject readOnlyViolation(boolean readOnly, long before, File scriptFile) {
+        if (!readOnly || currentProgram == null || before < 0) {
+            return null;
+        }
+        long after = currentProgram.getModificationNumber();
+        if (after == before) {
+            return null;
+        }
+        String message = "read-only script modified the program: " + scriptFile.getName()
+            + " ran with --read-only but the modification number of "
+            + currentProgram.getName() + " changed from " + before + " to " + after
+            + ". Run it without --read-only so it gets exclusive access.";
+        printerr("READ-ONLY VIOLATION: " + message);
+        JsonObject err = errorResult(message, "read_only_violation");
+        err.addProperty("modification_number_before", before);
+        err.addProperty("modification_number_after", after);
+        return err;
     }
 
     /**
@@ -5059,11 +6025,14 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private JsonObject handleScriptJava(JsonObject args) {
-        return errorResult("Inline Java execution not supported in bridge mode");
+        return errorResult("Inline Java is not supported in bridge mode. Save the code as a "
+            + "GhidraScript .java file and run it with `ghidra script run <file.java>`.");
     }
 
     private JsonObject handleScriptPython(JsonObject args) {
-        return errorResult("Python execution not available (Java bridge replaces Python bridge)");
+        return errorResult("Inline Python is not supported in bridge mode (the Java bridge "
+            + "replaced the Python bridge). Use `ghidra script run <file>` with a .java "
+            + "GhidraScript.");
     }
 
     private JsonObject handleScriptList() {

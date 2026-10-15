@@ -26,6 +26,13 @@ pub enum BridgeStartMode {
 /// Embedded Java bridge script
 const JAVA_BRIDGE_SCRIPT: &str = include_str!("scripts/GhidraCliBridge.java");
 
+/// Whether the bridge script bundled with this CLI dispatches `command`
+/// (it has a `case "<command>":` in `dispatchCommand`). Used to tell an
+/// outdated running bridge apart from a command no bridge implements.
+pub fn embedded_bridge_knows(command: &str) -> bool {
+    JAVA_BRIDGE_SCRIPT.contains(&format!("case \"{command}\":"))
+}
+
 /// Grace period for a bridge to drain accepted program jobs and let Ghidra
 /// close the project cleanly before the CLI falls back to process termination.
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 300;
@@ -986,6 +993,13 @@ pub fn find_headless_script(ghidra_install_dir: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn embedded_bridge_command_lookup() {
+        assert!(embedded_bridge_knows("decompile"));
+        assert!(embedded_bridge_knows("read_memory"));
+        assert!(!embedded_bridge_knows("search_memory"));
+    }
 
     #[test]
     fn shutdown_timeout_defaults_and_supports_unbounded_wait() {

@@ -638,10 +638,12 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                 // pre-flight ping, so connect directly and let it wait its turn.
                 BridgeClient::new(port)
             } else {
-                // Auto-start bridge - use specific program if available, otherwise project mode
+                // Auto-start bridge - use specific program if available, otherwise project mode.
+                // The config's default program belongs to the config's default
+                // project: never apply it to a project named with --project.
                 let mode = if let Some(program) = extract_program_from_command(&cli.command)
                     .or_else(|| cli.program.clone())
-                    .or_else(|| config.get_default_program())
+                    .or_else(|| default_program_for(project_from_cmd.as_deref(), &config))
                 {
                     BridgeStartMode::Process {
                         program_name: program,
@@ -660,78 +662,46 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
                 BridgeClient::new(port)
             };
 
-            // Switch to requested program if it differs from the bridge's current program
-            if let Some(requested_program) =
-                extract_program_from_command(&cli.command).or_else(|| cli.program.clone())
-            {
-                if let Ok(info) = client.program_info() {
-                    let current = info.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    if current != requested_program {
-                        client.open_program(&requested_program)?;
-                    }
-                } else {
-                    client.open_program(&requested_program)?;
-                }
+            let requested_program =
+                extract_program_from_command(&cli.command).or_else(|| cli.program.clone());
+            let mut client = client;
+            client.set_expected_program(requested_program.clone());
+
+            // Switch to the requested program if it differs from the bridge's
+            // current one, using the off-queue bridge_info snapshot (bug 001).
+            if let Some(requested) = &requested_program {
+                ensure_program_open(&client, requested)?;
             }
 
             let first_attempt =
                 execute_via_bridge(&client, &cli.command, cli.quiet, config.default_limit);
-            // Restart on "Unknown command" (old bridge lacks the handler) OR on a
-            // stale list_functions response: an old bridge silently ignores the
-            // newer tags/untagged args and returns a successful, UNFILTERED list.
-            let needs_restart = match &first_attempt {
-                Ok(value) => stale_tags_response(&cli.command, value),
-                Err(err) => is_unknown_command_error(err),
-            };
             match first_attempt {
-                Ok(value) if !needs_restart => value,
-                Err(err) if !needs_restart => return Err(err),
-                _ => {
+                // Another client switched programs while our job was queued: the
+                // bridge refused to run it against the wrong program. Re-open
+                // ours and retry once.
+                Err(err) if is_program_mismatch(&err) && requested_program.is_some() => {
                     if !cli.quiet {
                         eprintln!(
-                            "Bridge command not supported by running instance. Restarting bridge and retrying..."
+                            "Another client switched the bridge's program; re-opening {} and retrying...",
+                            requested_program.as_deref().unwrap_or_default()
                         );
                     }
-
-                    // Running bridge may be from an older script; force restart to load
-                    // the embedded bridge matching this CLI version.
-                    let _ = bridge::stop_bridge(&project_path);
-                    let mode = if let Some(program) = extract_program_from_command(&cli.command)
-                        .or_else(|| cli.program.clone())
-                        .or_else(|| config.get_default_program())
-                    {
-                        BridgeStartMode::Process {
-                            program_name: program,
-                        }
-                    } else {
-                        BridgeStartMode::Project
-                    };
-                    let port =
-                        bridge::ensure_bridge_running(&project_path, &ghidra_install_dir, mode)?;
-                    let retry_client = BridgeClient::new(port);
-
-                    if let Some(requested_program) =
-                        extract_program_from_command(&cli.command).or_else(|| cli.program.clone())
-                    {
-                        if let Ok(info) = retry_client.program_info() {
-                            let current = info.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                            if current != requested_program {
-                                retry_client.open_program(&requested_program)?;
-                            }
-                        } else {
-                            retry_client.open_program(&requested_program)?;
-                        }
-                    }
-
-                    // One restart per invocation: the retry result is accepted
-                    // (or its error propagated) without re-probing.
-                    execute_via_bridge(
-                        &retry_client,
-                        &cli.command,
-                        cli.quiet,
-                        config.default_limit,
-                    )?
+                    client.open_program(requested_program.as_deref().unwrap_or_default())?;
+                    execute_via_bridge(&client, &cli.command, cli.quiet, config.default_limit)?
                 }
+                // Never restart a bridge on the user's behalf (bug 002): other
+                // clients may have queued or running jobs on it.
+                Err(err) if is_unknown_command_error(&err) => {
+                    return Err(outdated_bridge_error(&project_path, &err.to_string()))
+                }
+                Err(err) => return Err(err),
+                Ok(value) if stale_tags_response(&cli.command, &value) => {
+                    return Err(outdated_bridge_error(
+                        &project_path,
+                        "it ignored the tag filter and returned unfiltered rows",
+                    ))
+                }
+                Ok(value) => value,
             }
         }
     };
@@ -770,23 +740,130 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
     if let Some(opts) = &opts {
         if let Some(query) = Query::from_options(opts, format).map_err(describe_query_error)? {
             let output = query.process_results(values)?;
-            if !output.is_empty() {
-                println!("{}", output);
-            }
-            return Ok(());
+            return emit_output(&output, format);
         }
     }
 
     let formatter = DefaultFormatter;
     let output = formatter.format(&values, format)?;
-    if !output.is_empty() {
-        println!("{}", output);
+    emit_output(&output, format)
+}
+
+/// Print command output. Empty JSON output is never a success: a JSON
+/// document always has at least `[]`, so emptiness means something upstream
+/// lost the response, and a silent exit 0 would be a false success.
+fn emit_output(output: &str, format: OutputFormat) -> anyhow::Result<()> {
+    if output.trim().is_empty() {
+        if matches!(format, OutputFormat::Json | OutputFormat::JsonCompact) {
+            anyhow::bail!(
+                "The bridge response produced no output; treating this as a failure. \
+                 Retry, and check `ghidra jobs` if it repeats."
+            );
+        }
+        return Ok(());
+    }
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{}", output)
+        .and_then(|_| stdout.flush())
+        .map_err(|e| anyhow::anyhow!("Failed to write output: {e}"))
+}
+
+fn is_unknown_command_error(err: &anyhow::Error) -> bool {
+    if let Some(typed) = err.downcast_ref::<ipc::protocol::BridgeError>() {
+        if typed.code == ipc::protocol::ERR_UNKNOWN_COMMAND {
+            return true;
+        }
+    }
+    err.to_string().contains("Unknown command:")
+}
+
+fn is_program_mismatch(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ipc::protocol::BridgeError>()
+        .is_some_and(|e| e.code == ipc::protocol::ERR_PROGRAM_MISMATCH)
+}
+
+/// The error for a command the running bridge does not understand. Older CLIs
+/// restarted the bridge here, killing every other client's jobs; now the user
+/// decides when to restart.
+fn outdated_bridge_error(project_path: &Path, detail: &str) -> anyhow::Error {
+    // If this CLI's own bridge lacks the command too, a restart cannot help.
+    if let Some(command) = detail
+        .split("Unknown command:")
+        .nth(1)
+        .map(|rest| rest.trim().trim_end_matches(')').trim())
+        .filter(|c| !c.is_empty())
+    {
+        if !bridge::embedded_bridge_knows(command) {
+            return anyhow::anyhow!(
+                "The bridge does not implement '{command}', and neither does the bridge bundled \
+                 with this CLI version, so restarting it would not help. This command is not \
+                 available yet."
+            );
+        }
+    }
+    let project = project_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| project_path.display().to_string());
+    anyhow::anyhow!(
+        "The running bridge is older than this CLI and does not support this command ({detail}). \
+         Restart it with `ghidra restart --project {project}` once no other clients are using it \
+         (check `ghidra jobs --project {project}`). The CLI no longer restarts a running bridge \
+         automatically, because other clients may be using it."
+    )
+}
+
+/// Make sure the bridge has `requested` open before a command runs (bug 001).
+///
+/// Reads the bridge's program snapshot via `bridge_info`, a control command
+/// that is answered immediately and never queues behind program jobs. Only a
+/// bridge too old to report the snapshot falls back to a `program_info` job.
+/// `open_program` is sent only on a definite answer (no program, or a
+/// different one) — never because a check timed out or failed.
+fn ensure_program_open(client: &BridgeClient, requested: &str) -> anyhow::Result<()> {
+    let info = client
+        .bridge_info()
+        .map_err(|e| e.context("checking the bridge's current program (bridge_info)"))?;
+    let current = match info.get("has_current_program").and_then(|v| v.as_bool()) {
+        Some(true) => info
+            .get("current_program")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        Some(false) => None,
+        None => match client.program_info() {
+            Ok(pi) => pi.get("name").and_then(|v| v.as_str()).map(str::to_owned),
+            Err(e) if e.to_string().contains("No program loaded") => None,
+            Err(e) => return Err(e.context("checking the bridge's current program")),
+        },
+    };
+    if current.as_deref() != Some(requested) {
+        client.open_program(requested)?;
     }
     Ok(())
 }
 
-fn is_unknown_command_error(err: &anyhow::Error) -> bool {
-    err.to_string().contains("Unknown command:")
+/// Say on stderr when `function disasm` output is incomplete: either the
+/// bridge truncated it at `limit`, or the bridge predates function-body
+/// disassembly and returned its fixed 10-instruction prologue.
+fn warn_disasm_truncation(value: &serde_json::Value, limit: Option<usize>) {
+    match value.get("total_instructions").and_then(|v| v.as_u64()) {
+        Some(total) => {
+            if value.get("truncated").and_then(|v| v.as_bool()) == Some(true) {
+                let shown = value.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                eprintln!(
+                    "warning: showing {shown} of {total} instructions (--limit {}); \
+                     use --limit 0 for the whole function",
+                    limit.unwrap_or(0)
+                );
+            }
+        }
+        None => eprintln!(
+            "warning: the running bridge predates whole-function disassembly and ignores \
+             --limit; this output may be only the first 10 instructions. Restart the bridge \
+             (`ghidra restart`) when it is idle."
+        ),
+    }
 }
 
 /// Detects a stale bridge that ignored the `tags`/`untagged` args on
@@ -964,7 +1041,20 @@ fn execute_via_bridge(
                     "get_function",
                     Some(json!({"address": args.resolved_target()})),
                 ),
-                FunctionCommands::Disasm(args) => client.disasm(args.resolved_target(), None),
+                FunctionCommands::Disasm(args) => {
+                    // Whole function body, honouring --limit (bug 004). No
+                    // --limit uses the configured default; --limit 0 is all.
+                    let limit = match args.options.limit {
+                        Some(0) => None,
+                        Some(n) => Some(n),
+                        None => default_limit,
+                    };
+                    let value = client.disasm_function(args.resolved_target(), limit)?;
+                    if !quiet {
+                        warn_disasm_truncation(&value, limit);
+                    }
+                    Ok(value)
+                }
                 FunctionCommands::Calls(args) => client.find_calls(args.resolved_target()),
                 FunctionCommands::XRefs(args) => {
                     client.xrefs_to(args.resolved_target().to_string())
@@ -1341,7 +1431,21 @@ fn execute_via_bridge(
                         .unwrap_or_else(|_| args.script_path.clone());
                     let expect: Vec<serde_json::Value> =
                         args.expect.iter().map(|s| parse_expect_spec(s)).collect();
-                    client.script_run(&path, &args.args, &expect, args.allow_empty)
+                    let value = client.script_run(
+                        &path,
+                        &args.args,
+                        &expect,
+                        args.allow_empty,
+                        args.read_only,
+                    )?;
+                    if args.read_only && !quiet && value.get("read_only").is_none() {
+                        eprintln!(
+                            "warning: the running bridge predates --read-only; the script ran \
+                             exclusively and its modification check was skipped. Restart the \
+                             bridge (`ghidra restart`) when it is idle to enable it."
+                        );
+                    }
+                    Ok(value)
                 }
                 ScriptCommands::Python(args) => client.script_python(&args.code),
                 ScriptCommands::Java(args) => client.script_java(&args.code),
@@ -1460,7 +1564,7 @@ fn handle_bridge_start(
     // Determine start mode
     let mode = if let Some(prog) = program {
         BridgeStartMode::Process { program_name: prog }
-    } else if let Some(prog) = config.get_default_program() {
+    } else if let Some(prog) = default_program_for(project.as_deref(), &config) {
         BridgeStartMode::Process { program_name: prog }
     } else {
         BridgeStartMode::Project
@@ -1609,11 +1713,35 @@ fn handle_bridge_jobs(
             .get("queue_depth")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        println!("Bridge: {} ({} queued)", state, depth);
+        let mut header = format!("Bridge: {} ({} queued", state, depth);
+        if let Some(lanes) = jobs.get("queue_depth_by_lane").and_then(|v| v.as_object()) {
+            let parts: Vec<String> = lanes
+                .iter()
+                .map(|(lane, n)| format!("{lane} {}", n.as_u64().unwrap_or(0)))
+                .collect();
+            header.push_str(&format!(": {}", parts.join(", ")));
+        }
+        header.push(')');
+        if let Some(threads) = jobs.get("read_threads").and_then(|v| v.as_u64()) {
+            header.push_str(&format!(", {threads} read threads"));
+        }
+        if let Some(n) = jobs.get("abandoned_jobs_total").and_then(|v| v.as_u64()) {
+            header.push_str(&format!(", {n} abandoned"));
+        }
+        println!("{header}");
 
-        match jobs.get("active_job").filter(|v| !v.is_null()) {
-            Some(job) => print_bridge_job("Active", job),
-            None => println!("Active: none"),
+        // Protocol-3 bridges list every active job; older ones have one.
+        match jobs.get("active_jobs").and_then(|v| v.as_array()) {
+            Some(active) if !active.is_empty() => {
+                for job in active {
+                    print_bridge_job("Active", job);
+                }
+            }
+            Some(_) => println!("Active: none"),
+            None => match jobs.get("active_job").filter(|v| !v.is_null()) {
+                Some(job) => print_bridge_job("Active", job),
+                None => println!("Active: none"),
+            },
         }
 
         if let Some(queued) = jobs.get("queued_jobs").and_then(|v| v.as_array()) {
@@ -1641,10 +1769,20 @@ fn print_bridge_job(label: &str, job: &serde_json::Value) {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
     let elapsed = job.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-    let mut details = format!(
-        "{label}: {id} {command} ({state}, {:.1}s",
-        elapsed as f64 / 1000.0
-    );
+    let mut details = format!("{label}: {id} {command} ({state}");
+    if let Some(lane) = job.get("lane").and_then(|v| v.as_str()) {
+        details.push_str(&format!(", {lane}"));
+    }
+    details.push_str(&format!(", {:.1}s", elapsed as f64 / 1000.0));
+    if let Some(pos) = job.get("queue_position").and_then(|v| v.as_u64()) {
+        details.push_str(&format!(", position {pos}"));
+    }
+    if let Some(blockers) = job.get("blocked_by").and_then(|v| v.as_array()) {
+        if !blockers.is_empty() {
+            let ids: Vec<String> = blockers.iter().map(|b| b.to_string()).collect();
+            details.push_str(&format!(", blocked by {}", ids.join(",")));
+        }
+    }
 
     let progress = job.get("progress").and_then(|v| v.as_u64()).unwrap_or(0);
     let maximum = job.get("maximum").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -2176,6 +2314,9 @@ fn unwrap_bridge_response(value: serde_json::Value) -> Vec<serde_json::Value> {
         "current_program_name",
         "has_current_program",
         "data",
+        // `function disasm` (bug 004): truncation is reported on stderr.
+        "total_instructions",
+        "truncated",
     ];
 
     // Special case: decompile responses have a "code" key - return as-is for special rendering
@@ -2253,6 +2394,18 @@ fn load_config(projects_dir: &Option<PathBuf>) -> anyhow::Result<Config> {
     Ok(config)
 }
 
+/// The config's `default_program`, but only when the project is also the
+/// config's default (none given, or the same name given explicitly). A
+/// default program from one project must not be opened in another.
+fn default_program_for(explicit_project: Option<&str>, config: &Config) -> Option<String> {
+    match explicit_project {
+        None => config.get_default_program(),
+        Some(p) if config.default_project.as_deref() == Some(p) => config.get_default_program(),
+        // An explicit env override is a per-shell choice, not a config default.
+        Some(_) => std::env::var("GHIDRA_DEFAULT_PROGRAM").ok(),
+    }
+}
+
 /// Resolve a project name to its full path on disk.
 fn resolve_project_path(project: &Option<String>, config: &Config) -> anyhow::Result<PathBuf> {
     let project_name = project
@@ -2272,6 +2425,23 @@ fn resolve_project_path(project: &Option<String>, config: &Config) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_program_only_applies_to_default_project() {
+        let config = Config {
+            default_project: Some("proj-a".to_string()),
+            default_program: Some("a.so".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(default_program_for(None, &config).as_deref(), Some("a.so"));
+        assert_eq!(
+            default_program_for(Some("proj-a"), &config).as_deref(),
+            Some("a.so")
+        );
+        if std::env::var_os("GHIDRA_DEFAULT_PROGRAM").is_none() {
+            assert_eq!(default_program_for(Some("proj-b"), &config), None);
+        }
+    }
 
     #[test]
     fn bridge_list_params_limit_zero_means_unlimited() {

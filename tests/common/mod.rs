@@ -30,6 +30,23 @@ pub fn fixture_binary() -> PathBuf {
         .join("sample_binary")
 }
 
+/// Delete a test project (and stop its bridge) so the next `ensure_test_project`
+/// re-imports it from the fixture.
+///
+/// For suites whose changes are destructive (e.g. `patch_tests` overwrites the
+/// bytes at `main`): they run against their own project, which is reset at the
+/// start of every run. Their changes can then never leak into the shared
+/// `ci-test` project that the read-only suites rely on, nor build up across runs.
+pub fn reset_test_project(project: &str) {
+    let projects_dir = ghidra_cli::config::Config::default_project_dir()
+        .expect("Could not determine default project dir");
+    let _ = ghidra_cli::ghidra::bridge::stop_bridge(&projects_dir.join(project));
+    let _ = std::fs::remove_file(projects_dir.join(format!("{}.gpr", project)));
+    let _ = std::fs::remove_file(projects_dir.join(format!("{}.lock", project)));
+    let _ = std::fs::remove_file(projects_dir.join(format!("{}.lock~", project)));
+    let _ = std::fs::remove_dir_all(projects_dir.join(format!("{}.rep", project)));
+}
+
 /// Ensure test project exists with analyzed sample binary.
 /// Uses Once::call_once for idempotent setup across multiple tests.
 /// Skips import+analyze if the project already exists (supports CI caching).

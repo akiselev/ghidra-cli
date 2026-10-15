@@ -211,8 +211,6 @@ pub async fn install_ghidra(version: Option<String>, target_dir: PathBuf) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_ghidra_min_java_defaults() {
         // Unknown install dir falls back to the documented default floor.

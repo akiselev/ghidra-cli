@@ -73,23 +73,37 @@ Returns the port directly so callers never need a separate `read_port_file()` ca
 
 Stronger verification than `is_bridge_running`: uses `BridgeClient::new(port).ping()` instead of raw TCP connect. Returns `BridgeStatus::Running { port, pid }` or `BridgeStatus::Stopped`.
 
-### Responsive control plane and serialized program lane
+### Responsive control plane and read/write program lanes
 
 Command dispatch no longer treats a failed pre-flight ping as proof that the bridge is
-dead. More importantly, socket handling is now separate from Ghidra program execution:
+dead. Socket handling is separate from Ghidra program execution, and program jobs run in
+lanes (protocol 3, bugs 001/005/006):
 
 ```text
 TCP acceptor -> bounded client pool -> control commands (immediate)
-                                  \-> bounded FIFO -> GhidraScript thread
+                                  |-> exclusive FIFO -> GhidraScript thread   (write lock)
+                                  \-> read / read-heavy FIFOs -> read pool    (read lock)
 ```
 
 `ping`, `status`, `bridge_info`, `job_status`, `job_cancel`, and `shutdown` run on the
-control plane using thread-safe snapshots. Every command that can touch `currentProgram`,
-`state`, a transaction, or another Ghidra object is assigned a job ID and executed on the
-original `GhidraScript.run()` thread. This keeps the conservative one-owner program model
-without making a long analysis look like a dead bridge.
+control plane using thread-safe snapshots. Writes, `open_program`, `program_close`,
+`analyze`, `import` and non-`--read-only` `script_run` are exclusive: they run on the
+original `GhidraScript.run()` thread under the write side of a fair
+`ReentrantReadWriteLock`. Commands in `READ_COMMANDS` run on a bounded read pool
+(`GHIDRA_CLI_READ_THREADS`, default `min(8, cores/2)`, at least 2; `0` = all exclusive)
+under the read side. Long reads (`HEAVY_READ_COMMANDS`) may occupy at most pool − 1
+threads and cheap reads are dequeued first. Handlers use the per-thread `jobMonitor()`
+instead of GhidraScript's shared `monitor` field, and each read thread keeps its own
+`DecompInterface`. Only exclusive jobs refresh the `bridge_info` program snapshot.
 
-The explicit queue is bounded at 256 program jobs. Connection handlers only parse and
+Each job keeps its client socket. A watchdog probes queued and running jobs every 2 s
+(1 ms read: EOF = client gone); gone clients' queued jobs are dropped as `abandoned`, and
+running reads/scripts are cooperatively cancelled. A job is probed again just before it
+runs. Requests may carry `request_id` (for `job_status`/`job_cancel` lookups after a client
+timeout) and `expect_program` (refused with `program_mismatch` if another client switched
+programs). Unknown commands are rejected immediately with code `unknown_command`.
+
+Each queue is bounded at 256 program jobs. Connection handlers only parse and
 enqueue; they do not block while a program future is pending. Completed futures hand socket
 writes to a separate bounded response pool, preserving the existing synchronous
 request/response protocol without starving controls behind waiting clients. Status retains

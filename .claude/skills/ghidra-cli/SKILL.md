@@ -73,7 +73,7 @@ ghidra jobs [JOB_ID] [--project P]      # bridge queue + recent jobs, or one job
 ghidra cancel [JOB_ID] [--project P]    # cooperatively cancel active (or given) job
 ```
 
-`ping`, `status`, `jobs`, and `cancel` answer on a control plane that stays responsive while a long `analyze`/`import`/decompile occupies the serialized program lane. Queued program operations get job IDs and wait in a bounded FIFO.
+`ping`, `status`, `jobs`, and `cancel` answer immediately on the control plane. Program jobs run in lanes: `read` (cheap reads, concurrent), `read-heavy` (decompile/find/graph/stats/`script run --read-only`, concurrent but capped at pool size − 1) and `exclusive` (writes, open/close, analyze, import, plain `script run`). `ghidra jobs` shows each job's `lane`, `queue_position` and `blocked_by`, and `abandoned` jobs (client disconnected; skipped or cancelled). The read pool size is `GHIDRA_CLI_READ_THREADS` (default `min(8, cores/2)`, `0` = all exclusive). The CLI never auto-restarts a bridge; if it is older than the CLI, run `ghidra restart` when no other clients use it.
 
 ### Project Management
 
@@ -112,7 +112,7 @@ ghidra program export FORMAT [--project P] [-o OUTPUT]   # FORMAT: json, xml, c/
 ghidra function list [QUERY_OPTS]           # aliases: fn, func, functions
 ghidra function get TARGET [QUERY_OPTS]     # TARGET = name or 0xADDRESS
 ghidra function decompile TARGET [--with-vars] [--with-params] [QUERY_OPTS]
-ghidra function disasm TARGET [QUERY_OPTS]
+ghidra function disasm TARGET [QUERY_OPTS]   # whole body; --limit N (default 1000, 0 = all); truncation warned on stderr
 ghidra function calls TARGET [QUERY_OPTS]   # outgoing calls
 ghidra function xrefs TARGET [QUERY_OPTS]   # incoming references
 ghidra function rename OLD NEW [--project P] [--program PROG]
@@ -307,13 +307,13 @@ ghidra patch export -o OUTPUT [--project P] [--program PROG]
 ### Script Execution
 
 ```bash
-ghidra script run PATH [--expect PATH[:MIN_ROWS]]... [--allow-empty] [--project P] [--program PROG] [-- ARGS...]
-ghidra script python CODE [--project P] [--program PROG]
-ghidra script java CODE [--project P] [--program PROG]
+ghidra script run PATH [--read-only] [--expect PATH[:MIN_ROWS]]... [--allow-empty] [--project P] [--program PROG] [-- ARGS...]
+ghidra script python CODE   # NOT supported in bridge mode; use script run
+ghidra script java CODE     # NOT supported in bridge mode; use script run
 ghidra script list
 ```
 
-`script run` resolves PATH to an absolute location, forwards the args after `--` to the script as real positional arguments, and captures stdout in the response (`{script, path, stdout, args}`). `--expect PATH[:MIN_ROWS]` (repeatable) fails the job if that artifact is missing, empty, or below MIN_ROWS; `--allow-empty` lets an expected artifact exist while empty. Scripts run on the cancellable job lane, so `ghidra cancel` works on them.
+`script run` resolves PATH to an absolute location, forwards the args after `--` to the script as real positional arguments, and captures stdout in the response (`{script, path, stdout, args}`). `--expect PATH[:MIN_ROWS]` (repeatable) fails the job if that artifact is missing, empty, or below MIN_ROWS; `--allow-empty` lets an expected artifact exist while empty. Scripts run exclusively and are cancellable (`ghidra cancel`). `--read-only` runs the script concurrently with other reads and fails it (`read_only_violation`) if the program's modification number changed. Compile errors fail with javac diagnostics (`script_compile_error`).
 
 ### Batch
 
@@ -515,6 +515,7 @@ ghidra patch export -o patched.exe --project analysis
 | `GHIDRA_CLI_READ_TIMEOUT` | Per-request socket read timeout; `0` = indefinite (default 300s) |
 | `GHIDRA_CLI_CONNECT_DEADLINE` | Retry window for connecting to a (re)starting bridge (default 60s) |
 | `GHIDRA_CLI_SHUTDOWN_TIMEOUT` | Grace period to drain jobs before force-kill; `0` = indefinite (default 300s) |
+| `GHIDRA_CLI_READ_THREADS` | Bridge read-pool size, read at bridge start; `0` = all jobs exclusive (default `min(8, cores/2)`, at least 2) |
 
 ## File Locations
 

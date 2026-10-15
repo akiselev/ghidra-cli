@@ -341,7 +341,7 @@ pub enum FunctionCommands {
     /// Decompile function
     #[command(alias = "decomp")]
     Decompile(FunctionDecompileArgs),
-    /// Disassemble function
+    /// Disassemble a whole function body (honours --limit; 0 = all)
     #[command(alias = "disassemble", alias = "dis")]
     Disasm(FunctionGetArgs),
     /// Get function calls
@@ -1218,9 +1218,9 @@ pub struct PatchExportArgs {
 pub enum ScriptCommands {
     /// Run a script file
     Run(ScriptRunArgs),
-    /// Execute inline Python code
+    /// Execute inline Python code (not supported in bridge mode; use `script run`)
     Python(ScriptInlineArgs),
-    /// Execute inline Java code
+    /// Execute inline Java code (not supported in bridge mode; use `script run`)
     Java(ScriptInlineArgs),
     /// List available scripts
     List,
@@ -1240,6 +1240,12 @@ pub struct ScriptRunArgs {
     /// Allow an expected artifact to exist but be empty.
     #[arg(long)]
     pub allow_empty: bool,
+    /// Run as a reader: concurrently with other read-only commands instead of
+    /// exclusively. The bridge fails the job loudly if the script changed the
+    /// program (its modification number moved). Use only for scripts that do
+    /// not write to the program.
+    #[arg(long)]
+    pub read_only: bool,
     /// Script arguments (after --)
     #[arg(last = true)]
     pub args: Vec<String>,

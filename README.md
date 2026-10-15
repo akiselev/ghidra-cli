@@ -15,7 +15,7 @@ A Rust CLI for automating Ghidra reverse engineering tasks. Usable directly by h
 - **Search capabilities** - Find strings, bytes, functions, crypto patterns
 - **Script execution** - Run Java/Python Ghidra scripts, inline or from files
 - **Batch operations** - Execute multiple commands from a file
-- **Responsive job control** - Long analyses run on a serialized program lane while `ping`, `status`, `jobs`, and `cancel` stay live on a separate control plane
+- **Responsive job control** - Read-only commands run concurrently on a read pool, writes run exclusively, and `ping`, `status`, `jobs`, and `cancel` stay live on a separate control plane
 - **Flexible output** - Human-readable, JSON, or pretty JSON formats
 - **Filtering** - Expression-based filtering with a small DSL (e.g., `size > 100 AND name ~ 'crypt'`)
 
@@ -129,6 +129,7 @@ ghidra function list --filter "size > 100"  # Filter by size
 ghidra decompile <name-or-addr>        # Decompile function
 ghidra decompile main --with-vars --with-params  # Include variable/param details
 ghidra disasm <address> --instructions 20  # Disassemble instructions
+ghidra function disasm <func> --limit 0    # Whole function body (default --limit 1000)
 ghidra function set-signature <func> --signature "int foo(int x, char *y)"
 ghidra function set-return-type <func> --type void
 ghidra function set-calling-convention <func> --convention __cdecl
@@ -217,6 +218,11 @@ ghidra comment set <addr> "note" --comment-type EOL  # Set comment
 ghidra comment list                    # List all comments
 ```
 
+`function disasm` walks the whole function body in address order and honours
+`--limit` (`0` = every instruction). When the output is cut at the limit it
+prints `warning: showing N of M instructions` on stderr; the JSON rows stay a
+plain instruction array.
+
 `--comment-type` accepts `EOL` (default), `PRE`, `POST`, or `PLATE`.
 
 ### Scripts
@@ -225,15 +231,24 @@ ghidra script list                     # List available scripts
 ghidra script run myscript.py          # Run a script file
 ghidra script run report.py -- arg1 arg2   # Pass positional args after --
 ghidra script run dump.py --expect out.csv:10   # Fail unless out.csv has >=10 rows
-ghidra script python "print(currentProgram)"   # Inline Python
-ghidra script java "println(currentProgram);"   # Inline Java
+ghidra script run Survey.java --read-only       # Run concurrently with other reads
 ```
+
+`script python` and `script java` (inline code) are **not supported in bridge
+mode**; save the code as a `.java` GhidraScript and use `script run`.
 
 `script run` resolves the path to an absolute location, forwards the args after
 `--` to the script, and captures its stdout in the response. Use `--expect
 PATH[:MIN_ROWS]` (repeatable) to make the job fail when an output artifact is
 missing, empty, or short, and `--allow-empty` to permit an expected-but-empty
 file.
+
+Scripts run exclusively by default (no other job touches the program while they
+run). `--read-only` runs the script as a reader, alongside other read-only
+commands; the bridge records the program's modification number before and after
+and fails the job (`read_only_violation`) if the script changed the program. A
+compile error fails the job with the javac diagnostics (`script_compile_error`);
+the bridge never falls back to an older build of the class.
 
 ### Batch Operations
 ```bash
@@ -277,11 +292,36 @@ ghidra restart --project myproject --program otherbinary
 ```
 
 The bridge handles networking and lifecycle controls independently from Ghidra
-program access. Program operations remain serialized on one Ghidra-owned thread,
-but `ping`, `status`, `jobs`, `cancel`, and drain requests remain responsive while
-analysis or another long operation is running. Queued program operations receive
-job IDs and wait in an explicit bounded FIFO rather than an invisible socket
-backlog.
+program access. `ping`, `status`, `jobs`, `cancel`, and drain requests always
+answer immediately. Program operations run in one of three lanes:
+
+- **read** – cheap read-only commands (`function get`, `memory read`, `x-ref`,
+  `program info`, …) run concurrently on a read pool;
+- **read-heavy** – long read-only commands (`decompile`, `find`, `graph`,
+  `stats`, `script run --read-only`, …) share the same pool but may use at most
+  all-but-one of its threads, so a cheap read never waits behind them;
+- **exclusive** – writes, `open_program`/`program close`, `analyze`, `import`
+  and plain `script run` run alone on the Ghidra program thread.
+
+Readers hold the read side of a fair read/write lock and exclusive jobs the
+write side, so a waiting writer stops new readers and is never starved. The pool
+size defaults to `min(8, cores/2)` (at least 2) and is set with
+`GHIDRA_CLI_READ_THREADS` in the environment of the process that starts the
+bridge; `0` makes every job exclusive, as in older bridges. `ghidra jobs` shows
+each job's lane, queue position and `blocked_by` (the active jobs it waits for).
+
+The CLI checks the bridge's current program through the off-queue `bridge_info`
+snapshot, so it adds no preflight jobs, and opens a program only when the bridge
+definitely has a different one. A job whose client has disconnected (killed,
+interrupted, or timed out) is skipped (`abandoned` in `ghidra jobs`), and a
+running read or script whose client disconnects is cancelled. On a read timeout
+the CLI reports its job's position and blockers and cancels it.
+
+The CLI never restarts a running bridge on its own: if the bridge is older than
+the CLI and lacks a command, the command fails with a message asking you to run
+`ghidra restart` once no other clients are using it. Explicit `--project` always
+overrides the config's `default_project`, and the config's `default_program` is
+only used for the default project.
 
 ### Multi-Project Support
 
@@ -358,6 +398,12 @@ decompile isn't cut off. Set them when you'd rather fail fast:
 | `GHIDRA_CLI_READ_TIMEOUT` | Per-request socket read timeout; `0` = indefinite (300s) |
 | `GHIDRA_CLI_CONNECT_DEADLINE` | How long to retry connecting to a (re)starting bridge (60s) |
 | `GHIDRA_CLI_SHUTDOWN_TIMEOUT` | Grace period to drain jobs before force-kill; `0` = indefinite (300s) |
+
+Bridge concurrency (read when the bridge starts):
+
+| Variable | Purpose (default) |
+|----------|-------------------|
+| `GHIDRA_CLI_READ_THREADS` | Read-pool size; `0` = all jobs exclusive (`min(8, cores/2)`, at least 2) |
 
 ## AI Agent Integration
 

@@ -11,15 +11,22 @@ use std::sync::OnceLock;
 
 #[macro_use]
 mod common;
-use common::{ensure_test_project, get_function_address, ghidra, DaemonTestHarness};
+use common::{
+    ensure_test_project, get_function_address, ghidra, reset_test_project, DaemonTestHarness,
+};
 
-const TEST_PROJECT: &str = "ci-test";
+// Patches overwrite the bytes at `main`, and the bridge saves them on stop. A
+// private project, reset on every run, keeps those changes out of the shared
+// `ci-test` project: under a plain `cargo test`, patch_tests runs before
+// readonly_tests, whose disasm tests need valid instructions at `main`.
+const TEST_PROJECT: &str = "ci-test-patch";
 const TEST_PROGRAM: &str = "sample_binary";
 
 static HARNESS: OnceLock<DaemonTestHarness> = OnceLock::new();
 
 fn harness() -> &'static DaemonTestHarness {
     HARNESS.get_or_init(|| {
+        reset_test_project(TEST_PROJECT);
         ensure_test_project(TEST_PROJECT, TEST_PROGRAM);
         DaemonTestHarness::new(TEST_PROJECT, TEST_PROGRAM).expect("Failed to start daemon")
     })

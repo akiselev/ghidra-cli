@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Shared-bridge fixes from the 2026-10-15 multi-agent trials (docs/bugs 001, 002,
+004–009). Bridge protocol version 3; the CLI still works with protocol-2 bridges.
+
+### Added
+
+- **Read/write split (bug 006).** Read-only commands run concurrently on a
+  bounded read pool under the read side of a fair `ReentrantReadWriteLock`;
+  writes, `open_program`/`program close`/`analyze`/`import` and plain
+  `script run` stay exclusive on the Ghidra program thread. Long reads
+  (`decompile`, `find`, `graph`, `stats`, …) use at most pool size − 1 threads
+  and cheap reads are dequeued first, so a cheap read never waits behind long
+  reads. Each read thread keeps its own `DecompInterface`. Pool size:
+  `GHIDRA_CLI_READ_THREADS` (default `min(8, cores/2)`, at least 2; `0` = all
+  jobs exclusive).
+- `ghidra script run --read-only`: run a script as a reader. The job fails
+  loudly (`read_only_violation`) if the program's modification number changed.
+- `ghidra jobs` shows each job's `lane`, `queue_position` and `blocked_by`, every
+  active job (`active_jobs`), per-lane queue depth and `abandoned_jobs_total`.
+- Requests carry a client `request_id`; `job_status`/`job_cancel` accept it.
+
+### Changed
+
+- **No preflight jobs (bug 001).** The CLI reads the bridge's current program
+  from the off-queue `bridge_info` snapshot and sends `open_program` only on a
+  definite "different/no program" answer, never after a timeout. Requests carry
+  `expect_program`; if another client switched programs while a job was queued
+  the bridge refuses it (`program_mismatch`) and the CLI re-opens and retries
+  once.
+- **Read timeouts report and cancel (bugs 001, 005).** The timeout message gives
+  the job's id, lane, state, queue position and blocking job ids, and the CLI
+  cancels its own job (protocol-3 bridges only; older bridges get a queue
+  summary and no cancel).
+- **Abandoned jobs (bug 005).** Jobs whose client has disconnected are skipped
+  before they start (state `abandoned`); queued ones are dropped by a watchdog
+  within ~2 s; a running read or script whose client disconnects is
+  cooperatively cancelled.
+- **No automatic bridge restarts (bug 002).** An unknown command or a stale
+  response now fails with "the running bridge is older than this CLI; restart
+  it with `ghidra restart`" (or says no bridge implements the command). Unknown
+  commands are rejected by the bridge without queuing (`unknown_command`).
+- **`function disasm` honours `--limit` (bug 004).** It disassembles the whole
+  function body (default limit 1000, `--limit 0` = all) and warns on stderr
+  when truncated (`total_instructions`/`truncated` in the bridge response).
+- **Script compile errors (bug 008).** A failed compile reports the javac
+  diagnostics (`script_compile_error`) instead of "class could not be found";
+  build output no longer leaks into another script's stdout; the bridge never
+  runs a stale build or a class other than the requested file's.
+- `script python` / `script java` help says they are not supported in bridge
+  mode; the error points to `script run`.
+- Empty JSON output, or an unexpected response status, is an error with exit
+  code 1 rather than a silent success (bug 007).
+- The config's `default_program` is only applied to the config's
+  `default_project`; an explicit `--project` never auto-starts a bridge with
+  another project's default program (bug 009).
+
 ## [0.2.2]
 
 ### Added

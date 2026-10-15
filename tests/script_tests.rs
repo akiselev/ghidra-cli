@@ -88,8 +88,14 @@ fn test_script_list() {
     let _harness = harness();
 
     // script list does not accept --project/--program arguments,
-    // so it may fail with "no project specified" unless a default is configured
+    // so it may fail with "no project specified" unless a default is configured.
+    // Point it at an empty config: otherwise the developer's own default_project /
+    // default_program decide what happens, and a stale default makes the bridge
+    // launch fail with an error this test doesn't expect.
+    let temp = tempfile::tempdir().expect("tempdir");
     let output = assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        .env("GHIDRA_CLI_CONFIG", temp.path().join("config.yaml"))
+        .env_remove("GHIDRA_DEFAULT_PROGRAM")
         .arg("script")
         .arg("list")
         .output()

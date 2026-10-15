@@ -11,6 +11,16 @@ pub struct BridgeRequest {
     pub command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
+    /// Client-chosen ID, so the client can look up or cancel its own job
+    /// (`job_status`/`job_cancel` with `request_id`) after a read timeout.
+    /// Bridges older than protocol 3 ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Program the request must run against. A protocol-3 bridge rejects the
+    /// job with [`ERR_PROGRAM_MISMATCH`] if another client switched programs
+    /// while it was queued. Older bridges ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expect_program: Option<String>,
 }
 
 /// Response from the Java bridge.
@@ -32,6 +42,17 @@ pub struct BridgeResponse<T = serde_json::Value> {
 // names this constant.
 #[allow(dead_code)]
 pub const ERR_DECOMPILE_PAYLOAD_EXCEEDED: &str = "decompile_payload_exceeded";
+
+/// Error code: the bridge's current program is not the one the request named
+/// in `expect_program`. The client re-opens the program and retries once.
+pub const ERR_PROGRAM_MISMATCH: &str = "program_mismatch";
+
+/// Error code: the bridge does not know the command (it predates this CLI).
+pub const ERR_UNKNOWN_COMMAND: &str = "unknown_command";
+
+/// Error code: a `--read-only` script changed the program.
+#[allow(dead_code)]
+pub const ERR_READ_ONLY_VIOLATION: &str = "read_only_violation";
 
 /// A bridge error response that carried a machine-readable `code`.
 ///
@@ -60,10 +81,27 @@ mod tests {
         let request = BridgeRequest {
             command: "ping".to_string(),
             args: None,
+            request_id: None,
+            expect_program: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("ping"));
         assert!(!json.contains("args"));
+        assert!(!json.contains("request_id"));
+        assert!(!json.contains("expect_program"));
+    }
+
+    #[test]
+    fn test_request_with_request_id_and_expected_program() {
+        let request = BridgeRequest {
+            command: "decompile".to_string(),
+            args: None,
+            request_id: Some("abc".to_string()),
+            expect_program: Some("ls".to_string()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(v["request_id"], "abc");
+        assert_eq!(v["expect_program"], "ls");
     }
 
     #[test]
@@ -71,6 +109,8 @@ mod tests {
         let request = BridgeRequest {
             command: "list_functions".to_string(),
             args: Some(serde_json::json!({"limit": 100})),
+            request_id: None,
+            expect_program: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("list_functions"));

@@ -13,11 +13,47 @@ use tracing::debug;
 
 use super::protocol::{BridgeError, BridgeRequest, BridgeResponse};
 
+/// Commands that never run against "the current program", so they must not
+/// carry `expect_program` (control commands, and the program-switching ones).
+const NO_PROGRAM_CHECK: &[&str] = &[
+    "ping",
+    "status",
+    "bridge_info",
+    "job_status",
+    "job_cancel",
+    "shutdown",
+    "open_program",
+    "import",
+    "list_programs",
+    "program_close",
+    "program_delete",
+];
+
+/// A process-unique request ID: pid, wall-clock nanos and a counter.
+fn new_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{}-{:x}-{}",
+        std::process::id(),
+        nanos,
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Short budget for the control requests the client makes on its own behalf
+/// (describing or cancelling a timed-out job). Control commands never queue.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Default socket read timeout for short, interactive commands, in seconds.
 ///
-/// Ghidra program access is serialized through the bridge's explicit job queue,
-/// so a command that arrives while another is in flight waits its turn while
-/// control requests remain responsive. This budget must therefore be generous
+/// Exclusive jobs (writes, analyze, plain scripts) block every other program
+/// job, and reads can queue behind a full read pool, so a command may wait its
+/// turn while control requests remain responsive. This budget must therefore be generous
 /// enough to outlast whatever is ahead of it. Override with
 /// `GHIDRA_CLI_READ_TIMEOUT` (seconds); `0` means block indefinitely.
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 300;
@@ -154,15 +190,72 @@ fn connect_with_retry(addr: &std::net::SocketAddr) -> Result<TcpStream> {
     }
 }
 
+/// One line describing a job from a protocol-3 `job_status` response.
+fn describe_job(job: &serde_json::Value) -> String {
+    let id = job.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+    let state = job
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let lane = job.get("lane").and_then(|v| v.as_str()).unwrap_or("?");
+    let elapsed = job.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0) as f64 / 1000.0;
+    let mut text = format!(" — job {id} ({lane} lane) is {state} after {elapsed:.0}s");
+    if let Some(pos) = job.get("queue_position").and_then(|v| v.as_u64()) {
+        text.push_str(&format!(", queue position {pos} (0 = next)"));
+    }
+    if let Some(blockers) = job.get("blocked_by").and_then(|v| v.as_array()) {
+        if !blockers.is_empty() {
+            let ids: Vec<String> = blockers.iter().map(|b| b.to_string()).collect();
+            text.push_str(&format!(", blocked by job(s) {}", ids.join(", ")));
+        }
+    }
+    text
+}
+
+/// Fallback for bridges that cannot look up a job by request ID.
+fn describe_queue_summary(status: &serde_json::Value) -> String {
+    let Some(depth) = status.get("queue_depth").and_then(|v| v.as_u64()) else {
+        return String::new();
+    };
+    let mut text = format!(" — the bridge has {depth} queued job(s)");
+    if let Some(active) = status.get("active_job").filter(|v| !v.is_null()) {
+        let id = active.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cmd = active
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let elapsed = active
+            .get("elapsed_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as f64
+            / 1000.0;
+        text.push_str(&format!("; active job {id} ({cmd}) has run {elapsed:.0}s"));
+    }
+    text.push_str(" (this bridge predates per-job lookup; its job was not cancelled)");
+    text
+}
+
 /// Client for communicating with the Ghidra Java bridge.
 pub struct BridgeClient {
     port: u16,
+    expect_program: Option<String>,
 }
 
 impl BridgeClient {
     /// Create a client for a known port.
     pub fn new(port: u16) -> Self {
-        Self { port }
+        Self {
+            port,
+            expect_program: None,
+        }
+    }
+
+    /// Tag every program request with the program it must run against. A
+    /// protocol-3 bridge then refuses the job with a `program_mismatch` error
+    /// if another client switched programs in the meantime; older bridges
+    /// ignore the tag.
+    pub fn set_expected_program(&mut self, program: Option<String>) {
+        self.expect_program = program;
     }
 
     /// Get the port this client connects to.
@@ -195,6 +288,26 @@ impl BridgeClient {
         args: Option<serde_json::Value>,
         read_timeout: Option<Duration>,
     ) -> Result<serde_json::Value> {
+        let control = NO_PROGRAM_CHECK.contains(&command);
+        let request = BridgeRequest {
+            command: command.to_string(),
+            args,
+            request_id: (!control).then(new_request_id),
+            expect_program: if control {
+                None
+            } else {
+                self.expect_program.clone()
+            },
+        };
+        self.send_request(&request, read_timeout)
+    }
+
+    fn send_request(
+        &self,
+        request: &BridgeRequest,
+        read_timeout: Option<Duration>,
+    ) -> Result<serde_json::Value> {
+        let command = request.command.as_str();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", self.port)
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid address: {}", e))?;
@@ -204,12 +317,7 @@ impl BridgeClient {
         stream.set_read_timeout(read_timeout).ok();
         stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
 
-        let request = BridgeRequest {
-            command: command.to_string(),
-            args,
-        };
-
-        let request_json = serde_json::to_string(&request)?;
+        let request_json = serde_json::to_string(request)?;
         debug!("Sending: {}", request_json);
 
         writeln!(stream, "{}", request_json)?;
@@ -227,20 +335,28 @@ impl BridgeClient {
             Ok(_) => {}
             // A read timeout here means the bridge is up (we connected) but hasn't
             // reached our queued request in time — almost always because it is busy
-            // serving another agent. Surface that plainly, with the knob to wait longer.
+            // serving another agent. Say where the job is, then cancel it so it
+            // does not run for nobody (bug 005), and give the knob to wait longer.
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
+                drop(reader);
+                let detail = request
+                    .request_id
+                    .as_deref()
+                    .map(|id| self.describe_and_cancel_pending(id))
+                    .unwrap_or_default();
                 anyhow::bail!(
-                    "Bridge did not respond within {}s while running '{}' — the program job is \
-                     still queued or running. Inspect `ghidra jobs`, raise the wait via \
-                     GHIDRA_CLI_READ_TIMEOUT (seconds; 0 = wait indefinitely), or use \
-                     GHIDRA_CLI_OP_TIMEOUT for long analyze/import operations.",
+                    "Bridge did not respond within {}s while running '{}'{}. Inspect \
+                     `ghidra jobs`, raise the wait via GHIDRA_CLI_READ_TIMEOUT (seconds; \
+                     0 = wait indefinitely), or use GHIDRA_CLI_OP_TIMEOUT for long \
+                     analyze/import operations.",
                     read_timeout.map(|d| d.as_secs()).unwrap_or(0),
-                    command
+                    command,
+                    detail
                 )
             }
             Err(e) => return Err(e.into()),
@@ -261,9 +377,53 @@ impl BridgeClient {
                 }
                 anyhow::bail!("{}", msg)
             }
-            "shutdown" => Ok(json!({"status": "shutdown"})),
-            _ => Ok(response.data.unwrap_or(json!({}))),
+            "shutdown" if command == "shutdown" => Ok(json!({"status": "shutdown"})),
+            // Never turn an unexpected envelope into a silent success.
+            other => anyhow::bail!(
+                "Bridge returned an unexpected response status '{other}' for '{command}'"
+            ),
         }
+    }
+
+    /// After a read timeout: report where our job is (queue position, the jobs
+    /// blocking it) and ask the bridge to cancel it. Only control requests are
+    /// sent, so nothing queues. Against a bridge older than protocol 3, which
+    /// cannot look jobs up by request ID, this reports the queue summary and
+    /// does NOT send a cancel (an ID-less cancel would hit another client's job).
+    fn describe_and_cancel_pending(&self, request_id: &str) -> String {
+        let status = match self.control("job_status", json!({"request_id": request_id})) {
+            Ok(v) => v,
+            Err(_) => return String::new(),
+        };
+        let Some(job) = status.get("job") else {
+            return describe_queue_summary(&status);
+        };
+        let mut text = describe_job(job);
+        let state = job.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        if matches!(
+            state,
+            "queued" | "waiting_lock" | "running" | "cancel_requested"
+        ) {
+            match self.control("job_cancel", json!({"request_id": request_id})) {
+                Ok(r) => {
+                    let new_state = r.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+                    text.push_str(&format!("; asked the bridge to cancel it ({new_state})"));
+                }
+                Err(e) => text.push_str(&format!("; cancel failed: {e}")),
+            }
+        }
+        text
+    }
+
+    /// Send a control command with a short timeout and no request ID.
+    fn control(&self, command: &str, args: serde_json::Value) -> Result<serde_json::Value> {
+        let request = BridgeRequest {
+            command: command.to_string(),
+            args: Some(args),
+            request_id: None,
+            expect_program: None,
+        };
+        self.send_request(&request, Some(CONTROL_TIMEOUT))
     }
 
     /// Check if bridge is responding.
@@ -615,6 +775,22 @@ impl BridgeClient {
         )
     }
 
+    /// Disassemble a function's whole body (bug 004). `limit = None` returns
+    /// every instruction. A protocol-3 bridge reports `total_instructions` and
+    /// `truncated`; older bridges ignore `function_body`/`limit` and return
+    /// their old 10-instruction default, which the caller detects and flags.
+    pub fn disasm_function(
+        &self,
+        address: &str,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value> {
+        let limit = limit.map(|n| n.min(i32::MAX as usize)).unwrap_or(0);
+        self.send_command(
+            "disasm",
+            Some(json!({"address": address, "function_body": true, "limit": limit})),
+        )
+    }
+
     pub fn stats(&self) -> Result<serde_json::Value> {
         self.send_command("stats", None)
     }
@@ -625,8 +801,12 @@ impl BridgeClient {
         args: &[String],
         expect: &[serde_json::Value],
         allow_empty: bool,
+        read_only: bool,
     ) -> Result<serde_json::Value> {
         let mut payload = json!({"path": script_path, "args": args});
+        if read_only {
+            payload["read_only"] = json!(true);
+        }
         if !expect.is_empty() {
             payload["expect"] = serde_json::Value::Array(expect.to_vec());
             payload["allow_empty"] = json!(allow_empty);

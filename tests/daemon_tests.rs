@@ -325,12 +325,21 @@ fn test_control_plane_stays_responsive_while_program_job_runs() {
     let queued_deadline = std::time::Instant::now() + Duration::from_secs(10);
     let queued_job_ids = loop {
         let status = control.status().expect("status with queued job");
-        let ids: Vec<u64> = status
-            .get("queued_jobs")
-            .and_then(|v| v.as_array())
-            .into_iter()
+        // With the read/write split (protocol 3), read jobs such as `stats`
+        // leave their lane queue for a read worker and wait for the program
+        // lock behind the exclusive `analyze` in `active_jobs` with state
+        // `waiting_lock`. Either way they must not have started.
+        let ids: Vec<u64> = ["queued_jobs", "active_jobs"]
+            .iter()
+            .filter_map(|key| status.get(*key).and_then(|v| v.as_array()))
             .flatten()
             .filter(|job| job.get("command").and_then(|v| v.as_str()) == Some("stats"))
+            .filter(|job| {
+                matches!(
+                    job.get("state").and_then(|v| v.as_str()),
+                    Some("queued") | Some("waiting_lock")
+                )
+            })
             .filter_map(|job| job.get("id").and_then(|v| v.as_u64()))
             .collect();
         if ids.len() == queued.len() {
