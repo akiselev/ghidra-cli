@@ -14,6 +14,7 @@ source-level cause where known, and a suggested fix.
 | [007](007-empty-output-exit-zero.md) | `program info --json` returned empty output with exit 0 under a ~22-deep queue | medium | not reproduced; guarded (unreleased) |
 | [008](008-script-compile-failure-wrong-output.md) | A script compile failure showed another script's output / no javac diagnostics | medium | diagnostics fixed; wrong-class run not reproduced, guarded (unreleased) |
 | [009](009-config-defaults-override-explicit-project.md) | Config `default_project`/`default_program` leak into commands given `--project` | medium | `default_program` leak fixed; `default_project` message not reproduced (unreleased) |
+| [010](010-launch-timeout-kills-language-upgrade.md) | Bridge launch cap (180 s) kills the one-time language/DB upgrade after a Ghidra upgrade; the upgrade restarts on every launch and the error hides the cause | high (any Ghidra upgrade) | open |
 
 "Unreleased" fixes are in the working tree after `c9aefa1` (bridge protocol 3). A running
 bridge keeps its old behaviour until it is restarted with the new CLI.
