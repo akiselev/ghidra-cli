@@ -262,6 +262,7 @@ fn extract_project_from_command(command: &Commands) -> Option<String> {
             cli::ProgramCommands::List(args) => args.project.clone(),
             cli::ProgramCommands::Open(args) => args.project.clone(),
             cli::ProgramCommands::Close(args) => args.project.clone(),
+            cli::ProgramCommands::Save(args) => args.project.clone(),
             cli::ProgramCommands::Delete(args) => args.project.clone(),
             cli::ProgramCommands::Info(args) => args.project.clone(),
             cli::ProgramCommands::Export(args) => args.project.clone(),
@@ -387,6 +388,7 @@ fn extract_program_from_command(command: &Commands) -> Option<String> {
             cli::ProgramCommands::List(args) => args.program.clone(),
             cli::ProgramCommands::Open(args) => args.program.clone(),
             cli::ProgramCommands::Close(args) => args.program.clone(),
+            cli::ProgramCommands::Save(args) => args.program.clone(),
             cli::ProgramCommands::Delete(args) => args.program.clone(),
             cli::ProgramCommands::Info(args) => args.program.clone(),
             cli::ProgramCommands::Export(args) => args.program.clone(),
@@ -1205,6 +1207,7 @@ fn execute_via_bridge(
                     client.open_program(program)
                 }
                 ProgramCommands::Close(_) => client.program_close(),
+                ProgramCommands::Save(_) => client.program_save(),
                 ProgramCommands::Delete(args) => {
                     let program = args
                         .program
