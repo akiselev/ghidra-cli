@@ -301,6 +301,8 @@ pub enum ProgramCommands {
     Open(ProgramTargetArgs),
     /// Close a program
     Close(ProgramTargetArgs),
+    /// Save the current program's changes to the project
+    Save(ProgramTargetArgs),
     /// Delete a program
     Delete(ProgramTargetArgs),
     /// Show program information

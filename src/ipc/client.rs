@@ -826,6 +826,10 @@ impl BridgeClient {
         self.send_command("script_list", None)
     }
 
+    pub fn program_save(&self) -> Result<serde_json::Value> {
+        self.send_command("program_save", None)
+    }
+
     pub fn program_close(&self) -> Result<serde_json::Value> {
         self.send_command("program_close", None)
     }

@@ -159,7 +159,7 @@ public class GhidraCliBridge extends GhidraScript {
         "create_function", "delete_function", "decompile", "list_strings",
         "list_imports", "list_exports", "memory_map", "xrefs_to", "xrefs_from",
         "xrefs_list", "import", "analyze", "list_programs", "open_program",
-        "program_close", "program_delete", "program_export",
+        "program_close", "program_save", "program_delete", "program_export",
         "find_string", "find_bytes", "find_function", "find_calls",
         "find_crypto", "find_interesting",
         "symbol_list", "symbol_get", "symbol_create", "symbol_delete", "symbol_rename",
@@ -346,6 +346,15 @@ public class GhidraCliBridge extends GhidraScript {
     @Override
     public void run() throws Exception {
         startTime = System.currentTimeMillis();
+        // GhidraScript.executeNormal() opened one transaction on the -process
+        // program (FlatProgramAPI.start) for the whole run, and end() closes
+        // it on whatever currentProgram is when run() returns. While it is
+        // open the program cannot be saved ("Unable to lock due to active
+        // transaction"), and after a program switch it is closed on the wrong
+        // program, so the headless exit cannot save the -process program and
+        // its edits are lost. Every write handler opens its own transaction,
+        // so close the script-wide one now.
+        end(true);
         // Get port file path from script arguments
         String[] scriptArgs = getScriptArgs();
         if (scriptArgs.length < 1) {
@@ -434,6 +443,11 @@ public class GhidraCliBridge extends GhidraScript {
             // workers exit. This must finish before run() returns, because
             // Ghidra closes the program once the script ends.
             stopReadWorkers();
+            // Persist the open program before Ghidra closes it.
+            String saveError = saveCurrentProgram("ghidra-cli bridge shutdown");
+            if (saveError != null) {
+                printerr("ghidra-cli: " + saveError);
+            }
             Thread watchdog = watchdogThread;
             if (watchdog != null) {
                 watchdog.interrupt();
@@ -1204,6 +1218,7 @@ public class GhidraCliBridge extends GhidraScript {
             case "list_programs":   return handleListPrograms();
             case "open_program":    return handleOpenProgram(args);
             case "program_close":   return handleProgramClose();
+            case "program_save":    return handleProgramSave();
             case "program_delete":  return handleProgramDelete(args);
             case "program_export":  return handleProgramExport(args);
             // Find commands
@@ -2991,12 +3006,13 @@ public class GhidraCliBridge extends GhidraScript {
             Object consumer = project;
             TaskMonitor mon = jobMonitor();
 
-            // Release current program if one is open
+            // Release current program if one is open. Refuse the switch when
+            // its changes cannot be saved: releasing it would drop them.
             if (currentProgram != null) {
-                try {
-                    currentProgram.save("Auto-save before switch", mon);
-                } catch (Exception e) {
-                    // Best effort save
+                String saveError = saveCurrentProgram("Auto-save before switch");
+                if (saveError != null) {
+                    printerr("ghidra-cli: " + saveError);
+                    return errorResult(saveError + "; not switching to " + programName);
                 }
                 try {
                     currentProgram.release(consumer);
@@ -3019,6 +3035,39 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to open program: " + e.getMessage());
         }
+    }
+
+    /**
+     * Saves currentProgram if it has unsaved changes. Returns null on success
+     * (or when there is nothing to save), else the error message.
+     */
+    private String saveCurrentProgram(String description) {
+        if (currentProgram == null || !currentProgram.isChanged()) {
+            return null;
+        }
+        try {
+            currentProgram.save(description, jobMonitor());
+            return null;
+        } catch (Exception e) {
+            return "Could not save " + currentProgram.getName() + ": " + e.getMessage();
+        }
+    }
+
+    private JsonObject handleProgramSave() {
+        if (currentProgram == null) {
+            return errorResult("No program loaded");
+        }
+        boolean changed = currentProgram.isChanged();
+        String saveError = saveCurrentProgram("ghidra-cli program save");
+        if (saveError != null) {
+            return errorResult(saveError);
+        }
+        JsonObject result = new JsonObject();
+        result.addProperty("status", "success");
+        result.addProperty("program", currentProgram.getName());
+        result.addProperty("saved", changed);
+        result.addProperty("version", currentProgram.getDomainFile().getVersion());
+        return result;
     }
 
     private JsonObject handleProgramClose() {
